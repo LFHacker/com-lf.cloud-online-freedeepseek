@@ -1,0 +1,91 @@
+apply plugin: 'com.android.application'
+
+// ── 版本号来源：仓库根目录的 VERSION（每个分支各自的值）──────────────
+//   发行版线 main : 0.7.0
+//   开发版线 dev  : 0.7.0A-debug（字母 A→B→C 递增；功能更新则升 0.8.0A-debug）
+//
+//   versionCode 由版本自动推导，保证单调递增：
+//     major*1_000_000 + minor*10_000 + patch*100 + 后缀
+//     后缀：开发版 = 字母序号（A=1 … Z=26），发行版 = 99
+//   于是同一基线的发行版（+99）永远高于它的开发版（+1…+26），
+//   而下一基线的开发版（0.8.0A=80001）又高于上一发行版（0.7.0=70099）。
+def appVersion = rootProject.file("../../VERSION").text.trim()
+def versionMatcher = (appVersion =~ /^(\d+)\.(\d+)\.(\d+)([A-Z])?(-debug)?$/)
+if (!versionMatcher.matches()) {
+    throw new GradleException("VERSION 格式不合法：${appVersion}（应形如 0.7.0 或 0.7.0A-debug）")
+}
+def vLetter = versionMatcher[0][4]
+def computedVersionCode = (versionMatcher[0][1] as int) * 1000000 +
+        (versionMatcher[0][2] as int) * 10000 +
+        (versionMatcher[0][3] as int) * 100 +
+        (vLetter ? (vLetter.charAt(0) - ('A' as char) + 1) : 99)
+
+android {
+    namespace = "com.example.dsclient"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "online.lfcloud.freedeepseek"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode computedVersionCode
+        versionName appVersion
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+    }
+    signingConfigs {
+        release {
+            // 在闭包内部读取，避免 Gradle 把顶层局部变量当成 DSL 属性
+            def propsFile = rootProject.file("../keystore.properties")
+            if (propsFile.exists()) {
+                def props = new Properties()
+                propsFile.withInputStream { props.load(it) }
+                storeFile file(props["storeFile"])
+                storePassword props["storePassword"]
+                keyAlias props["keyAlias"]
+                keyPassword props["keyPassword"]
+            }
+        }
+    }
+    buildTypes {
+        release {
+            if (rootProject.file("../keystore.properties").exists()) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

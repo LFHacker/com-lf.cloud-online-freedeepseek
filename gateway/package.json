@@ -1,0 +1,19 @@
+{
+  "name": "ds-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek C 端 App 的自建网关：Anthropic 兼容层 + 密钥代持 + 上下文预算 + 检索注入",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "type": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^7.0.2"
+  }
+}

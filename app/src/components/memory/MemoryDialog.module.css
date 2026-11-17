@@ -1,0 +1,379 @@
+/* 记忆管理弹窗：比默认 Modal 宽，列表自己滚动，头尾固定 */
+
+.wide {
+  width: 560px;
+  max-width: calc(100vw - 24px);
+  max-height: min(78vh, 720px);
+  padding: 20px 22px 18px;
+}
+
+.main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  color: var(--dsw-alias-label-secondary);
+}
+
+/* ---- 顶部统计 ---- */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-caption);
+  background-color: var(--dsw-alias-interactive-bg-hover);
+  border: 1px solid transparent;
+}
+
+.chip b {
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.chipOn {
+  color: var(--dsw-alias-brand-text);
+  border-color: var(--dsw-alias-brand-primary);
+  background-color: var(--dsw-alias-interactive-bg-hover-accent);
+}
+
+/* ---- 分段切换 ---- */
+.tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  margin-bottom: 14px;
+  border-radius: 12px;
+  background-color: var(--dsw-alias-interactive-bg-hover);
+}
+
+.tab {
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 9px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color var(--ds-transition-duration) var(--ds-ease-in-out),
+    color var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.tab:hover {
+  color: var(--dsw-alias-label-primary);
+}
+
+.tabOn {
+  color: var(--dsw-alias-label-primary);
+  background-color: var(--dsw-alias-bg-layer-2);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+}
+
+/* ---- 搜索行 ---- */
+.searchRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.searchRow {
+  position: relative;
+}
+
+.searchIcon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  color: var(--dsw-alias-label-dimmed);
+  pointer-events: none;
+}
+
+.searchIcon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.search {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px 9px 34px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--dsw-alias-label-primary);
+  background-color: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  outline: none;
+  transition: border-color var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.searchPlain {
+  padding-left: 12px;
+}
+
+.search:focus {
+  border-color: var(--dsw-alias-brand-primary);
+}
+
+.search::placeholder {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.run {
+  flex: none;
+  padding: 9px 16px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--dsw-alias-label-primary-foreground);
+  background-color: var(--dsw-alias-brand-primary);
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.run:hover {
+  background-color: var(--dsw-alias-button-primary-hover);
+}
+
+.hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-caption);
+}
+
+/* ---- 列表 ---- */
+.list {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 120px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.card {
+  /* 不被 flex 容器拉伸：默认 flex-grow 虽为 0，但显式声明避免受父级布局影响 */
+  flex: none;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background-color: var(--dsw-alias-bg-layer-2);
+  transition: border-color var(--ds-transition-duration) var(--ds-ease-in-out),
+    box-shadow var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.card:hover {
+  border-color: var(--dsw-alias-border-l1);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 6%);
+}
+
+.cardHead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 7px;
+}
+
+.stamp {
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 17px;
+  color: var(--dsw-alias-label-caption);
+  background-color: var(--dsw-alias-interactive-bg-hover);
+  font-variant-numeric: tabular-nums;
+}
+
+.stampHit {
+  color: var(--dsw-alias-brand-text);
+  background-color: var(--dsw-alias-interactive-bg-hover-accent);
+}
+
+.stampRank {
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cardFoot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.delete {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--dsw-alias-label-caption);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color var(--ds-transition-duration) var(--ds-ease-in-out),
+    background-color var(--ds-transition-duration) var(--ds-ease-in-out),
+    border-color var(--ds-transition-duration) var(--ds-ease-in-out);
+}
+
+.delete svg {
+  width: 13px;
+  height: 13px;
+}
+
+.delete:hover {
+  color: var(--dsw-alias-label-primary);
+  background-color: var(--dsw-alias-interactive-bg-hover-danger);
+}
+
+.deleteArmed {
+  color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary);
+  background-color: var(--dsw-alias-interactive-bg-hover-danger);
+}
+
+/* ---- 评分条 ---- */
+.scoreRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.scoreBar {
+  flex: 1;
+  height: 5px;
+  border-radius: 999px;
+  overflow: hidden;
+  background-color: var(--dsw-alias-interactive-bg-hover);
+}
+
+.scoreFill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--dsw-alias-brand-primary), var(--dsw-alias-brand-text));
+  transition: width var(--ds-transition-duration-slow) var(--ds-ease-in-out);
+}
+
+.scoreValue {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-caption);
+}
+
+/* 关键词回退命中没有分数，用一个中性标签代替数字 */
+.scoreTag {
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 17px;
+  color: var(--dsw-alias-label-caption);
+  background-color: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* ---- 空态与骨架 ---- */
+.empty {
+  margin: 0;
+  padding: 34px 12px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--dsw-alias-label-caption);
+}
+
+.emptyBox {
+  padding: 22px 12px;
+  border-radius: 12px;
+  border: 1px dashed var(--dsw-alias-border-l2);
+}
+
+.emptyBox .empty {
+  padding: 8px 12px 4px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.emptyHint {
+  margin: 0;
+  padding: 0 12px 8px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.skeleton {
+  height: 74px;
+  border-style: dashed;
+  background: linear-gradient(
+    100deg,
+    var(--dsw-alias-bg-skeleton) 30%,
+    var(--dsw-alias-interactive-bg-hover) 50%,
+    var(--dsw-alias-bg-skeleton) 70%
+  );
+  background-size: 240% 100%;
+  animation: sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  from {
+    background-position: 130% 0;
+  }
+
+  to {
+    background-position: -30% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}
+
+@media (max-width: 520px) {
+  /* 手机上铺满整屏：居中卡片会浪费大量垂直空间，列表也更需要高度 */
+  .wide {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
+    border-radius: 0;
+    padding: max(14px, env(safe-area-inset-top)) 16px max(12px, env(safe-area-inset-bottom));
+  }
+
+  .list {
+    /* 铺满后列表自己吃掉剩余高度，别被 min-height 顶住 */
+    min-height: 0;
+  }
+}

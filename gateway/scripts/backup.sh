@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# 记忆库备份：一致性快照 + 完整性校验 + 本地轮转 + 异地推送
+#
+# 为什么不用 cp：
+#   memory.db 是 WAL 模式，新数据可能还在 -wal 文件里，
+#   直接 cp 拿到的是**旧快照**（实测因此误判过一次"清理失败"）。
+#   这里用 SQLite 的 VACUUM INTO，它会把当前已提交状态写成一个干净的独立文件。
+#
+# 为什么密钥不推异地：
+#   异地那台机器一旦被入侵，等于把 DeepSeek Key / 网关令牌 / 阿里云 AccessKey 全送出去。
+#   而密钥丢失只需重新签发（几分钟），数据库丢失不可恢复 —— 所以只把数据推出去。
+
+set -euo pipefail
+
+DB_PATH="${MEMORY_DB_PATH:-/var/lib/ds-gateway/memory.db}"
+DEST="/var/backups/ds-gateway"
+KEEP=14
+STAMP="$(date +%Y%m%d-%H%M%S)"
+OFFSITE_HOST="root@183.66.27.22"
+OFFSITE_PORT=43043
+OFFSITE_DIR="/var/backups/ds-gateway"
+OFFSITE_KEY="/root/.ssh/dsbackup"
+
+mkdir -p "$DEST"
+
+SNAPSHOT="$DEST/memory-$STAMP.db"
+CONFIG_TAR="$DEST/config-$STAMP.tar.gz"
+
+echo "[backup] $(date '+%F %T') 开始"
+
+# ---- 1) 一致性快照 ----
+node - "$DB_PATH" "$SNAPSHOT" <<'NODE_EOF'
+const { DatabaseSync } = require('node:sqlite')
+const [source, target] = process.argv.slice(2)
+const db = new DatabaseSync(source)
+// VACUUM INTO 生成的副本不含 -wal/-shm，且是事务一致的
+db.exec(`vacuum into '${target.replace(/'/g, "''")}'`)
+db.close()
+NODE_EOF
+echo "[backup] 快照: $SNAPSHOT ($(du -h "$SNAPSHOT" | cut -f1))"
+
+# ---- 2) 完整性校验：坏备份比没备份更危险 ----
+node - "$SNAPSHOT" <<'NODE_EOF'
+const { DatabaseSync } = require('node:sqlite')
+const file = process.argv[2]
+const db = new DatabaseSync(file)
+const integrity = db.prepare('pragma integrity_check').get()
+const value = Object.values(integrity ?? {})[0]
+if (String(value).toLowerCase() !== 'ok') {
+  console.error('[backup] 完整性校验失败:', JSON.stringify(integrity))
+  process.exit(1)
+}
+const count = (sql) => db.prepare(sql).get().n
+console.log(
+  `[backup] 校验通过 会话=${count('select count(*) n from sessions')} ` +
+  `消息=${count('select count(*) n from messages')} 切片=${count('select count(*) n from chunks')}`
+)
+db.close()
+NODE_EOF
+
+# ---- 3) 压缩 ----
+gzip -9 -f "$SNAPSHOT"
+
+# ---- 4) 配置归档（不含 /etc/*.env 里的密钥）----
+tar czf "$CONFIG_TAR" \
+  -C / \
+  etc/caddy/Caddyfile \
+  etc/systemd/system/ds-gateway.service \
+  etc/systemd/system/caddy.service \
+  etc/systemd/system/ds-gateway-backup.service \
+  etc/systemd/system/ds-gateway-backup.timer \
+  opt/ds-gateway/src \
+  opt/ds-gateway/scripts \
+  opt/ds-gateway/shared 2>/dev/null || true
+
+# ---- 5) 本地轮转 ----
+rotate() {
+  local pattern="$1"
+  # shellcheck disable=SC2012
+  ls -1t $pattern 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r old; do
+    rm -f "$old"
+  done
+}
+rotate "$DEST/memory-*.db.gz"
+rotate "$DEST/config-*.tar.gz"
+
+# ---- 6) 推异地（失败不算整体失败：本地备份已经有效）----
+if [ -f "$OFFSITE_KEY" ] && command -v scp >/dev/null 2>&1; then
+  if scp -q -i "$OFFSITE_KEY" -P "$OFFSITE_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+      "$DEST/memory-$STAMP.db.gz" "$OFFSITE_HOST:$OFFSITE_DIR/" 2>/dev/null; then
+    echo "[backup] 异地推送成功"
+    # 异地上也保留最近 N 份
+    ssh -i "$OFFSITE_KEY" -p "$OFFSITE_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+      "$OFFSITE_HOST" "ls -1t $OFFSITE_DIR/memory-*.db.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f" \
+      >/dev/null 2>&1 || true
+  else
+    echo "[backup] ⚠️ 异地推送失败（本地备份仍然有效）"
+  fi
+else
+  echo "[backup] 未配置异地密钥，跳过推送"
+fi
+
+echo "[backup] 完成。本地保留:"
+ls -1t "$DEST"/memory-*.db.gz 2>/dev/null | head -5 | sed 's/^/  /'

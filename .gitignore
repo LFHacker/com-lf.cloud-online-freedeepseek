@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# 这个仓库是**公开**的。任何密钥、签名文件、构建产物都不许进仓库。
+# 提交前请跑： pwsh -File scripts/check-secrets.ps1
+# ─────────────────────────────────────────────────────────────
+
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物（前端）
+app/dist/
+android-app/www/
+# cap sync 会把前端产物复制进 Android assets —— 里面会带构建期注入的令牌，必须忽略
+android-app/android/app/src/main/assets/public/
+
+# 构建产物（Android）
+android-app/android/app/build/
+android-app/android/build/
+android-app/android/.gradle/
+android-app/android/local.properties
+*.apk
+*.aab
+*.ap_
+*.idsig
+
+# ── 密钥与签名（绝不入库）───────────────────────────────────────
+android-app/keystore.properties
+android-app/keystore/
+*.jks
+*.keystore
+*.p12
+*.pem
+.env
+.env.*
+!**/.env.example
+etc/
+
+# ── 交付物与本地数据 ──────────────────────────────────────────
+delivery/
+research/
+*.db
+*.db-wal
+*.db-shm
+*.log
+logs/
+tmp/
+.tmp*/
+
+# ── 编辑器 / 系统 ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 本地 Gradle 分发包（构建缓存，131 MB）
+android-app/gradle-dist/

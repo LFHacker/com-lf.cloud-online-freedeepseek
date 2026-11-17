@@ -1,0 +1,8 @@
+{
+  "appId": "online.lfcloud.freedeepseek",
+  "appName": "自由的deepseek",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  }
+}

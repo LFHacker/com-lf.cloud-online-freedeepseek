@@ -25,7 +25,10 @@ android-app/android/local.properties
 
 # ── 密钥与签名（绝不入库）───────────────────────────────────────
 # 临时 GitHub 令牌（用完即删，绝不入库）
-.gh-token
+.gh-token*
+# 任何名字像令牌的文件都不许入库
+*.token
+*_token*
 
 android-app/keystore.properties
 android-app/keystore/

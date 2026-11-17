@@ -1,0 +1,172 @@
+/* 登录 / 注册：全屏，浅彩底 + 白色实心卡片 + 细彩色边线（与 App 的扁平风格一致） */
+.screen {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  background: linear-gradient(160deg, #eef3ff 0%, #f7fbff 45%, #eafaf7 100%);
+  overflow-y: auto;
+}
+
+.card {
+  width: 100%;
+  max-width: 380px;
+  padding: 28px 24px 20px;
+  border: 1px solid #dbe6ff;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 8px 0 #e8eeff, 0 18px 40px rgba(59, 91, 253, 0.12);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+/* 图标里那只飞鸟的极简复刻：两道折线 */
+.bird {
+  width: 26px;
+  height: 14px;
+  border-top: 3px solid #3b5bfd;
+  border-radius: 2px;
+  transform: skewX(-18deg);
+  position: relative;
+  flex: none;
+}
+
+.bird::after {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 0;
+  width: 26px;
+  height: 14px;
+  border-top: 3px solid #00d6c4;
+  border-radius: 2px;
+  transform: skewX(36deg);
+}
+
+.title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: #101838;
+  letter-spacing: 0.2px;
+}
+
+.tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 4px;
+  margin-bottom: 18px;
+  border-radius: 12px;
+  background: #f1f5ff;
+}
+
+.tab,
+.tabActive {
+  padding: 9px 0;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: #5b6480;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.tabActive {
+  background: #ffffff;
+  color: #3b5bfd;
+  box-shadow: 0 2px 6px rgba(59, 91, 253, 0.16);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #4a5470;
+}
+
+.input {
+  width: 100%;
+  padding: 11px 13px;
+  border: 1px solid #dbe3f5;
+  border-radius: 10px;
+  background: #f8faff;
+  color: #101838;
+  font-size: 15px;
+  outline: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.input:focus {
+  border-color: #3b5bfd;
+  background: #ffffff;
+}
+
+.hint {
+  font-size: 12px;
+  color: #7b849c;
+}
+
+.error {
+  padding: 9px 12px;
+  border: 1px solid #ffd3d3;
+  border-radius: 10px;
+  background: #fff6f6;
+  color: #d64545;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.submit {
+  margin-top: 4px;
+  padding: 12px 0;
+  border: none;
+  border-radius: 11px;
+  background: #3b5bfd;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 3px 0 #2d47cc;
+  transition: transform 0.1s ease, box-shadow 0.1s ease, opacity 0.15s ease;
+}
+
+.submit:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: 0 3px 0 #9aa8e8;
+}
+
+.submit:not(:disabled):active {
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 #2d47cc;
+}
+
+.footer {
+  margin-top: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: #8b93a8;
+  line-height: 1.6;
+}

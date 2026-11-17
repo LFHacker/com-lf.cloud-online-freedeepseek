@@ -25,6 +25,9 @@ import { createRateLimiter } from './rate-limit.ts'
 /** 客户端诊断日志路径（App 端导入流程上报，见 /client-log 路由） */
 const CLIENT_LOG_PATH = process.env.CLIENT_LOG_PATH ?? '/var/log/ds-gateway/client.log'
 import { MemoryStore, type MemoryScope } from './memory/store.ts'
+import { MemoryRegistry } from './memory/registry.ts'
+import { AuthFailure, AuthStore, type User } from './auth/store.ts'
+import { randomBytes } from 'node:crypto'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
 
@@ -84,27 +87,77 @@ const limiter = createRateLimiter({
  *  - P2：全局会话的内容进 FTS5 全文索引，跨会话按需召回并注入
  */
 const MEMORY_ENABLED = (process.env.MEMORY_ENABLED ?? '1') !== '0'
-const MEMORY_DB_PATH = process.env.MEMORY_DB_PATH ?? '/var/lib/ds-gateway/memory.db'
+/**
+ * 改造前的单库路径。多用户之后只作为「老库」被吸收到管理员账号目录下，
+ * 新数据一律写到 MEMORY_DATA_DIR/<userId>/memory.db。
+ */
+const LEGACY_MEMORY_DB_PATH = process.env.MEMORY_DB_PATH ?? '/var/lib/ds-gateway/memory.db'
+/** 每用户一个子目录 */
+const MEMORY_DATA_DIR = process.env.MEMORY_DATA_DIR ?? '/var/lib/ds-gateway/users'
+/** 账号与会话 */
+const AUTH_DB_PATH = process.env.AUTH_DB_PATH ?? '/var/lib/ds-gateway/auth.db'
+/** 管理员账号：老网关令牌映射到它，老记忆库也迁到它名下 */
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL ?? 'admin@l-f-cloud.online').trim().toLowerCase()
+/** 不配就随机生成并打印一次（首次部署用） */
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? ''
+/** 是否允许自助注册；关掉就只能由管理员建号 */
+const ALLOW_SIGNUP = (process.env.ALLOW_SIGNUP ?? '1') !== '0'
 /** 本地会话是否也读取全局记忆。默认 0 = 完全隔离（不写也不读），心智模型最简单 */
 const MEMORY_LOCAL_READS_GLOBAL = (process.env.MEMORY_LOCAL_READS_GLOBAL ?? '0') === '1'
 const MEMORY_MAX_HITS = Number(process.env.MEMORY_MAX_HITS ?? 4)
 const MEMORY_MAX_CHARS = Number(process.env.MEMORY_MAX_CHARS ?? 1500)
 
-let memory: MemoryStore | null = null
+let registry: MemoryRegistry | null = null
 if (MEMORY_ENABLED) {
   try {
-    memory = new MemoryStore({
-      dbPath: MEMORY_DB_PATH,
+    registry = new MemoryRegistry({
+      dataDir: MEMORY_DATA_DIR,
       maxHits: MEMORY_MAX_HITS,
       maxChars: MEMORY_MAX_CHARS,
+      legacyPath: LEGACY_MEMORY_DB_PATH,
     })
   } catch (error) {
     // 记忆库起不来**不能让网关挂掉**——聊天是主功能，记忆是增强
     console.error(
       `[gateway] 记忆库初始化失败，将以无记忆模式运行：${error instanceof Error ? error.message : String(error)}`
     )
-    memory = null
+    registry = null
   }
+}
+
+/**
+ * 账号库起不来就**拒绝启动**（与记忆不同）：
+ * 没有账号库 = 无法判断请求属于谁 = 所有人都能看到同一份数据，
+ * 这比「暂时没有记忆」危险得多。
+ */
+const authStore = new AuthStore(AUTH_DB_PATH)
+
+/** 首次部署：没有账号就建一个管理员，密码随机并打印一次 */
+const bootstrapAdmin = (): User => {
+  const existing = authStore.findByEmail(ADMIN_EMAIL)
+  if (existing) {
+    return existing
+  }
+  const password = ADMIN_PASSWORD || randomBytes(18).toString('base64url')
+  const created = authStore.createUser(ADMIN_EMAIL, password, 'admin')
+  if (ADMIN_PASSWORD) {
+    console.log(`[gateway] 已创建管理员账号 ${created.email}（密码取自 ADMIN_PASSWORD）`)
+  } else {
+    console.log(
+      `[gateway] 已创建管理员账号 ${created.email}，初始密码：${password}
+` +
+        `[gateway] ↑ 这个密码只打印这一次，请立即在 App 里登录并修改`
+    )
+  }
+  return created
+}
+
+const adminUser = bootstrapAdmin()
+
+// 多用户改造之前的数据都在单库里，归到管理员账号下（只做一次）
+const adopted = registry?.adoptLegacy(adminUser.id)
+if (adopted?.adopted) {
+  console.log(`[gateway] 已把改造前的单库迁移到管理员账号 ${adminUser.email} 名下`)
 }
 
 /** 会话 id 只允许安全字符，避免被当成路径或 SQL 拼接素材 */
@@ -255,6 +308,33 @@ const sameToken = (given: string, expected: string): boolean => {
   return timingSafeEqual(a, b)
 }
 
+/**
+ * 令牌 → 用户。
+ *
+ * 两种令牌并存：
+ *  - 用户令牌（/auth/login 发的）：多用户的正路
+ *  - 旧网关令牌（GATEWAY_TOKEN）：映射到管理员账号，保证改造前已经装在手机上的
+ *    App 不会因为这次升级突然连不上
+ */
+const userFromToken = (token: string): User | null => {
+  if (!token) {
+    return null
+  }
+  if (GATEWAY_TOKEN && sameToken(token, GATEWAY_TOKEN)) {
+    return adminUser
+  }
+  return authStore.resolveToken(token)
+}
+
+const userFromRequest = (req: IncomingMessage): User | null => {
+  const found = readGatewayToken(req)
+  return found ? userFromToken(found.token) : null
+}
+
+/** 该用户的记忆库；没登录或没启用记忆就返回 null */
+const memoryFor = (user: User | null): MemoryStore | null =>
+  registry && user ? registry.get(user.id) : null
+
 /** App 对不同接口用不同鉴权头：对话走 x-api-key，/models 与语音走 Bearer。两种都认。 */
 type AuthStyle = 'x-api-key' | 'bearer' | 'basic'
 
@@ -381,15 +461,15 @@ const manageContext = (text: string, budget: number): ManagedBody => {
 }
 
 const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string) => {
-  const auth = readGatewayToken(req)
-  if (!auth) {
-    json(res, 401, { ok: false, error: 'unauthorized', message: '缺少网关令牌' })
+  const user = userFromRequest(req)
+  if (!user) {
+    json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或无效的访问令牌' })
     return
   }
-  if (!sameToken(auth.token, GATEWAY_TOKEN)) {
-    json(res, 401, { ok: false, error: 'unauthorized', message: '网关令牌不正确' })
-    return
-  }
+  // 上游仍然用 DeepSeek Key 转发，客户端令牌只用于识别「你是谁」
+  const inbound = readGatewayToken(req)
+  // 本次请求使用**这个用户自己的**记忆库
+  const memory = memoryFor(user)
 
   // 客户端断开时中止上游请求，别让 DeepSeek 那边继续空跑计费。
   // ⚠️ 必须监听 res 而不是 req：req 的 'close' 在请求体正常读完时也会触发。
@@ -565,7 +645,7 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
   try {
     upstream = await fetch(`${UPSTREAM}${pathname}`, {
       method,
-      headers: upstreamHeaders(req, auth.style),
+      headers: upstreamHeaders(req, inbound?.style ?? `x-api-key`),
       body,
       duplex: 'half',
       signal: controller.signal,
@@ -715,18 +795,26 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       hasGatewayToken: GATEWAY_TOKEN.length > 0,
       contextBudgetTokens: CONTEXT_BUDGET_TOKENS,
       allowedOrigins: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : 'any (echo)',
-      memory: memory
+      auth: {
+        users: authStore.countUsers(),
+        signupAllowed: ALLOW_SIGNUP,
+        legacyTokenWorks: GATEWAY_TOKEN.length > 0,
+        admin: adminUser.email,
+      },
+      memory: registry
         ? {
             enabled: true,
-            dbPath: MEMORY_DB_PATH,
+            /** 每用户一个库；这里报的是管理员那份作为概览 */
+            dataDir: MEMORY_DATA_DIR,
+            dbPath: registry.pathFor(adminUser.id),
             localReadsGlobal: MEMORY_LOCAL_READS_GLOBAL,
             maxHits: MEMORY_MAX_HITS,
             /** 向量检索是否已启用（配了 embedding 接口才为 true） */
-            vectors: memory.vectorEnabled,
+            vectors: memoryFor(adminUser)?.vectorEnabled ?? false,
             /** P4：记忆新鲜度半衰期与权重修正幅度 */
             decayHalfLifeDays: Number(process.env.MEMORY_DECAY_HALF_LIFE_DAYS ?? 90),
             freshnessBoost: Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25),
-            ...memory.stats(),
+            ...(memoryFor(adminUser)?.stats() ?? { sessions: 0, messages: 0, chunks: 0 }),
           }
         : { enabled: false },
       rateLimit: {
@@ -754,6 +842,149 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
+  // ---- 账号：注册 / 登录 / 登出 / 当前用户 / 改密码 ----
+  if (url.pathname.startsWith('/auth/')) {
+    const fail = (status: number, error: string, message: string) => {
+      json(res, status, { ok: false, error, message })
+    }
+    const readJsonBody = async (): Promise<Record<string, unknown> | null> => {
+      const body = await readBodyCapped(req, 16 * 1024)
+      if (!body.ok) {
+        fail(413, 'body_too_large', '请求体过大')
+        return null
+      }
+      try {
+        const parsed = JSON.parse(body.buffer.toString('utf8')) as unknown
+        return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
+      } catch {
+        fail(400, 'bad_json', '请求体不是合法 JSON')
+        return null
+      }
+    }
+    const str = (value: unknown): string => (typeof value === 'string' ? value : '')
+    const device = (): string | undefined => {
+      const ua = req.headers['user-agent']
+      return typeof ua === 'string' ? ua : undefined
+    }
+    /** AuthFailure → 合适的 HTTP 状态与错误码 */
+    const authError = (error: unknown) => {
+      if (!(error instanceof AuthFailure)) {
+        console.error('[gateway] 账号接口异常:', error)
+        fail(500, 'internal_error', '服务器内部错误')
+        return
+      }
+      const map: Record<string, [number, string]> = {
+        invalidEmail: [400, '邮箱格式不正确'],
+        weakPassword: [400, '密码至少 8 位'],
+        emailTaken: [409, '该邮箱已注册'],
+        badCredentials: [401, '邮箱或密码不正确'],
+        disabled: [403, '账号已被停用'],
+        invalidToken: [401, '登录状态已失效，请重新登录'],
+      }
+      const [status, message] = map[error.key] ?? [400, '请求无法处理']
+      fail(status, error.key, message)
+    }
+    const payloadUser = (user: User) => ({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      status: user.status,
+      createdAt: user.createdAt,
+    })
+
+    if (req.method === 'POST' && url.pathname === '/auth/register') {
+      if (!ALLOW_SIGNUP) {
+        fail(403, 'signup_disabled', '本实例未开放注册，请联系管理员')
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      try {
+        const user = authStore.createUser(str(body.email), str(body.password))
+        const session = authStore.createSession(user.id, device())
+        console.log(`[gateway] 新注册：${user.email}`)
+        json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
+      } catch (error) {
+        authError(error)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/login') {
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      try {
+        const user = authStore.verifyPassword(str(body.email), str(body.password))
+        const session = authStore.createSession(user.id, device())
+        json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
+      } catch (error) {
+        authError(error)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/logout') {
+      const found = readGatewayToken(req)
+      if (found) {
+        authStore.revokeToken(found.token)
+      }
+      json(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/auth/me') {
+      const user = userFromRequest(req)
+      if (!user) {
+        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        return
+      }
+      const store = memoryFor(user)
+      json(res, 200, {
+        ok: true,
+        user: payloadUser(user),
+        /** 旧网关令牌登录时是 true：提示前端可以引导去设置密码 */
+        legacyToken: ((inbound: string) => Boolean(inbound) && sameToken(inbound, GATEWAY_TOKEN))(
+          readGatewayToken(req)?.token ?? ''
+        ),
+        memory: store ? store.stats() : null,
+      })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/password') {
+      const user = userFromRequest(req)
+      if (!user) {
+        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      try {
+        // 用旧网关令牌进来的没有密码，允许直接设置；否则必须先验证旧密码
+        const legacyLogin = sameToken(readGatewayToken(req)?.token ?? '', GATEWAY_TOKEN)
+        if (!legacyLogin) {
+          authStore.verifyPassword(user.email, str(body.oldPassword))
+        }
+        authStore.setPassword(user.id, str(body.newPassword))
+        // 改密码会踢掉所有会话，这里给当前设备重新发一个，避免自己被登出
+        const session = authStore.createSession(user.id, device())
+        json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt })
+      } catch (error) {
+        authError(error)
+      }
+      return
+    }
+
+    fail(404, 'not_found', '没有这个账号接口')
+    return
+  }
+
   // ---- 记忆管理页面（自用工具，不是 App 的接口）----
   if (url.pathname === '/memory' || url.pathname.startsWith('/memory/')) {
     /**
@@ -777,11 +1008,17 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       return
     }
 
-    const auth = readGatewayToken(req)
-    if (!auth || !sameToken(auth.token, GATEWAY_TOKEN)) {
-      json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或错误的网关令牌' })
+    const admin = userFromRequest(req)
+    if (!admin) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或无效的访问令牌' })
       return
     }
+    // 管理页面能列出并删除切片，只给管理员
+    if (admin.role !== 'admin') {
+      json(res, 403, { ok: false, error: 'forbidden', message: '需要管理员账号' })
+      return
+    }
+    const memory = memoryFor(admin)
     if (!memory) {
       json(res, 503, { ok: false, error: 'memory_disabled', message: '记忆库未启用' })
       return

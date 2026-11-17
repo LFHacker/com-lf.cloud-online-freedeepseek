@@ -1,0 +1,147 @@
+import { useState } from 'react'
+import { useTranslate } from '../../i18n/index.js'
+import { changePassword } from '../../services/auth/client.js'
+import { replaceToken, signOut, useAuth } from '../../services/auth/store.js'
+import { apiOrigin } from '../../services/api/client.js'
+import styles from './Settings.module.css'
+
+/**
+ * 「数据管理」里的账号栏：显示当前登录邮箱、退出登录、修改密码。
+ *
+ * 取代了原来那个「API Key 掩码 + 铅笔」的输入框 ——
+ * 有账号体系之后再让人手填一串令牌，既危险（令牌等于密码）也没必要。
+ */
+export const AccountField = () => {
+  const t = useTranslate()
+  const user = useAuth((state) => state.user)
+  const [changing, setChanging] = useState(false)
+  const [oldPassword, setOldPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null)
+
+  const origin = apiOrigin()
+
+  const submit = async () => {
+    if (newPassword.length < 8) {
+      setNotice({ text: t('accountPasswordTooShort'), error: true })
+      return
+    }
+    if (newPassword !== confirm) {
+      setNotice({ text: t('accountPasswordMismatch'), error: true })
+      return
+    }
+    setBusy(true)
+    setNotice(null)
+    try {
+      const token = useAuth.getState()
+      void token
+      const result = await changePassword(
+        // 令牌就存在 settings 里，这里从 store 取当前值
+        (await import('../../services/settings.js')).useSettings.getState().apiKey ?? '',
+        oldPassword,
+        newPassword
+      )
+      if (result.token) {
+        replaceToken(result.token)
+      }
+      setNotice({ text: t('accountPasswordChanged'), error: false })
+      setChanging(false)
+      setOldPassword('')
+      setNewPassword('')
+      setConfirm('')
+    } catch (error) {
+      setNotice({
+        text: error instanceof Error && error.message ? error.message : t('accountPasswordFailed'),
+        error: true,
+      })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className={styles.cell}>
+      <div className={styles.account}>
+        <div className={styles.accountRow}>
+          <div>
+            <div className={styles.label}>{t('accountSignedInAs')}</div>
+            <div className={styles.accountEmail}>{user?.email ?? t('accountUnknown')}</div>
+            <div className={styles.accountMeta}>
+              {user?.role === 'admin' ? t('accountRoleAdmin') : t('accountRoleUser')} · {origin}
+            </div>
+          </div>
+          <button
+            type="button"
+            className={styles.accountAction}
+            onClick={() => void signOut()}
+          >
+            {t('accountSignOut')}
+          </button>
+        </div>
+
+        {changing ? (
+          <div className={styles.accountForm}>
+            <input
+              className={styles.accountInput}
+              type="password"
+              placeholder={t('accountOldPassword')}
+              autoComplete="current-password"
+              value={oldPassword}
+              onChange={(event) => setOldPassword(event.target.value)}
+            />
+            <input
+              className={styles.accountInput}
+              type="password"
+              placeholder={t('accountNewPassword')}
+              autoComplete="new-password"
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+            />
+            <input
+              className={styles.accountInput}
+              type="password"
+              placeholder={t('accountConfirmPassword')}
+              autoComplete="new-password"
+              value={confirm}
+              onChange={(event) => setConfirm(event.target.value)}
+            />
+            <div className={styles.accountFormActions}>
+              <button
+                type="button"
+                className={styles.accountAction}
+                disabled={busy}
+                onClick={() => void submit()}
+              >
+                {busy ? t('loginSubmitting') : t('confirm')}
+              </button>
+              <button
+                type="button"
+                className={styles.accountSecondary}
+                onClick={() => {
+                  setChanging(false)
+                  setNotice(null)
+                }}
+              >
+                {t('cancel')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className={styles.accountSecondary}
+            onClick={() => setChanging(true)}
+          >
+            {t('accountChangePassword')}
+          </button>
+        )}
+
+        {notice ? (
+          <div className={notice.error ? styles.error : styles.accountNotice}>{notice.text}</div>
+        ) : null}
+      </div>
+    </div>
+  )
+}

@@ -14,7 +14,8 @@ import { closeSearchPanel } from '../components/search/searchPanelState.js'
 import { SessionView } from '../components/session/SessionView.js'
 import { MobileHeader } from '../components/session/MobileHeader.js'
 import { Welcome } from '../components/session/Welcome.js'
-import { ensureApiKey } from '../components/settings/settingsDialogState.js'
+import { LoginScreen } from '../components/auth/LoginScreen.js'
+import { initAuth, useAuth } from '../services/auth/store.js'
 import { SettingsDialog } from '../components/settings/SettingsDialog.js'
 import { MemoryDialog } from '../components/memory/MemoryDialog.js'
 import { Toast } from '../components/base/Toast.js'
@@ -74,12 +75,15 @@ export const App = () => {
 
   useEffect(() => {
     void initChat()
-    // 首次打开先在设置里输入 API Key
-    ensureApiKey()
+    // 启动时校验登录态：没有令牌 / 令牌失效 → 显示登录页
+    void initAuth()
   }, [])
+
+  const authStatus = useAuth((state) => state.status)
 
   return (
     <>
+      {authStatus !== 'signedIn' ? <LoginScreen /> : null}
       <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : siderCollapsed ? null : <Sider />}
         <main className={styles.main}>

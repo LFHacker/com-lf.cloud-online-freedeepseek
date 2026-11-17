@@ -654,3 +654,41 @@ api.deepseek.com
 - 真实召回实测：「苹果电脑怎么切换输入法」→ 命中「mac系统切换中英文的快捷键」；「表格软件丢了一半」→ 命中 WPS 那段。
 - **代价**：每次检索 +300~700ms（embedding 的 HTTP 调用占主要部分）。
 - ⚠️ **待修**：`import-history` 会**内联向量化**，批量导入时必然撞 TPM（日志刷屏 + 大量失败，靠事后 backfill 补齐）。应加 `--no-embed` 之类开关，导入阶段只写文本。
+
+### 用户系统（v0.8.0A-debug，2026-11-18）
+
+**一、隔离方式：每用户一个记忆库文件，而不是在六张表加 user_id**
+
+- 加列意味着**每次查询**都要记得 `where user_id = ?`，漏一处就是跨用户泄露，且现有测试很难覆盖到。
+- 一个用户一个 `memory.db`（`/var/lib/ds-gateway/users/<userId>/memory.db`）是**结构上不可能串**。
+- 代价：备份要遍历目录（备份脚本需相应调整）。
+- `MemoryRegistry` 负责按 id 取库并缓存，`adoptLegacy()` 用 `VACUUM INTO` 把改造前的单库吸收到管理员账号名下（WAL 三文件不能直接 mv）。
+
+**二、账号**（`gateway/src/auth/store.ts`，auth.db）
+
+- 密码 **scrypt**（N=16384），不引原生依赖 —— 2C2G 的机器装 argon2 是自找麻烦。
+- 令牌只存 `sha256(token)`；30 天滑动续期；`last_seen_at` 每小时最多写一次。
+- **邮箱不存在与密码错返回同一个错误** `badCredentials`，且都跑一次 scrypt，避免用响应时间探测邮箱是否注册。
+- 改密码会吊销该用户全部会话（改完给当前设备重发一个，避免把自己踢掉）。
+- 接口：`POST /auth/register|login|logout|password`、`GET /auth/me`。
+
+**三、兼容旧客户端**
+
+- `GATEWAY_TOKEN` 仍然有效，映射到管理员账号 —— 手机上已经装着的旧版不会因为升级突然连不上。
+- `/auth/me` 返回 `legacyToken: true` 表示这次是旧令牌登录，前端可引导去设置密码。
+
+**四、权限**
+
+- `/memory/api/*` 管理接口**仅管理员**，普通用户 403。
+
+**五、迁移结果**
+
+- 老单库已迁到管理员 `3209391487@qq.com` 名下：1011 会话 / 7750 消息 / 7752 切片，向量覆盖率 100%。
+
+**六、踩坑**
+
+- **Node 直接跑 TS 不支持构造函数参数属性**（`constructor(private readonly x: T)`），类型擦除模式报 `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`。必须显式声明字段再赋值。
+- **`auth` 变量名冲突**：`index.ts` 里原本就用 `auth` 表示"从请求里读出的令牌"，新增的全局 `AuthStore` 实例必须叫别的名字（改成 `authStore`）。
+- **Caddy 证书链隐患**：默认签发的 ECDSA 证书链到 **ISRG Root X2**，Windows 与部分安卓设备**不信任 X2**（只信 X1）。表现为浏览器 `ERR_CONNECTION_RESET`、手机连不上，而 `node`/`openssl` 反而正常（自带 CA 库）。已在两个站点加 `key_type rsa2048`，删掉旧证书强制重签，链变为 YR1 → ISRG Root X1。
+- **本机 Kaspersky 仍会拦 Schannel 应用**（Chrome/curl/PowerShell 对 8443 握手被重置，openssl/Node 正常）——本地验收走 SSH 隧道 + 明文 HTTP 绕开。
+- 开发版改用 **release 密钥签名**，否则从发行版升级到开发版必须卸载（本地历史全丢）。

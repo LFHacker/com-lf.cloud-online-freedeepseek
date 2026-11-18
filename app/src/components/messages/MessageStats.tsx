@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { readLastTurnMeta } from '../../services/api/client.js'
+import { loadTurnMemory } from '../../services/usage/index.js'
 import {
   costOf,
   formatCost,
@@ -27,12 +28,18 @@ import styles from './MessageStats.module.css'
 export const MessageStats = ({
   usage,
   isLast,
+  sessionId,
+  streaming,
 }: {
   usage: unknown
   isLast: boolean
+  sessionId?: string
+  streaming?: boolean
 }) => {
   const t = useTranslate()
   const [pricing, setPricing] = useState<Pricing | null>(null)
+  /** 本轮是否写进记忆：null = 还不知道/还在流式中 */
+  const [memoryRecorded, setMemoryRecorded] = useState<boolean | null>(null)
 
   useEffect(() => {
     if (!usage) {
@@ -48,6 +55,28 @@ export const MessageStats = ({
       alive = false
     }
   }, [usage])
+
+  /**
+   * 回答结束后问一次"这轮存进记忆了吗"。
+   * 只在最新一条、且不在流式时查：写记忆发生在流结束后，提前问必然是 null。
+   */
+  useEffect(() => {
+    if (!isLast || streaming || !sessionId) {
+      return
+    }
+    let alive = true
+    const timer = setTimeout(() => {
+      void loadTurnMemory(sessionId).then((result) => {
+        if (alive && result) {
+          setMemoryRecorded(result.recorded)
+        }
+      })
+    }, 1200)
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
+  }, [isLast, streaming, sessionId])
 
   const numbers = usageOf(usage)
   if (!numbers) {
@@ -101,6 +130,16 @@ export const MessageStats = ({
             </span>
           </>
         ) : null}
+        {memoryRecorded === null ? null : (
+          <>
+            <span className={styles.sep} aria-hidden>
+              ·
+            </span>
+            <span className={memoryRecorded ? styles.memoryYes : styles.memoryNo}>
+              {memoryRecorded ? t('statsMemorySaved') : t('statsMemorySkipped')}
+            </span>
+          </>
+        )}
       </div>
       {/* 会话累计已移到输入框上方常驻显示（SessionUsageBar），这里只管本轮 */}
     </>

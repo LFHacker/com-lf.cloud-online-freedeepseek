@@ -30,6 +30,8 @@ export const SessionView = ({
           <div className={clsx(styles.title, siderCollapsed && styles.withCollapsedSider)}>
             {title}
           </div>
+          {/* 免责声明挪到标题栏正中：不占内容区、又始终可见 */}
+          <div className={styles.headerCaveat}>{t('contentCaveat')}</div>
         </div>
       )}
       <MessageList
@@ -37,9 +39,8 @@ export const SessionView = ({
         streaming={streaming}
         footer={
           <div className={styles.inputContainer}>
-            <SessionUsageBar session={session} />
             <ChatInput sessionId={session.id} />
-            <div className={styles.caveat}>{t('contentCaveat')}</div>
+            <SessionUsageBar session={session} />
           </div>
         }
       />

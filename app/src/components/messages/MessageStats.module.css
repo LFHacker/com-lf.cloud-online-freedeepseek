@@ -51,3 +51,13 @@
   font-weight: 600;
   color: var(--text-primary, #3c4149);
 }
+/* 记忆状态：绿=已存、灰=未存。不用红色——未存不一定出错（本地会话本就不入库） */
+.memoryYes {
+  color: var(--dsw-alias-text-success, #1a9c6b);
+  white-space: nowrap;
+}
+
+.memoryNo {
+  color: var(--text-secondary, #8a8f99);
+  white-space: nowrap;
+}

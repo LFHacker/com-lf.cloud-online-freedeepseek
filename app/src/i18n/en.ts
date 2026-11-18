@@ -174,6 +174,8 @@ export const en = {
   statsCostAbout: 'Cost about',
   statsSessionTotal: 'This conversation',
   statsTurns: 'turns',
+  statsMemorySaved: 'saved to memory',
+  statsMemorySkipped: 'not saved to memory',
   loginTitle: 'Freedeepseek',
   loginSignIn: 'Sign in',
   loginSignUp: 'Sign up',

@@ -169,6 +169,8 @@ export const zh = {
   statsCostAbout: '本次费用约',
   statsSessionTotal: '本对话累计',
   statsTurns: '轮',
+  statsMemorySaved: '本轮已存入记忆',
+  statsMemorySkipped: '本轮未存入记忆',
   loginTitle: '自由的deepseek',
   loginSignIn: '登录',
   loginSignUp: '注册',

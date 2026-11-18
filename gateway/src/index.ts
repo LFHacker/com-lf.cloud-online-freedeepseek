@@ -152,6 +152,15 @@ const PROFILE = readProfileConfig(process.env)
  * DeepSeek 返回 prompt_cache_hit_tokens / prompt_cache_miss_tokens，
  * 不记录就永远不知道缓存到底有没有命中——而这正是"多带原文"能不能成立的前提。
  */
+/**
+ * 每个会话「最近一轮回答是否写进记忆」。
+ *
+ * 为什么要记：写记忆发生在**流式响应结束之后**，那时响应头早就发出去了，
+ * 没法用头告诉客户端。所以存在内存里，让 App 在回答结束后单独问一次。
+ * 只保留最近一轮，重启即清空（够用：界面要显示的是"刚才这轮"）。
+ */
+const lastRecordBySession = new Map<string, { recorded: boolean; chunks: number; at: number }>()
+
 const usageStats = {
   requests: 0,
   promptTokens: 0,
@@ -757,6 +766,11 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
           now: Date.now(),
           occurrence,
         })
+        lastRecordBySession.set(sessionId, {
+          recorded: recorded.stored,
+          chunks: recorded.chunks,
+          at: Date.now(),
+        })
         if (recorded.stored) {
           stats.memoryWrites += 1
         }
@@ -1066,6 +1080,34 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       console.warn('[gateway] 余额查询失败:', error instanceof Error ? error.message : error)
       json(res, 502, { ok: false, error: 'balance_failed', message: '查询余额失败，请稍后重试' })
     }
+    return
+  }
+
+  /**
+   * 查询本会话最近一轮回答有没有写进记忆。
+   * App 在回答结束后调一次，用于显示「已存入记忆 / 未存入」。
+   */
+  if (req.method === 'GET' && url.pathname === '/memory/last-turn') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const session = (url.searchParams.get('session') ?? '').trim()
+    if (!session || !SESSION_ID_RE.test(session)) {
+      json(res, 400, { ok: false, error: 'bad_session', message: '缺少有效的会话 id' })
+      return
+    }
+    const record = lastRecordBySession.get(session)
+    json(res, 200, {
+      ok: true,
+      /** null = 这一轮还没走到写记忆那一步（例如还在流式中） */
+      recorded: record ? record.recorded : null,
+      chunks: record?.chunks ?? 0,
+      at: record?.at ?? 0,
+      /** 本会话是否属于"会记忆"的范围（local 范围只记本会话，不跨会话召回） */
+      memoryEnabled: Boolean(user),
+    })
     return
   }
 

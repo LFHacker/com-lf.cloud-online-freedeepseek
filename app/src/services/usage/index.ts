@@ -222,3 +222,30 @@ export const formatCost = (value: number, currency = 'USD'): string => {
   }
   return `${symbol}${value.toFixed(3)}`
 }
+
+/**
+ * 查询本会话最近一轮是否写进了记忆。
+ *
+ * 为什么单独查：写记忆发生在**流式响应结束之后**，那时响应头已经发出去了，
+ * 没法在同一个响应里告诉客户端。所以回答结束后单独问一次。
+ */
+export const loadTurnMemory = async (
+  sessionId: string
+): Promise<{ recorded: boolean | null; chunks: number } | null> => {
+  if (!sessionId) {
+    return null
+  }
+  try {
+    const response = await fetch(
+      `${apiOrigin()}/memory/last-turn?session=${encodeURIComponent(sessionId)}`,
+      { headers: { 'x-api-key': sessionToken() } }
+    )
+    if (!response.ok) {
+      return null
+    }
+    const payload = (await response.json()) as { recorded?: boolean | null; chunks?: number }
+    return { recorded: payload.recorded ?? null, chunks: payload.chunks ?? 0 }
+  } catch {
+    return null
+  }
+}

@@ -40,7 +40,7 @@ import { estimateCost, isPeakNow, offPeakTable, readPriceTable } from './usage/c
  * 网关版本。1.2.x 起：会话同步进入「云端为主」阶段 2（分页游标 + pinned + 墓碑优先）
  * 与阶段 3（附件引用计数 + 回收）。/health 里能看到它，用来确认线上跑的是哪份代码。
  */
-const VERSION = '1.2.1'
+const VERSION = '1.2.2'
 const PORT = Number(process.env.PORT ?? 8787)
 /** 默认只监听环回：前面由 Caddy 做 TLS 与反代 */
 const HOST = process.env.HOST ?? '127.0.0.1'
@@ -427,7 +427,14 @@ const setCorsHeaders = (req: IncomingMessage, res: ServerResponse): boolean => {
   }
   res.setHeader('access-control-allow-origin', origin)
   res.setHeader('access-control-allow-credentials', 'true')
-  res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS')
+  /**
+   * ⚠️ 这里踩过一次大的：原来只有 GET/POST/DELETE。附件上传走的是
+   * `PUT /sync/files/:id`，而 **PUT 一定会触发预检**（简单方法只有 GET/HEAD/POST），
+   * 于是浏览器在预检那一步就把请求拒了 —— 服务端**一个字节都没收到**，
+   * 网关日志里连记录都没有。表现是：会话同步一切正常、附件永远 0 个。
+   * 所以这里必须把服务端真正支持的方法全列上。
+   */
+  res.setHeader('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
   /**
    * 预检通过的条件是：浏览器列出的每一个请求头，都必须在这里出现。
    *

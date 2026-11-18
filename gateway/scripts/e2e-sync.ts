@@ -270,7 +270,28 @@ try {
     JSON.stringify(acceptable.json)
   )
 
-  // ── 8. 鉴权 ───────────────────────────────────────
+  // ── 8. 附件上传的 CORS 预检（PUT）────────────────────
+  /**
+   * 这条是补的：PUT **一定会触发预检**（简单方法只有 GET/HEAD/POST），
+   * 而服务端 allow-methods 曾经漏了 PUT → 浏览器在预检就拒掉，
+   * 服务端一个字节都收不到、日志里连记录都没有。
+   * 症状是"会话全同步成功，附件永远 0 个"，极难从日志反推。
+   */
+  const preflight = await fetch(`${BASE}/sync/files/preflight_probe_1`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'http://localhost',
+      'Access-Control-Request-Method': 'PUT',
+      'Access-Control-Request-Headers': 'content-type,x-api-key',
+    },
+  })
+  const allowMethods = String(preflight.headers.get('access-control-allow-methods') ?? '')
+  check('预检允许 PUT（否则附件永远传不上去）', /\bPUT\b/.test(allowMethods), allowMethods)
+  check('预检回显 Origin', preflight.headers.get('access-control-allow-origin') === 'http://localhost')
+  const allowHeaders = String(preflight.headers.get('access-control-allow-headers') ?? '').toLowerCase()
+  check('预检允许 content-type 头', allowHeaders.includes('content-type'), allowHeaders)
+
+  // ── 9. 鉴权 ───────────────────────────────────────
   const anonymous = await fetch(`${BASE}/sync/sessions`)
   check('未带令牌返回 401', anonymous.status === 401, String(anonymous.status))
 } finally {

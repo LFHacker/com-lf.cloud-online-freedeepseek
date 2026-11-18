@@ -359,6 +359,21 @@ try {
     throw new Error('app did not render')
   }
 
+  /**
+   * 附件上传走 PUT，而 PUT **一定触发 CORS 预检**。
+   * 服务端 allow-methods 曾经漏了 PUT → 浏览器在预检就拒掉、服务端一个字节都收不到，
+   * 症状是"会话全同步成功、附件永远 0 个"。这条断言就是盯这个的：
+   * 用真浏览器从页面源发一次跨域 PUT，必须拿到 200。
+   */
+  const putProbe = await evaluate(
+    `fetch('http://127.0.0.1:${GATEWAY_PORT}/sync/files/probe_file_0001', {
+       method: 'PUT',
+       headers: { 'x-api-key': ${JSON.stringify(TOKEN)}, 'Content-Type': 'application/octet-stream' },
+       body: 'probe',
+     }).then((r) => String(r.status)).catch((e) => 'ERR ' + e.message)`
+  )
+  check('浏览器跨域 PUT 能上传附件（CORS 允许 PUT）', putProbe === '200', putProbe)
+
   // ── 阶段 2-1：列表来自云端 ──────────────────────
   const listed = await waitFor(async () => (await bodyText()).includes(seedTitle), 15_000, '云端会话出现在列表')
   check('本地库为空时，列表仍显示云端会话', listed)

@@ -35,6 +35,16 @@ create table if not exists chunks (
   session_id   text not null,
   message_id   text not null,
   body         text not null,
+  /**
+   * 紧随其后的助手回答。
+   *
+   * ⚠️ 只用于**注入时给模型看**，绝不参与检索索引（FTS/向量都只建在 body 上）。
+   * 原因见 store.recordMessage 的注释：把助手旧输出当索引内容，会让模型把自己的话
+   * 当事实来源（实测出现「我叫DeepSeek」顶掉「我叫刘飞」的自我强化幻觉）。
+   * 但完全不给，又变成"只有问题没有答案"——问「Flutter 找不到 Chrome 怎么办」时，
+   * 资料里只有那句报错，模型只能复述。
+   */
+  context      text,
   created_at   integer not null
 );
 create index if not exists idx_chunks_session on chunks(session_id);
@@ -86,7 +96,21 @@ export const openMemoryDb = (path: string): MemoryDb => {
   db.exec('pragma cache_size = -8000;')
   db.exec('pragma busy_timeout = 3000;')
   db.exec(SCHEMA)
+  migrate(db)
   return db
+}
+
+/**
+ * 幂等迁移：`create table if not exists` 不会给**已存在**的表补列，
+ * 所以老库必须显式 ALTER，否则读 chunks.context 会直接报错。
+ */
+const migrate = (db: MemoryDb): void => {
+  const columns = new Set(
+    (db.prepare('pragma table_info(chunks)').all() as Array<{ name: string }>).map((row) => row.name)
+  )
+  if (!columns.has('context')) {
+    db.exec('alter table chunks add column context text')
+  }
 }
 
 /** 是否已存在某个会话（用于判断 scope 冲突） */

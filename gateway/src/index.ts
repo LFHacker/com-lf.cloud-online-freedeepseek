@@ -756,6 +756,18 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
       })
       if (recorded.stored) {
         stats.memoryWrites += 1
+        /**
+         * 把这一轮的回答挂到上一条用户消息的切片上。
+         * 记忆只索引用户说的话，但只给问题不给答案，模型就只能复述报错。
+         * 失败不影响聊天：context 只是锦上添花。
+         */
+        try {
+          memory.attachLastAssistantReply(sessionId, text)
+        } catch (error) {
+          console.error(
+            `[gateway] 挂接助手回答失败：${error instanceof Error ? error.message : String(error)}`
+          )
+        }
       }
     } catch (error) {
       console.error(

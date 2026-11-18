@@ -27,6 +27,8 @@ export type MemoryHit = {
   sessionId: string
   createdAt: number
   body: string
+  /** 紧随其后的助手回答：只用于注入，不参与检索打分（索引仍只建在 body 上） */
+  context?: string | null
   /** bm25 分数，越负越相关 */
   score: number
 }
@@ -514,6 +516,40 @@ export class MemoryStore {
     return hits
   }
 
+  /**
+   * 把助手这一轮的回答，挂到本会话**最近一条用户消息**的切片上。
+   *
+   * 为什么在写入时就挂：记忆只索引用户说的话（防自我强化幻觉），
+   * 但只给问题不给答案，模型看到「Flutter 找不到 Chrome」这种报错就没法回答，
+   * 只能复述。挂上回答既保留原有索引口径，又让注入资料成对。
+   *
+   * 幂等：已经有 context 的切片不覆盖（重复调用不会把旧回答换掉）。
+   */
+  attachLastAssistantReply(sessionId: string, reply: string, maxChars = 600): number {
+    const text = reply.trim()
+    if (!text) {
+      return 0
+    }
+    const lastUser = this.db
+      .prepare(
+        `select id, created_at from messages
+          where session_id = ? and role = 'user'
+          order by created_at desc, id desc limit 1`
+      )
+      .get(sessionId) as { id: string; created_at: number } | undefined
+    if (!lastUser) {
+      return 0
+    }
+    const result = this.db
+      .prepare(
+        `update chunks set context = ?
+          where message_id = ?
+            and (context is null or context = '')`
+      )
+      .run(text.slice(0, maxChars), lastUser.id)
+    return Number(result.changes)
+  }
+
   /** 按 id 取切片原文（评测与调试用） */
   chunkBody(chunkId: string): string | null {
     const row = this.db.prepare('select body from chunks where id = ?').get(chunkId) as
@@ -847,16 +883,22 @@ export class MemoryStore {
   ): MemoryHit[] {
     const hits: MemoryHit[] = []
     let used = 0
+    // 上下文批量取，避免每命中一条就查一次库
+    const contextOf = this.db.prepare('select context from chunks where id = ?')
     for (const row of rows) {
-      if (used + row.body.length > this.maxChars) {
+      const context = (contextOf.get(row.chunk_id) as { context: string | null } | undefined)?.context
+      const extra = context ? context.length : 0
+      // 上下文也算进预算：否则带上下文时总字数会大幅超出 maxChars
+      if (used + row.body.length + extra > this.maxChars) {
         continue
       }
-      used += row.body.length
+      used += row.body.length + extra
       hits.push({
         chunkId: row.chunk_id,
         sessionId: row.session_id,
         createdAt: Number(row.created_at),
         body: row.body,
+        context: context ?? null,
         score: row.s,
       })
     }
@@ -875,9 +917,19 @@ export class MemoryStore {
     if (hits.length === 0) {
       return ''
     }
-    const lines = hits.map(
-      (hit) => `[${formatDay(hit.createdAt)} · 会话 ${hit.sessionId.slice(0, 8)}] ${hit.body}`
-    )
+    /**
+     * 命中是把「用户当时说的话」和「助手当时的回答」一起给模型。
+     * 带上回答的原因：用户问「Flutter 找不到 Chrome 怎么办」时，
+     * 他这句话里只有报错，解法在回答里——只给问题，模型只能复述报错。
+     */
+    const lines = hits.map((hit) => {
+      const head = `[${formatDay(hit.createdAt)} · 会话 ${hit.sessionId.slice(0, 8)}]`
+      const context = hit.context?.trim()
+      if (!context) {
+        return `${head} ${hit.body}`
+      }
+      return `${head} 用户说：${hit.body}\n（当时助手的回答：${context}）`
+    })
     return [
       '<回忆>',
       '以下是你在「其他对话」中与用户聊过的内容，按时间从近到远。',

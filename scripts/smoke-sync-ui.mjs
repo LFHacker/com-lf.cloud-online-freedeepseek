@@ -390,6 +390,17 @@ try {
   }
   const text1 = await bodyText()
   check('置顶分组显示（pinned 来自服务端）', text1.includes('置顶'), text1.slice(0, 200))
+
+  /**
+   * 同步成功后状态条必须自己消失。
+   * 这条断言是补的：v0.17.0B 里收尾逻辑拿 `phase` 判"队列冲干净没有"，
+   * 而那时 phase 恒为 syncing → 永远不报完成，顶部一直卡「正在同步…」。
+   */
+  const barGone = await waitFor(async () => {
+    const text = await bodyText()
+    return !text.includes('正在同步') && !text.includes('同步失败')
+  }, 10_000, '同步结束后状态条消失')
+  check('同步成功后顶部状态条自动消失（不卡「正在同步」）', barGone)
   await shoot('01-cloud-list')
 
   // ── 打开云端会话（正文按需下载，所以要先联网打开） ──

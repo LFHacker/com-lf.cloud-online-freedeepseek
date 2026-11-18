@@ -12,7 +12,7 @@
 import { loadSyncMeta, saveSyncMeta } from '../chat/db.js'
 import { backoffDelay } from './backoff.js'
 import { fetchSessionIndex } from './index.js'
-import { flushOutbox } from './outbox.js'
+import { flushOutbox, pendingOutboxCount } from './outbox.js'
 import { markRetry, setSync, useSync } from './status.js'
 
 export type SyncOutcome = 'ok' | 'offline' | 'error' | 'suspicious'
@@ -71,10 +71,22 @@ export const syncNow = async (): Promise<SyncOutcome> => {
     await saveSyncMeta({ lastSyncedAt: String(Date.now()) })
     await flushOutbox({ force: true })
     /**
-     * 队列还没冲干净（例如消息推送失败）就别报"同步完成" ——
-     * 那条错误状态是队列设置的，这里覆盖掉会让用户以为消息已经发出去了。
+     * 队列里还有没发出去的消息，就别报"同步完成" ——
+     * 那几条的错误状态是队列自己设置的，这里覆盖成 idle 会让用户以为消息已经发出去了。
+     *
+     * ⚠️ 判据必须是**队列**，不能判 `phase`：走到这里 phase 一定是 'syncing'
+     * （本函数开头刚设的），拿它做条件就成了"永远不报完成"，
+     * 顶部会一直卡在「正在同步…」——真踩过这一脚（v0.17.0B）。
      */
-    if (useSync.getState().phase !== 'idle') {
+    if (pendingOutboxCount() > 0) {
+      /**
+       * 正常情况下队列自己已经把状态设成"重试中/失败"了；
+       * 只有它没能给结论时（例如没有令牌、根本没发出去）才会还停在 syncing，
+       * 这时补一个终态，免得状态条又卡在「正在同步」。
+       */
+      if (useSync.getState().phase === 'syncing') {
+        setSync({ phase: 'offline', retryAt: 0, message: '有消息待发送，联网后会自动补发' })
+      }
       return 'offline'
     }
     setSync({

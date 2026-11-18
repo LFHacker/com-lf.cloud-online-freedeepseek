@@ -8,6 +8,7 @@ import {
   IconFollowsystemOutline16,
   IconLightOutline16,
   IconLinkOutline16,
+  IconRefreshOutline16,
   IconSettingsOutline16,
   IconUploadOutline14,
 } from '../base/icons.js'
@@ -118,6 +119,7 @@ const SettingsContent = () => {
             <>
               <AccountField />
               <UpstreamKeyField />
+              <CloudSyncField disabled={historyBusy} />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
               <SettingCell
@@ -856,6 +858,89 @@ const ImportHistory = ({
 }
 
 /** 将全部会话及图片导出为 ZIP 文件并下载 */
+/**
+ * 「同步到云端」：把本地会话与附件补推到云端，并把结果显示出来。
+ *
+ * 为什么必须有一个手动入口：
+ *   导入 1000 条历史之后的那次自动推送是 fire-and-forget —— 它失败时界面上**什么都没有**，
+ *   用户只能得出"云端就是没有"这个结论（真实事故）。而重试一次要重发上百 MB，
+ *   手机要在前台待几分钟，所以必须：① 增量（已同步的跳过）② 看得见进度 ③ 能反复点。
+ */
+let cloudSyncRunning = false
+
+const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
+  const t = useTranslate()
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState<Status>(null)
+
+  const run = async () => {
+    if (cloudSyncRunning) {
+      return
+    }
+    cloudSyncRunning = true
+    setBusy(true)
+    setStatus({ key: 'cloudSyncBusy' })
+    try {
+      const { pushEverything } = await import('../../services/sync/full.js')
+      const result = await pushEverything((progress) => {
+        if (progress.phase === 'sessions') {
+          setStatus({
+            key: 'cloudSyncSessions',
+            params: { done: progress.done, total: progress.total },
+          })
+        } else if (progress.phase === 'files') {
+          setStatus({
+            key: 'cloudSyncFiles',
+            params: { done: progress.done, total: progress.total },
+          })
+        }
+      })
+      const failed = result.sessionsFailed + result.filesFailed
+      const nothingHappened =
+        result.sessionsPushed === 0 && result.filesUploaded === 0 && result.sessionsSkipped === 0
+      setStatus(
+        nothingHappened && result.error
+          ? { key: 'cloudSyncFailed', params: { message: result.error }, error: true }
+          : {
+              key: failed > 0 ? 'cloudSyncPartial' : 'cloudSyncDone',
+              params: {
+                sessions: result.sessionsPushed,
+                files: result.filesUploaded,
+                skipped: result.sessionsSkipped,
+                failed,
+              },
+              error: failed > 0,
+            }
+      )
+    } catch (error) {
+      setStatus(errorStatus('cloudSyncFailed', error))
+    } finally {
+      cloudSyncRunning = false
+      setBusy(false)
+    }
+  }
+
+  return (
+    <SettingCell
+      label={t('cloudSyncLabel')}
+      description={t('cloudSyncDescription')}
+      status={status}
+      action={
+        <Button
+          variant="outlined"
+          size="m"
+          className={styles.cellButton}
+          disabled={disabled || busy}
+          onClick={() => void run()}
+        >
+          <IconRefreshOutline16 />
+          {t(busy ? 'cloudSyncBusy' : 'cloudSyncAction')}
+        </Button>
+      }
+    />
+  )
+}
+
 const ExportHistory = ({ disabled }: { disabled: boolean }) => {
   const t = useTranslate()
   const empty = useChatStore((state) => state.sessions.length === 0)

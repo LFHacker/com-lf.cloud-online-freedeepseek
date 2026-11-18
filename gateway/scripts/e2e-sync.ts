@@ -239,7 +239,38 @@ try {
   const rebuild = await call('/sync/files/refs/rebuild', { method: 'POST', body: '{}' })
   check('引用重建成功', rebuild.status === 200 && Number(rebuild.json.sessions) > 0, JSON.stringify(rebuild.json))
 
-  // ── 7. 鉴权 ───────────────────────────────────────
+  // ── 7. 请求体上限：客户端必须自己切批 ────────────────
+  // 这条约束被客户端 bug 违反过：按"50 条一批"发，而单条可能几百 KB，
+  // 于是每一批都超限，最终一条都没推上去。
+  /**
+   * 服务端单批上限 8MB。这里**只验一个"客户端切批后的体积能过"**，
+   * 不验超限的反例：真发 9MB 时服务端会在读完 body 之前结束响应，
+   * 客户端此时仍在发数据 → 连接被重置，而 undici 会把它抛成**进程级未捕获异常**
+   * （TCP.onStreamRead），把整个测试进程带走 —— 测一个已知行为不值得这个代价。
+   *
+   * 反例由客户端单测覆盖：`app/scripts/test-sync-logic.ts` 断言切批后
+   * 每批都 ≤3.5MB，也就是"永远不会发出会触发重置的请求"。
+   */
+  const pad = 'x'.repeat(1024 * 1024)
+  const big = (index: number) => ({
+    id: `big${index}`,
+    title: `big${index}`,
+    createdAt: 9000,
+    updatedAt: 9000 + index,
+    fileIds: [],
+    payload: JSON.stringify({ id: `big${index}`, messages: [], pad }),
+  })
+  const acceptable = await call('/sync/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ sessions: Array.from({ length: 3 }, (_, i) => big(i)) }),
+  })
+  check(
+    '按体积切批后的批次（3MB）正常写入',
+    acceptable.status === 200 && acceptable.json.written === 3,
+    JSON.stringify(acceptable.json)
+  )
+
+  // ── 8. 鉴权 ───────────────────────────────────────
   const anonymous = await fetch(`${BASE}/sync/sessions`)
   check('未带令牌返回 401', anonymous.status === 401, String(anonymous.status))
 } finally {

@@ -10,6 +10,7 @@
  * 运行：node app/scripts/test-sync-logic.ts
  */
 import { backoffDelay, BASE_DELAY_MS, MAX_DELAY_MS } from '../src/services/sync/backoff.ts'
+import { splitByBytes, SPLIT_MAX_BYTES, SPLIT_MAX_ITEMS } from '../src/services/sync/batching.ts'
 import { cloudLooksWiped, mergeSessionIndex } from '../src/services/sync/merge.ts'
 
 let pass = 0
@@ -137,6 +138,42 @@ const meta = (id: string, updatedAt: number, extra: Record<string, unknown> = {}
   const high = backoffDelay(3, () => 1)
   check('抖动下限约 -20%', low === Math.round(8000 * 0.8), String(low))
   check('抖动上限约 +20%', high === Math.round(8000 * 1.2), String(high))
+}
+
+// ── 10. 按体积切批（这次"云端 0 条"事故的直接原因）──
+{
+  const item = (bytes: number) => ({ payload: 'x'.repeat(bytes) })
+
+  const many = Array.from({ length: 120 }, () => item(100 * 1024)) // 12 MB / 120 条
+  const batches = splitByBytes(many)
+  check(
+    '每批都不超过字节上限',
+    batches.every((batch) => batch.reduce((sum, one) => sum + one.payload.length, 0) <= SPLIT_MAX_BYTES),
+    JSON.stringify(batches.map((batch) => batch.length))
+  )
+  check(
+    '每批都不超过条数上限',
+    batches.every((batch) => batch.length <= SPLIT_MAX_ITEMS),
+    JSON.stringify(batches.map((batch) => batch.length))
+  )
+  check(
+    '一条不丢、顺序不变',
+    batches.flat().length === many.length &&
+      batches.flat().every((one, index) => one === many[index]),
+    `${batches.flat().length} / ${many.length}`
+  )
+
+  // 官方导出里常见的单条体积：300 KB × 50 条 = 15 MB（老逻辑必然整批 413）
+  const realistic = Array.from({ length: 50 }, () => item(300 * 1024))
+  const realisticBatches = splitByBytes(realistic)
+  check('50 条 × 300KB 会被切成多批（不再整批 413）', realisticBatches.length >= 3, String(realisticBatches.length))
+
+  // 单条自己超大：独占一批，不去拖累别的会话
+  const huge = [item(10 * 1024), item(9 * 1024 * 1024), item(10 * 1024)]
+  const hugeBatches = splitByBytes(huge)
+  check('超大单条自己占一批', hugeBatches.some((batch) => batch.length === 1 && batch[0].payload.length > SPLIT_MAX_BYTES))
+  check('超大单条两侧的正常会话仍会被推送', hugeBatches.flat().length === 3)
+  check('空输入不产生空批', splitByBytes([]).length === 0)
 }
 
 console.log(`\n${pass} 项通过，${fail} 项失败`)

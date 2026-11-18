@@ -254,6 +254,23 @@ export const deleteSession = async (sessionId: string): Promise<void> => {
   ])
 }
 
+/**
+ * 本地所有会话引用的附件 id（并集）。
+ *
+ * 从 **sessionSummaries** 取，不读正文：摘要里已经存了 fileIds，
+ * 而 1000 条会话的正文加起来上百 MB —— 为了一个 id 集合去读它不划算。
+ */
+export const loadSessionFileIds = async (): Promise<Set<string>> => {
+  const rows = await (await getDB()).getAll('sessionSummaries')
+  const ids = new Set<string>()
+  for (const row of rows) {
+    for (const id of row.fileIds ?? []) {
+      ids.add(id)
+    }
+  }
+  return ids
+}
+
 const putFiles = async (store: 'files' | 'filesStaging', files: StoredFile[]) => {
   const tx = (await getDB()).transaction(store, 'readwrite')
   await Promise.all([...files.map((file) => tx.store.put(file)), tx.done])

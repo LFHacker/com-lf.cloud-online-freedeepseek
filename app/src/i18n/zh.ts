@@ -233,6 +233,16 @@ export const zh = {
   historyExportDescription:
     '包含所有历史对话及本地图片原件；其他附件仅保留文件信息，不包含 API Key。',
   exportAllDownload: '下载',
+  cloudSyncLabel: '同步到云端',
+  cloudSyncDescription:
+    '把本机的会话与附件补推到云端；云端已经是最新的会自动跳过。推送失败时会显示原因，可反复重试。',
+  cloudSyncAction: '开始同步',
+  cloudSyncBusy: '同步中…',
+  cloudSyncSessions: '正在推送会话 {done}/{total}',
+  cloudSyncFiles: '正在推送附件 {done}/{total}',
+  cloudSyncDone: '已推送 {sessions} 条会话、{files} 个附件（{skipped} 条已是最新）',
+  cloudSyncPartial: '推送完成：会话 {sessions} 条、附件 {files} 个，失败 {failed} 项',
+  cloudSyncFailed: '同步失败：{message}',
   deleteAllSessions: '删除所有对话',
   deleteAllSessionsModalTitle: '删除后，所有对话都将被清空且无法找回',
   deleteAllSessionsModalDescription: '本地保存的附件及未发送的草稿也将被删除。',

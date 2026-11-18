@@ -344,6 +344,35 @@ try {
   await sleep(600)
   await shoot('session-usage-desktop')
 
+  // 设置 → 数据管理：确认「同步到云端」这一行的位置与文案
+  await evaluate(`(() => {
+    const btn = [...document.querySelectorAll('button')].find((el) => el.textContent.trim() === '设置')
+    btn?.click()
+    return Boolean(btn)
+  })()`)
+  await sleep(500)
+  const switched = await evaluate(`(() => {
+    const tab = [...document.querySelectorAll('button')].find(
+      (el) => el.textContent.trim() === '数据管理'
+    )
+    tab?.click()
+    return Boolean(tab)
+  })()`)
+  await sleep(500)
+  console.log(`  设置面板：${switched ? '已切到数据管理' : '没找到数据管理 tab'}`)
+  // 滚到设置内容底部：新加的「同步到云端」在账号与 Key 之后
+  const scrolled = await evaluate(`(() => {
+    const el = [...document.querySelectorAll('div')].find(
+      (node) => node.scrollHeight > node.clientHeight + 50 && node.clientHeight > 200
+    )
+    if (!el) return false
+    el.scrollTop = el.scrollHeight
+    return true
+  })()`)
+  await sleep(400)
+  console.log(`  设置内容滚动：${scrolled ? 'ok' : '没找到可滚动容器'}`)
+  await shoot('settings-cloud-sync')
+
   // 手机尺寸：先桌面打开会话，再缩到 390x844（移动端抽屉是关着的，没法点列表）
   await page('Emulation.setDeviceMetricsOverride', {
     width: 390,

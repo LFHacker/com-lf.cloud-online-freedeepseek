@@ -1,19 +1,18 @@
 /**
  * 全量同步：把本机所有会话和附件推到云端。
  *
- * 这是"标准做法"该有的样子，不是给某个人凑合用：
+ *  1. **增量**：先拉云端清单，已经是云端最新的一律跳过 —— 1000 条会话重推一次是 100 MB，
+ *     手机上重推几轮就废了
+ *  2. **按体积切批**（`pushSessions` 内部）：单条几百 KB 的会话按 50 条一批必然撞 8 MB 上限
+ *  3. **可观察**：每一步都上报进度与最终成败，界面据此显示"推了多少、失败多少"
+ *  4. **不阻塞**：附件逐张上传，单张失败只记数
  *
- *  1. **断点可用**：分批推、按 id 去重，中途失败下次继续，不从头再来
- *  2. **幂等**：会话按 updatedAt 取较新者；附件 id 即内容哈希，已存在就跳过
- *  3. **可观察**：每一步都有进度回调（调用方拿去显示 N/M）
- *  4. **不阻塞**：附件逐张上传，单张失败只记数，不影响其余
- *  5. **可恢复**：失败不抛给用户界面，返回统计；下次同步自然补齐
- *
- * 为什么附件要在这里全量推：导入时图片本来就在本地，
- * 换设备后如果没有云端副本，会话里就只剩文件名。
+ * 这套东西是给「导入 1000 条历史之后」用的：那次自动推送是 fire-and-forget，
+ * 失败了界面上什么都没有，用户只能看到"云端就是没有"。
  */
-import { loadFile, loadSession, loadSessionSummaries } from '../chat/db.js'
-import { listRemoteFiles, pushSessions, uploadAttachment } from './index.js'
+import { loadSession, loadSessionFileIds, loadSessionSummaries } from '../chat/db.js'
+import { fetchSessionIndex, listRemoteFiles, pushSessions, uploadAttachment } from './index.js'
+import { loadFile } from '../chat/db.js'
 import type { Session } from '../chat/types.js'
 
 export type FullSyncProgress = {
@@ -25,78 +24,82 @@ export type FullSyncProgress = {
 
 export type FullSyncResult = {
   sessionsPushed: number
+  /** 云端已经是最新、跳过的条数 */
+  sessionsSkipped: number
   sessionsFailed: number
   filesUploaded: number
   filesSkipped: number
   filesFailed: number
-}
-
-/** 从一条会话里收集所有附件 id（去重由调用方做） */
-const collectFileIds = (session: Session): string[] => {
-  const ids: string[] = []
-  for (const message of session.messages ?? []) {
-    const files = (message as { files?: Array<{ id?: string }> }).files
-    if (!Array.isArray(files)) {
-      continue
-    }
-    for (const file of files) {
-      if (typeof file?.id === 'string' && file.id.length >= 8) {
-        ids.push(file.id)
-      }
-    }
-  }
-  return ids
+  /** 第一条失败原因（给界面显示，不刷屏） */
+  error?: string
 }
 
 /**
- * 全量推送。
+ * 全量推送（增量）。
  *
- * @param onProgress 每完成一批回调一次（用于界面进度条）
+ * @param onProgress 每完成一批回调一次（界面据此显示 N/M）
  */
 export const pushEverything = async (
   onProgress?: (progress: FullSyncProgress) => void
 ): Promise<FullSyncResult> => {
   const result: FullSyncResult = {
     sessionsPushed: 0,
+    sessionsSkipped: 0,
     sessionsFailed: 0,
     filesUploaded: 0,
     filesSkipped: 0,
     filesFailed: 0,
   }
 
-  // ---- 1) 会话：分批推，批内失败不影响后续 ----
+  /**
+   * ---- 1) 先问云端有哪些、各自多新 ----
+   * 清单拉失败（null）时不能当"云端是空的"去推全量：那等于把 100 MB 又发一遍，
+   * 而且可能是离线。这里直接如实报错，让用户看得到"没推成"。
+   */
+  const remote = await fetchSessionIndex()
+  if (!remote) {
+    result.error = '拿不到云端清单（网络或登录状态有问题）'
+    onProgress?.({ phase: 'done', done: 1, total: 1 })
+    return result
+  }
+  const cloudUpdatedAt = new Map(remote.sessions.map((item) => [item.id, item.updatedAt]))
+
+  // ---- 2) 挑出需要推的会话 ----
   const summaries = await loadSessionSummaries()
-  const sessions: Session[] = []
+  const pending: Session[] = []
   for (const summary of summaries) {
-    const session = await loadSession(summary.id)
-    if (session) {
-      sessions.push(session)
+    if ((cloudUpdatedAt.get(summary.id) ?? 0) >= summary.updatedAt) {
+      result.sessionsSkipped += 1
+      continue
     }
+    const session = await loadSession(summary.id)
+    if (!session) {
+      // 摘要还在、正文没了（本地存储被清过）：如实计入失败，别假装推过
+      result.sessionsFailed += 1
+      continue
+    }
+    pending.push(session)
   }
 
+  // ---- 3) 推会话：每 50 条一组，组内再按体积切 ----
   const BATCH = 50
-  for (let index = 0; index < sessions.length; index += BATCH) {
-    const batch = sessions.slice(index, index + BATCH)
+  for (let index = 0; index < pending.length; index += BATCH) {
+    const batch = pending.slice(index, index + BATCH)
     const pushed = await pushSessions(batch)
     result.sessionsPushed += pushed.written
     result.sessionsFailed += pushed.failed
+    result.error ??= pushed.message
     onProgress?.({
       phase: 'sessions',
-      done: Math.min(index + BATCH, sessions.length),
-      total: sessions.length,
+      done: Math.min(index + BATCH, pending.length),
+      total: pending.length,
     })
   }
 
-  // ---- 2) 附件：先问云端有哪些，只传缺的 ----
-  const fileIds = new Set<string>()
-  for (const session of sessions) {
-    for (const id of collectFileIds(session)) {
-      fileIds.add(id)
-    }
-  }
-  const remote = await listRemoteFiles()
-  // 清单拉不到（网络失败）不等于云端没有：全部当缺的上传，失败的自会计数
-  const missing = [...fileIds].filter((id) => !remote || !remote.has(id))
+  // ---- 4) 附件：只传云端还没有的（引用 id 从摘要里直接取，不必读正文）----
+  const fileIds = await loadSessionFileIds().catch(() => new Set<string>())
+  const remoteFiles = await listRemoteFiles()
+  const missing = [...fileIds].filter((id) => !remoteFiles || !remoteFiles.has(id))
   result.filesSkipped = fileIds.size - missing.length
 
   let uploaded = 0
@@ -109,6 +112,7 @@ export const pushEverything = async (
       result.filesUploaded += 1
     } else {
       result.filesFailed += 1
+      result.error ??= '有附件上传失败'
     }
     uploaded += 1
     onProgress?.({ phase: 'files', done: uploaded, total: missing.length })

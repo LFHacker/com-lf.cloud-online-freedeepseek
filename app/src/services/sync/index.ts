@@ -16,6 +16,7 @@
  */
 import { apiOrigin } from '../api/client.js'
 import { useSettings } from '../settings.js'
+import { splitByBytes } from './batching.js'
 import {
   cacheSessionOnly,
   loadFile,
@@ -206,45 +207,93 @@ export type PushResult = {
   message?: string
 }
 
-/** 推送一批会话（每批 50 条，避免单次请求过大）。按批汇总成败，供上层决定是否重试 */
-export const pushSessions = async (sessions: Session[]): Promise<PushResult> => {
+/** 一批里的会话条目（发出去的东西） */
+type PushItem = {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  pinned: boolean
+  fileIds: string[]
+  payload: string
+}
+
+/**
+ * 服务端单次请求上限 8 MB（`readBodyCapped`）。切批规则见 `batching.ts`。
+ */
+
+/** 发一批；413 时自动二分重试（单条过大才算真失败） */
+const postSessionBatch = async (items: PushItem[]): Promise<PushResult> => {
   const result: PushResult = { written: 0, failed: 0, retryable: false }
-  if (sessions.length === 0) {
+  if (items.length === 0) {
     return result
   }
-  for (let index = 0; index < sessions.length; index += 50) {
-    const batch = sessions.slice(index, index + 50).map((session) => ({
-      id: session.id,
-      title: session.title ?? '',
-      createdAt: session.createdAt ?? Date.now(),
-      updatedAt: session.updatedAt ?? Date.now(),
-      pinned: session.pinned === true,
-      // 让服务端直接拿到引用，不必再解析几百 KB 的 payload
-      fileIds: sessionFileIds(session),
-      payload: JSON.stringify(session),
-    }))
-    try {
-      const response = await fetch(`${apiOrigin()}/sync/sessions`, {
-        method: 'POST',
-        headers: jsonHeaders(),
-        body: JSON.stringify({ sessions: batch }),
-      })
-      if (response.ok) {
-        const payload = (await response.json()) as { written?: number }
-        result.written += payload.written ?? 0
-        continue
-      }
-      result.failed += batch.length
-      result.status = response.status
-      result.retryable ||= isRetryableStatus(response.status)
-      result.message = failureMessage(response.status)
-    } catch {
-      result.failed += batch.length
-      result.retryable = true
-      result.message = failureMessage(undefined)
+  try {
+    const response = await fetch(`${apiOrigin()}/sync/sessions`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ sessions: items }),
+    })
+    if (response.ok) {
+      const payload = (await response.json()) as { written?: number }
+      result.written = payload.written ?? 0
+      return result
     }
+    if (response.status === 413 && items.length > 1) {
+      // 拆半重试：可能是这批太大，而不是某一条有问题
+      const middle = Math.ceil(items.length / 2)
+      const left = await postSessionBatch(items.slice(0, middle))
+      const right = await postSessionBatch(items.slice(middle))
+      return {
+        written: left.written + right.written,
+        failed: left.failed + right.failed,
+        retryable: left.retryable || right.retryable,
+        status: left.status ?? right.status,
+        message: left.message ?? right.message,
+      }
+    }
+    result.failed = items.length
+    result.status = response.status
+    result.retryable = isRetryableStatus(response.status)
+    result.message =
+      response.status === 413 ? '单条会话超过云端上限（8MB）' : failureMessage(response.status)
+    return result
+  } catch {
+    result.failed = items.length
+    result.retryable = true
+    result.message = failureMessage(undefined)
+    return result
   }
-  return result
+}
+
+/**
+ * 推送一批会话：**按体积切批**（规则见 `batching.ts`），单批 413 时二分重试。
+ * 返回按批汇总的成败，供上层决定是否重试。
+ */
+export const pushSessions = async (sessions: Session[]): Promise<PushResult> => {
+  const total: PushResult = { written: 0, failed: 0, retryable: false }
+  if (sessions.length === 0) {
+    return total
+  }
+  const items: PushItem[] = sessions.map((session) => ({
+    id: session.id,
+    title: session.title ?? '',
+    createdAt: session.createdAt ?? Date.now(),
+    updatedAt: session.updatedAt ?? Date.now(),
+    pinned: session.pinned === true,
+    // 让服务端直接拿到引用，不必再解析几百 KB 的 payload
+    fileIds: sessionFileIds(session),
+    payload: JSON.stringify(session),
+  }))
+  for (const batch of splitByBytes(items)) {
+    const result = await postSessionBatch(batch)
+    total.written += result.written
+    total.failed += result.failed
+    total.retryable ||= result.retryable
+    total.status = result.status ?? total.status
+    total.message = result.message ?? total.message
+  }
+  return total
 }
 
 /**

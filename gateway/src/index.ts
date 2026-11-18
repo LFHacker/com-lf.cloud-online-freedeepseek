@@ -37,10 +37,10 @@ import { ensureProfile, readProfileConfig } from './memory/profile.ts'
 import { estimateCost, isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
 /**
- * 网关版本。1.2.0 起：会话同步进入「云端为主」阶段 2（分页游标 + pinned + 墓碑优先）
+ * 网关版本。1.2.x 起：会话同步进入「云端为主」阶段 2（分页游标 + pinned + 墓碑优先）
  * 与阶段 3（附件引用计数 + 回收）。/health 里能看到它，用来确认线上跑的是哪份代码。
  */
-const VERSION = '1.2.0'
+const VERSION = '1.2.1'
 const PORT = Number(process.env.PORT ?? 8787)
 /** 默认只监听环回：前面由 Caddy 做 TLS 与反代 */
 const HOST = process.env.HOST ?? '127.0.0.1'
@@ -2160,7 +2160,18 @@ const server = createServer((req, res) => {
     } else {
       res.destroy()
     }
-    console.error('[gateway] 未捕获异常:', error)
+    const message = error instanceof Error ? error.message : String(error)
+    /**
+     * 客户端中途断开（手机切网、被系统杀进程、用户退出）是常态，
+     * 但它会让**整批请求静默作废** —— 所以必须带上方法与路径记下来。
+     * 没有路径的话日志里只有一句 "aborted"，根本查不出是哪一步丢的
+     * （真实事故：导入 1000 条会话后云端 0 条，日志里全是没有上下文的 aborted）。
+     */
+    if (message === 'aborted' || message === 'ECONNRESET') {
+      console.warn(`[gateway] 请求中断 ${req.method} ${req.url}: ${message}`)
+    } else {
+      console.error(`[gateway] 未捕获异常 ${req.method} ${req.url}:`, error)
+    }
   })
 })
 

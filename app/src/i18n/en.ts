@@ -240,6 +240,16 @@ export const en = {
   historyExportDescription:
     'Includes all chat history and locally stored images. Other attachments retain file details only. Your API Key is not included.',
   exportAllDownload: 'Download',
+  cloudSyncLabel: 'Sync to cloud',
+  cloudSyncDescription:
+    'Push chats and attachments from this device to the cloud. Items already up to date are skipped. Failures are shown with a reason and can be retried.',
+  cloudSyncAction: 'Start sync',
+  cloudSyncBusy: 'Syncing…',
+  cloudSyncSessions: 'Pushing chats {done}/{total}',
+  cloudSyncFiles: 'Pushing attachments {done}/{total}',
+  cloudSyncDone: 'Pushed {sessions} chats and {files} attachments ({skipped} already up to date)',
+  cloudSyncPartial: 'Finished: {sessions} chats, {files} attachments, {failed} failed',
+  cloudSyncFailed: 'Sync failed: {message}',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',
   deleteAllSessionsModalDescription:

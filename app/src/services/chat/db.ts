@@ -82,6 +82,16 @@ export const loadSession = async (id: string): Promise<Session | undefined> =>
   (await getDB()).get('sessions', id)
 
 export const saveSession = async (session: Session, files: StoredFile[] = []): Promise<void> => {
+
+  /**
+   * 落库后排队推送到云端（5 秒防抖）。
+   * 挂在 saveSession 上是刻意的：一次对话会多次保存（流式增量、标题、置顶），
+   * 一个钩子就覆盖全部路径，不会因为新增保存点而漏同步。
+   * 推到队列里只是排个定时器，这里不等待，也不影响落库。
+   */
+  void import('../sync/queue.js')
+    .then((queue) => queue.queuePushSession(session.id))
+    .catch(() => undefined)
   const summary = storedSummary(session)
   const tx = (await getDB()).transaction(['sessions', 'sessionSummaries', 'files'], 'readwrite')
   await Promise.all([
@@ -175,6 +185,28 @@ const putFiles = async (store: 'files' | 'filesStaging', files: StoredFile[]) =>
 }
 
 export const saveFiles = (files: StoredFile[]): Promise<void> => putFiles('files', files)
+
+/**
+ * 取附件：本地优先，缺失时从云端懒加载并写回本地。
+ *
+ * 为什么懒加载而不是登录时全下：你的导出包图片有 191 MB，
+ * 登录时全下会在移动网络里等很久；而图片只在具体某条消息里才需要。
+ */
+export const loadFileOrFetch = async (id: string): Promise<Blob | undefined> => {
+  const local = await loadFile(id)
+  if (local) {
+    return local
+  }
+  const sync = await import('../sync/index.js').catch(() => null)
+  if (!sync) {
+    return undefined
+  }
+  const blob = await sync.fetchAttachment(id)
+  if (blob) {
+    await saveFiles([{ id, blob, name: id } as StoredFile]).catch(() => undefined)
+  }
+  return blob
+}
 
 export const loadFile = async (id: string): Promise<Blob | undefined> =>
   (await (await getDB()).get('files', id))?.blob

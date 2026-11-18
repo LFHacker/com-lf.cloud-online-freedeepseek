@@ -221,7 +221,7 @@ const RESERVED_USERNAMES = new Set([
  */
 const normalizeUsername = (raw: string): string => raw.trim()
 
-const validateUsername = (raw: string): string => {
+const validateUsername = (raw: string, options: { allowReserved?: boolean } = {}): string => {
   const name = normalizeUsername(raw)
   if (name.length < 2 || name.length > 20) {
     throw new AuthFailure('badUsername')
@@ -235,7 +235,7 @@ const validateUsername = (raw: string): string => {
   if (/^\d+$/.test(name)) {
     throw new AuthFailure('badUsername')
   }
-  if (RESERVED_USERNAMES.has(name.toLowerCase())) {
+  if (!options.allowReserved && RESERVED_USERNAMES.has(name.toLowerCase())) {
     throw new AuthFailure('usernameReserved')
   }
   return name
@@ -433,11 +433,15 @@ export class AuthStore {
    * 改显示名。限频：24 小时内最多 3 次 —— 否则可以被用来反复抢注/骚扰。
    */
   setUsername(userId: string, rawUsername: string): User {
-    const username = validateUsername(rawUsername)
     const owner = this.findById(userId)
     if (!owner) {
       throw new AuthFailure('invalidToken')
     }
+    /**
+     * 保留名是防"别人冒充官方"，不是防站长自己。
+     * 管理员（owner）可以用任何保留名；普通用户仍然一律拦。
+     */
+    const username = validateUsername(rawUsername, { allowReserved: owner.role === 'admin' })
     const existing = this.findByUsername(username)
     if (existing && existing.id !== userId) {
       throw new AuthFailure('usernameTaken')

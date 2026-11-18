@@ -127,6 +127,20 @@ create table if not exists user_sessions (
 create index if not exists idx_user_sessions_time on user_sessions(user_id, updated_at desc);
 
 /**
+ * 软删除（墓碑）。
+ *
+ * 为什么不能直接 DELETE：另一台设备离线时还留着这条会话，
+ * 上线后会把"本地版本"推回来，删掉的东西又活了。
+ * 留一行墓碑，同步时告诉各端"这条已删"，才是可传播的删除。
+ */
+create table if not exists session_tombstones (
+  user_id    text not null,
+  session_id text not null,
+  deleted_at integer not null,
+  primary key (user_id, session_id)
+);
+
+/**
  * 用量账本。
  *
  * 为什么落在服务端：手机端只在消息里存 usage，重装/换设备就没了，
@@ -664,15 +678,53 @@ export class AuthStore {
     return { written, skipped: sessions.length - written }
   }
 
+  /** 软删除：记墓碑，并把会话行删掉（正文没必要留） */
+  deleteSession(userId: string, sessionId: string): void {
+    const now = Date.now()
+    this.db.exec('begin')
+    try {
+      this.db
+        .prepare('delete from user_sessions where user_id = ? and session_id = ?')
+        .run(userId, sessionId)
+      this.db
+        .prepare(
+          `insert into session_tombstones (user_id, session_id, deleted_at) values (?, ?, ?)
+           on conflict(user_id, session_id) do update set deleted_at = excluded.deleted_at`
+        )
+        .run(userId, sessionId, now)
+      this.db.exec('commit')
+    } catch (error) {
+      this.db.exec('rollback')
+      throw error
+    }
+  }
+
+  /** 墓碑清单：各端据此删除本地副本 */
+  listTombstones(userId: string, since = 0): Array<{ id: string; deletedAt: number }> {
+    return (
+      this.db
+        .prepare(
+          'select session_id id, deleted_at from session_tombstones where user_id = ? and deleted_at >= ? order by deleted_at desc'
+        )
+        .all(userId, since) as Array<{ id: string; deleted_at: number }>
+    ).map((row) => ({ id: row.id, deletedAt: row.deleted_at }))
+  }
+
   /** 会话列表（不含 payload，用于拉取前先比对） */
-  listSessions(userId: string): Array<{ id: string; title: string; createdAt: number; updatedAt: number }> {
+  listSessions(
+    userId: string,
+    options: { since?: number; limit?: number } = {}
+  ): Array<{ id: string; title: string; createdAt: number; updatedAt: number }> {
+    const since = options.since ?? 0
+    const limit = Math.min(Math.max(options.limit ?? 500, 1), 2000)
     return (
       this.db
         .prepare(
           `select session_id id, title, created_at, updated_at from user_sessions
-            where user_id = ? order by updated_at desc`
+            where user_id = ? and updated_at >= ?
+            order by updated_at desc limit ?`
         )
-        .all(userId) as Array<{ id: string; title: string; created_at: number; updated_at: number }>
+        .all(userId, since, limit) as Array<{ id: string; title: string; created_at: number; updated_at: number }>
     ).map((row) => ({
       id: row.id,
       title: row.title,

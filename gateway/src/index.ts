@@ -1321,7 +1321,36 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
       return
     }
-    json(res, 200, { ok: true, sessions: authStore.listSessions(user.id) })
+    const since = Number(url.searchParams.get('since') ?? 0) || 0
+    const limit = Number(url.searchParams.get('limit') ?? 0) || undefined
+    json(res, 200, {
+      ok: true,
+      sessions: authStore.listSessions(user.id, { since, limit }),
+      /** 墓碑：这些会话已被删除，客户端要删掉本地副本 */
+      deleted: authStore.listTombstones(user.id, since),
+    })
+    return
+  }
+
+  /** 删除会话（软删除 + 墓碑，保证能在其它设备上传播） */
+  if (req.method === 'DELETE' && url.pathname === '/sync/session') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = (url.searchParams.get('id') ?? '').trim()
+    if (!id) {
+      json(res, 400, { ok: false, error: 'bad_session', message: '缺少会话 id' })
+      return
+    }
+    try {
+      authStore.deleteSession(user.id, id)
+      json(res, 200, { ok: true })
+    } catch (error) {
+      console.warn('[gateway] 删除会话失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'delete_failed', message: '删除失败，请稍后重试' })
+    }
     return
   }
 

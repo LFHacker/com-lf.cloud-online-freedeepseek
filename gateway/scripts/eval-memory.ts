@@ -56,7 +56,24 @@ for (const item of cases) {
   relevantInjected += hits.filter((h) => h.sessionId === item.sessionId).length
 }
 
-const pct = (n: number) => `${((n / cases.length) * 100).toFixed(1)}%`
+/**
+ * Wilson 95% 置信区间。
+ * 40 条样本时 ±1 条就是 2.5 个百分点，不给区间很容易把噪声当改进。
+ */
+const wilson = (hits: number, total: number): [number, number] => {
+  if (total === 0) return [0, 0]
+  const z = 1.96
+  const p = hits / total
+  const denom = 1 + (z * z) / total
+  const center = (p + (z * z) / (2 * total)) / denom
+  const margin = (z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total))) / denom
+  return [Math.max(0, (center - margin) * 100), Math.min(100, (center + margin) * 100)]
+}
+
+const pct = (n: number) => {
+  const [lo, hi] = wilson(n, cases.length)
+  return `${((n / cases.length) * 100).toFixed(1)}%  (95%CI ${lo.toFixed(1)}–${hi.toFixed(1)})`
+}
 const sorted = [...latencies].sort((a, b) => a - b)
 const q = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]
 

@@ -12,6 +12,7 @@ import { AssistantMessage } from './AssistantMessage.js'
 import { ScrollToBottomContext } from './scrollContext.js'
 import { UserMessage } from './UserMessage.js'
 import type { Message } from '../../services/chat/types.js'
+import { usageOf } from '../../services/usage/index.js'
 
 /**
  * 会话共用可重试的附件上传失败入口，覆盖当前提问与历史消息中的附件。
@@ -49,6 +50,29 @@ export const MessageList = ({
   const scrollTopRef = useRef(0)
   const restoreScrollRef = useRef<{ messageId: string; top: number } | null>(null)
   const messages = getVisibleMessages(session)
+
+  /**
+   * 会话累计：把所有回答的 usage 加起来。
+   * 放在列表层算，是因为只有这里能拿到整个会话的消息；
+   * 单条消息组件只知道自己那一轮。
+   */
+  const totals = useMemo(() => {
+    let cacheHit = 0
+    let cacheMiss = 0
+    let output = 0
+    let turns = 0
+    for (const message of messages) {
+      const usage = usageOf((message as { usage?: unknown }).usage)
+      if (!usage) {
+        continue
+      }
+      cacheHit += usage.cacheHit
+      cacheMiss += usage.cacheMiss
+      output += usage.output
+      turns += 1
+    }
+    return { cacheHit, cacheMiss, output, turns }
+  }, [messages])
   const [previousVersions, setPreviousVersions] = useState(() =>
     buildMessageVersions(session, new Map())
   )
@@ -169,6 +193,7 @@ export const MessageList = ({
                   busy={streaming}
                   versions={versions.get(message.id) ?? EMPTY_VERSIONS}
                   onSelectVersion={selectVersion}
+                  totals={totals}
                 />
               )
             )}

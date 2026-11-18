@@ -172,6 +172,8 @@ export const en = {
   statsMemoryHit: 'Memory hits',
   statsItems: '',
   statsCostAbout: 'Cost about',
+  statsSessionTotal: 'This conversation',
+  statsTurns: 'turns',
   loginTitle: 'Freedeepseek',
   loginSignIn: 'Sign in',
   loginSignUp: 'Sign up',

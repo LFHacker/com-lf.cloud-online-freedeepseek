@@ -35,3 +35,19 @@
 .sep {
   opacity: 0.45;
 }
+/* 会话累计：比单轮更重一点，因为它是"这对话一共花了多少" */
+.session {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-soft, rgba(0, 0, 0, 0.03));
+  color: var(--text-secondary, #8a8f99);
+  font-size: 12px;
+  line-height: 1.7;
+  user-select: text;
+}
+
+.session b {
+  font-weight: 600;
+  color: var(--text-primary, #3c4149);
+}

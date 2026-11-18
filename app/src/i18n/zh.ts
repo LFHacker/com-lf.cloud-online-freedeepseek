@@ -167,6 +167,8 @@ export const zh = {
   statsMemoryHit: '命中记忆',
   statsItems: '条',
   statsCostAbout: '本次费用约',
+  statsSessionTotal: '本对话累计',
+  statsTurns: '轮',
   loginTitle: '自由的deepseek',
   loginSignIn: '登录',
   loginSignUp: '注册',

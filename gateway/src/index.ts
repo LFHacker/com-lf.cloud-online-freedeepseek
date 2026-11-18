@@ -12,7 +12,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
 import { timingSafeEqual } from 'node:crypto'
-import { appendFile, rename, stat } from 'node:fs/promises'
+import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { ChatModel } from '../../shared/protocol.js'
 /**
  * ⚠️ 运行时导入必须写 `.ts`：Node 的类型剥离只删类型，**不重写导入说明符**。
@@ -1159,6 +1160,93 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       /** 本会话是否属于"会记忆"的范围（local 范围只记本会话，不跨会话召回） */
       memoryEnabled: Boolean(user),
     })
+    return
+  }
+
+  /**
+   * 附件（图片）云端同步。
+   *
+   * 为什么单独存文件而不是塞进会话 JSON：
+   *  · 191 MB 的图片 base64 进 JSON 会膨胀 33%，而且每次同步整条会话都要重传
+   *  · 图片是不可变内容（id 即内容哈希），天然可以按 id 增量同步
+   *
+   * 目录：users/<userId>/files/<fileId>（没有扩展名，类型由 App 侧记录）
+   */
+  if (url.pathname === '/sync/files' && req.method === 'GET') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    try {
+      const dir = join(MEMORY_DATA_DIR, user.id, 'files')
+      const names = await readdir(dir).catch(() => [] as string[])
+      const files: Array<{ id: string; size: number; updatedAt: number }> = []
+      for (const name of names) {
+        if (name.endsWith('.tmp')) continue
+        const info = await stat(join(dir, name)).catch(() => null)
+        if (info && info.isFile()) {
+          files.push({ id: name, size: info.size, updatedAt: Math.round(info.mtimeMs) })
+        }
+      }
+      json(res, 200, { ok: true, files })
+    } catch (error) {
+      console.warn('[gateway] 附件列表失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'list_failed', message: '读取附件列表失败' })
+    }
+    return
+  }
+
+  if (url.pathname.startsWith('/sync/files/') && req.method === 'PUT') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = decodeURIComponent(url.pathname.slice('/sync/files/'.length))
+    // id 来自客户端，必须挡住路径穿越
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+      json(res, 400, { ok: false, error: 'bad_id', message: '附件 id 不合法' })
+      return
+    }
+    const read = await readBodyCapped(req, 20 * 1024 * 1024)
+    if (!read.ok) {
+      json(res, 413, { ok: false, error: 'too_large', message: '单个附件最大 20MB' })
+      return
+    }
+    try {
+      const dir = join(MEMORY_DATA_DIR, user.id, 'files')
+      await mkdir(dir, { recursive: true })
+      // 先写临时文件再改名：中途断开不会留下半个文件被当成"已同步"
+      const target = join(dir, id)
+      await writeFile(`${target}.tmp`, read.buffer)
+      await rename(`${target}.tmp`, target)
+      json(res, 200, { ok: true, id, size: read.buffer.length })
+    } catch (error) {
+      console.warn('[gateway] 附件写入失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'write_failed', message: '附件写入失败' })
+    }
+    return
+  }
+
+  if (url.pathname.startsWith('/sync/files/') && req.method === 'GET') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = decodeURIComponent(url.pathname.slice('/sync/files/'.length))
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+      json(res, 400, { ok: false, error: 'bad_id', message: '附件 id 不合法' })
+      return
+    }
+    try {
+      const data = await readFile(join(MEMORY_DATA_DIR, user.id, 'files', id))
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(data.length) })
+      res.end(data)
+    } catch {
+      json(res, 404, { ok: false, error: 'not_found', message: '云端没有这个附件' })
+    }
     return
   }
 

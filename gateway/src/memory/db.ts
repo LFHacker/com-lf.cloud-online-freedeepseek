@@ -80,6 +80,18 @@ create index if not exists idx_chunk_vec_session on chunk_vec(session_id);
  * 单独建表而不是给 chunks 加列：create table if not exists 不会给已存在的表补列，
  * 老库会缺字段，检索时静默读不到值。独立表新老库都能建。
  */
+/**
+ * 长期用户档案（稳定层）。
+ * 只有一行：id 固定为 'stable'。单独建表是为了让"重建"变成一次整行替换，
+ * 不会残留半旧半新的内容。
+ */
+create table if not exists memory_profile (
+  id           text primary key,
+  body         text not null,
+  source_chunks integer not null,
+  updated_at   integer not null
+);
+
 create table if not exists chunk_usage (
   chunk_id    text primary key,
   hits        integer not null default 0,

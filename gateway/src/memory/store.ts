@@ -556,6 +556,49 @@ export class MemoryStore {
     return Number(result.changes)
   }
 
+  /** 读长期档案（稳定层） */
+  getProfile(): { body: string; sourceChunks: number; updatedAt: number } | null {
+    const row = this.db
+      .prepare("select body, source_chunks, updated_at from memory_profile where id = 'stable'")
+      .get() as { body: string; source_chunks: number; updated_at: number } | undefined
+    return row ? { body: row.body, sourceChunks: row.source_chunks, updatedAt: row.updated_at } : null
+  }
+
+  /** 写长期档案（整行替换） */
+  saveProfile(body: string, sourceChunks: number, now: number): void {
+    this.db
+      .prepare(
+        "insert into memory_profile (id, body, source_chunks, updated_at) values ('stable', ?, ?, ?) " +
+          'on conflict(id) do update set body = excluded.body, source_chunks = excluded.source_chunks, updated_at = excluded.updated_at'
+      )
+      .run(body, sourceChunks, now)
+  }
+
+  /**
+   * 取一批代表性切片给档案生成用。
+   * 优先"被召回过"的（说明真的有用），再按时间补最近的，覆盖近期变化。
+   */
+  sampleForProfile(limit: number): string[] {
+    const used = this.db
+      .prepare(
+        `select c.body from chunk_usage u join chunks c on c.id = u.chunk_id
+          order by u.hits desc, u.last_hit_at desc limit ?`
+      )
+      .all(Math.ceil(limit / 2)) as Array<{ body: string }>
+    const recent = this.db
+      .prepare('select body from chunks order by created_at desc limit ?')
+      .all(limit - used.length) as Array<{ body: string }>
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const row of [...used, ...recent]) {
+      const text = row.body.trim()
+      if (!text || seen.has(text)) continue
+      seen.add(text)
+      out.push(text.slice(0, 300))
+    }
+    return out
+  }
+
   /** 按 id 取切片原文（评测与调试用） */
   chunkBody(chunkId: string): string | null {
     const row = this.db.prepare('select body from chunks where id = ?').get(chunkId) as

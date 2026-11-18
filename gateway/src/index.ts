@@ -31,7 +31,8 @@ import { randomBytes } from 'node:crypto'
 import { redactSecrets } from './redact.ts'
 import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
-import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
+import { AssistantTextCollector, extractUserMessages, injectRecall, injectStable } from './memory/wire.ts'
+import { ensureProfile, readProfileConfig } from './memory/profile.ts'
 
 const VERSION = '1.1.4'
 const PORT = Number(process.env.PORT ?? 8787)
@@ -140,6 +141,64 @@ if (MEMORY_ENABLED) {
  * 这比「暂时没有记忆」危险得多。
  */
 const authStore = new AuthStore(AUTH_DB_PATH)
+
+/** 稳定层（长期档案）配置；没有 API key 就等于不启用 */
+const PROFILE = readProfileConfig(process.env)
+
+/**
+ * 用量与缓存统计。
+ *
+ * DeepSeek 返回 prompt_cache_hit_tokens / prompt_cache_miss_tokens，
+ * 不记录就永远不知道缓存到底有没有命中——而这正是"多带原文"能不能成立的前提。
+ */
+const usageStats = {
+  requests: 0,
+  promptTokens: 0,
+  cacheHit: 0,
+  cacheMiss: 0,
+  completionTokens: 0,
+}
+
+const recordUsage = (usage: unknown): void => {
+  if (!usage || typeof usage !== "object") {
+    return
+  }
+  const record = usage as Record<string, unknown>
+  /**
+   * 两套字段都要认：
+   *  · OpenAI 风格（/chat/completions）：prompt_tokens / prompt_cache_hit_tokens
+   *  · Anthropic 风格（/anthropic/v1/messages）：input_tokens / cache_read_input_tokens
+   * 只按其中一套解析，另一条链路就永远是 0（实测踩过）。
+   */
+  const details = record.prompt_tokens_details as Record<string, unknown> | undefined
+  const anthropicStyle = record.input_tokens !== undefined && record.prompt_tokens === undefined
+  const hit = Number(
+    record.prompt_cache_hit_tokens ?? record.cache_read_input_tokens ?? details?.cached_tokens ?? 0
+  )
+  /**
+   * ⚠️ Anthropic 格式里 input_tokens **只是未缓存的部分**，
+   * 总 prompt = input_tokens + cache_read + cache_creation。
+   * 按 OpenAI 的口径去读会把命中率算成 100%（实测踩过）。
+   */
+  const prompt = anthropicStyle
+    ? Number(record.input_tokens) + hit + Number(record.cache_creation_input_tokens ?? 0)
+    : Number(record.prompt_tokens ?? record.input_tokens ?? 0)
+  const miss = anthropicStyle
+    ? Number(record.input_tokens) + Number(record.cache_creation_input_tokens ?? 0)
+    : Number(
+        record.prompt_cache_miss_tokens ??
+          record.cache_creation_input_tokens ??
+          Math.max(0, prompt - hit)
+      )
+  usageStats.requests += 1
+  usageStats.promptTokens += prompt
+  usageStats.cacheHit += hit
+  usageStats.cacheMiss += miss
+  usageStats.completionTokens += Number(record.completion_tokens ?? record.output_tokens ?? 0)
+  if (hit > 0) {
+    console.log(`[gateway] 缓存命中 ${hit} / 未命中 ${miss}（累计命中率 ${((usageStats.cacheHit / Math.max(1, usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)}%）`)
+  }
+}
 
 /** 邮件通道；没配就退化成"验证码只能打印到日志"（仅开发用） */
 const SMTP: SmtpConfig | null = readSmtpConfig(process.env)
@@ -731,6 +790,27 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
     if (prefix) {
       body = injectRecall(managed.body, prefix)
     }
+
+    /**
+     * 稳定层：长期档案拼进 system。
+     *
+     * 它一天最多重建一次，所以是"逐字节稳定"的前缀 → 吃 1/10 缓存价。
+     * 动态召回必须留在尾部（见 injectRecall 的注释）：把会变的东西放进前缀，
+     * 等于每轮让整段缓存作废。实测稳定前缀 6009 token 时，
+     * 第二次调用命中 5760、只有 249 全价。
+     */
+    if (PROFILE && memory) {
+      try {
+        const profile = await ensureProfile(memory, PROFILE)
+        if (profile.body) {
+          body = injectStable(body, ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'))
+        }
+      } catch (error) {
+        console.warn(
+          `[gateway] 长期档案注入失败：${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
   } else {
     body = Readable.toWeb(req) as unknown as FetchBody
   }
@@ -821,6 +901,28 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
   if (!upstream.body) {
     res.end()
     return
+  }
+
+  /**
+   * 记录用量与缓存命中。
+   * 非流式响应可以整段解析；流式的 usage 只在 SSE 末尾出现，交给下面的 tap 处理。
+   */
+  const contentType = upstream.headers.get('content-type') ?? ''
+  if (contentType.includes('application/json')) {
+    try {
+      const cloned = upstream.clone()
+      void cloned
+        .json()
+        .then((payload: unknown) => {
+          const usage = (payload as { usage?: unknown } | null)?.usage
+          recordUsage(usage)
+        })
+        .catch(() => {
+          // 解析失败不影响转发
+        })
+    } catch {
+      // clone 失败（已被消费）时静默跳过
+    }
   }
   // 逐帧转发：不缓冲、不聚合，SSE 才能边生成边显示
   const stream = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0])
@@ -971,6 +1073,20 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         windowMs: RATE_LIMIT_WINDOW_MS,
         maxPerWindow: RATE_LIMIT_MAX,
         trackedSources: limiter.size(),
+      },
+      /**
+       * 上游用量与缓存命中。
+       * 用来验证「多带原文靠缓存摊薄成本」是否真的成立——
+       * 实测稳定前缀 926 token 时，重复请求命中 768、只有 158 全价。
+       */
+      usage: {
+        ...usageStats,
+        cacheHitRate:
+          usageStats.cacheHit + usageStats.cacheMiss > 0
+            ? Number(
+                ((usageStats.cacheHit / (usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)
+              )
+            : 0,
       },
       stats,
       uptimeSeconds: Math.round(process.uptime()),
@@ -1248,6 +1364,16 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
           readGatewayToken(req)?.token ?? ''
         ),
         memory: store ? store.stats() : null,
+    /** 上游用量与缓存命中（用来验证"多带原文靠缓存摊薄成本"是否成立） */
+    usage: {
+      ...usageStats,
+      cacheHitRate:
+        usageStats.cacheHit + usageStats.cacheMiss > 0
+          ? Number(
+              ((usageStats.cacheHit / (usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)
+            )
+          : 0,
+    },
       })
       return
     }

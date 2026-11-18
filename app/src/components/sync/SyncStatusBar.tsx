@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import { retryOutboxEntry, useOutbox } from '../../services/sync/outbox.js'
+import { useCloudSync } from '../../services/sync/cloudSync.js'
 import { retrySyncNow } from '../../services/sync/engine.js'
 import { useSync } from '../../services/sync/status.js'
 import { Button } from '../base/Button.js'
@@ -21,6 +22,13 @@ export const SyncStatusBar = () => {
   const retryAt = useSync((state) => state.retryAt)
   const detail = useSync((state) => state.message)
   const entries = useOutbox((state) => state.entries)
+  /**
+   * 手动触发的「同步到云端」也要在这里显示。
+   * 它可能跑几分钟，用户会关掉设置、切到别的会话、甚至切到后台 ——
+   * 进度必须跟人走，否则看起来像"没在同步"。
+   */
+  const cloudRunning = useCloudSync((state) => state.running)
+  const cloudProgress = useCloudSync((state) => state.progress)
   const [now, setNow] = useState(Date.now)
 
   // 只有在等待重试时才需要秒级刷新，其余状态不要白跑定时器
@@ -38,6 +46,25 @@ export const SyncStatusBar = () => {
   const failedList = list.filter((entry) => entry.status === 'failed')
   const failed = failedList.length
   const seconds = retryAt > 0 ? Math.max(0, Math.ceil((retryAt - now) / 1000)) : 0
+
+  // 全量同步优先显示：它是最"重"的一件事，期间的其它提示都次要
+  if (cloudRunning) {
+    const text = (() => {
+      if (!cloudProgress || cloudProgress.phase === 'sessions') {
+        return cloudProgress && cloudProgress.total > 0
+          ? t('cloudSyncSessions', { done: cloudProgress.done, total: cloudProgress.total })
+          : t('cloudSyncBusy')
+      }
+      return t('cloudSyncFiles', { done: cloudProgress.done, total: cloudProgress.total })
+    })()
+    return (
+      <div className={styles.bar} role="status" aria-live="polite">
+        <span className={`${styles.dot} ${styles.active}`} aria-hidden />
+        <span className={styles.text}>{text}</span>
+      </div>
+    )
+  }
+
   const visible = phase !== 'idle' || pending > 0 || failed > 0
   if (!visible) {
     return null

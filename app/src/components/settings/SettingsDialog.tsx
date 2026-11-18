@@ -20,6 +20,7 @@ import {
   type ImportStage,
 } from '../../services/chat/backup.js'
 import { useChatStore } from '../../services/chat/store.js'
+import { startCloudSync, useCloudSync } from '../../services/sync/cloudSync.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
   DEFAULT_API_ORIGIN,
@@ -869,14 +870,18 @@ const ImportHistory = ({
  * 为什么必须有一个手动入口：
  *   导入 1000 条历史之后的那次自动推送是 fire-and-forget —— 它失败时界面上**什么都没有**，
  *   用户只能得出"云端就是没有"这个结论（真实事故）。而重试一次要重发上百 MB，
- *   手机要在前台待几分钟，所以必须：① 增量（已同步的跳过）② 看得见进度 ③ 能反复点。
+ *   所以必须：① 增量（已同步的跳过）② 看得见进度 ③ 能反复点。
+ *
+ * ⚠️ 运行状态**必须放在模块级 store**（`services/sync/cloudSync.ts`），不能放组件里：
+ *   设置弹窗是 `open ? <Modal> : null`，一关就卸载、`useState` 全丢。
+ *   之前就因为这个：关掉设置再回来显示"没在跑"，而旧锁还锁着 → 再点毫无反应。
  */
-let cloudSyncRunning = false
-
 const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
   const t = useTranslate()
-  const [busy, setBusy] = useState(false)
-  const [status, setStatus] = useState<Status>(null)
+  const running = useCloudSync((state) => state.running)
+  const progress = useCloudSync((state) => state.progress)
+  const result = useCloudSync((state) => state.result)
+  const error = useCloudSync((state) => state.error)
   /**
    * 本机实际存了多少个附件原件。
    * 这一行是给"附件传不上去"准备的诊断：如果它是 0，说明导入的包里就没有图片，
@@ -897,63 +902,55 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
     return () => {
       alive = false
     }
-  }, [busy])
+  }, [running])
 
-  const run = async () => {
-    if (cloudSyncRunning) {
-      return
-    }
-    cloudSyncRunning = true
-    setBusy(true)
-    setStatus({ key: 'cloudSyncBusy' })
-    try {
-      const { pushEverything } = await import('../../services/sync/full.js')
-      const result = await pushEverything((progress) => {
-        if (progress.phase === 'sessions') {
-          setStatus({
-            key: 'cloudSyncSessions',
-            params: { done: progress.done, total: progress.total },
-          })
-        } else if (progress.phase === 'files') {
-          setStatus({
-            key: 'cloudSyncFiles',
-            params: { done: progress.done, total: progress.total },
-          })
-        }
-      })
-      const failed = result.sessionsFailed + result.filesFailed
-      const nothingHappened =
-        result.sessionsPushed === 0 && result.filesUploaded === 0 && result.sessionsSkipped === 0
-      /**
-       * 三种结局要分开说，否则用户没法判断下一步该做什么：
-       *  · 有失败项 → 网络/服务端问题，重试有意义
-       *  · 没有失败、但有"本机缺原件" → 数据本身不完整（导入包没带图片），重试没用
-       *  · 都正常 → 完成
-       */
-      const params = {
-        sessions: result.sessionsPushed,
-        files: result.filesUploaded,
-        skipped: result.sessionsSkipped,
-        failed,
-        missing: result.filesMissing,
-        localFiles: result.localFiles,
+
+  /**
+   * 状态完全由 store 推导：组件重新挂载后看到的是同一份进度，
+   * 不需要（也不能）在组件里重新记一遍。
+   */
+  const status = ((): Status => {
+    if (running) {
+      if (!progress || progress.phase === 'sessions') {
+        return progress && progress.total > 0
+          ? { key: 'cloudSyncSessions', params: { done: progress.done, total: progress.total } }
+          : { key: 'cloudSyncBusy' }
       }
-      setStatus(
-        nothingHappened && result.error
-          ? { key: 'cloudSyncFailed', params: { message: result.error }, error: true }
-          : failed > 0
-            ? { key: 'cloudSyncPartial', params, error: true }
-            : result.filesMissing > 0
-              ? { key: 'cloudSyncMissingFiles', params }
-              : { key: 'cloudSyncDone', params }
-      )
-    } catch (error) {
-      setStatus(errorStatus('cloudSyncFailed', error))
-    } finally {
-      cloudSyncRunning = false
-      setBusy(false)
+      return { key: 'cloudSyncFiles', params: { done: progress.done, total: progress.total } }
     }
-  }
+    if (error) {
+      return { key: 'cloudSyncFailed', params: { message: error }, error: true }
+    }
+    if (!result) {
+      return null
+    }
+    const failed = result.sessionsFailed + result.filesFailed
+    const nothingHappened =
+      result.sessionsPushed === 0 && result.filesUploaded === 0 && result.sessionsSkipped === 0
+    /**
+     * 三种结局要分开说，否则用户没法判断下一步该做什么：
+     *  · 有失败项 → 网络/服务端问题，重试有意义
+     *  · 没有失败、但有"本机缺原件" → 数据本身不完整（导入包没带图片），重试没用
+     *  · 都正常 → 完成
+     */
+    const params = {
+      sessions: result.sessionsPushed,
+      files: result.filesUploaded,
+      skipped: result.sessionsSkipped,
+      failed,
+      missing: result.filesMissing,
+      localFiles: result.localFiles,
+    }
+    if (nothingHappened && result.error) {
+      return { key: 'cloudSyncFailed', params: { message: result.error }, error: true }
+    }
+    if (failed > 0) {
+      return { key: 'cloudSyncPartial', params, error: true }
+    }
+    return result.filesMissing > 0
+      ? { key: 'cloudSyncMissingFiles', params }
+      : { key: 'cloudSyncDone', params }
+  })()
 
   return (
     <SettingCell
@@ -969,11 +966,11 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
           variant="outlined"
           size="m"
           className={styles.cellButton}
-          disabled={disabled || busy}
-          onClick={() => void run()}
+          disabled={disabled || running}
+          onClick={() => void startCloudSync()}
         >
           <IconRefreshOutline16 />
-          {t(busy ? 'cloudSyncBusy' : 'cloudSyncAction')}
+          {t(running ? 'cloudSyncBusy' : 'cloudSyncAction')}
         </Button>
       }
     />

@@ -516,6 +516,54 @@ try {
   }, 10_000, '待发送标记消失')
   check('确认后「待发送」标记消失', chipGone)
   await shoot('03-after-retry')
+
+  // ── 阶段 2-4：手动同步的状态必须能跨页面存活 ──────────
+  /**
+   * 用 CDP 的 Fetch 域把 /sync/sessions 拦住，让同步"卡住"——
+   * 这样断言不依赖时序（否则要赌"300ms 内还没同步完"）。
+   * 这条针对真实现象：点开始同步后关掉设置再打开，界面又变回"没在跑"。
+   */
+  const clickByText = (text) => `(() => {
+    const btn = [...document.querySelectorAll('button')].find((el) => el.textContent.trim() === ${JSON.stringify(text)})
+    btn?.click()
+    return Boolean(btn)
+  })()`
+
+  await page('Fetch.enable', { patterns: [{ urlPattern: '*sync/sessions*' }] })
+  await evaluate(clickByText('设置'))
+  await sleep(400)
+  await evaluate(clickByText('数据管理'))
+  await sleep(400)
+  const started = await evaluate(clickByText('开始同步'))
+  check('点开设置并触发同步', started === true)
+  await sleep(400)
+
+  // 关掉设置（Modal 用 document 上的 Escape 关闭）
+  await evaluate(
+    `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`
+  )
+  await sleep(400)
+  const afterClose = await bodyText()
+  check(
+    '关掉设置后，顶部状态条仍在显示同步进度',
+    afterClose.includes('同步中') || afterClose.includes('正在推送'),
+    afterClose.slice(0, 120)
+  )
+
+  // 重新打开设置：必须还是"同步中"，而不是变回"开始同步"
+  await evaluate(clickByText('设置'))
+  await sleep(400)
+  await evaluate(clickByText('数据管理'))
+  await sleep(400)
+  const reopened = await bodyText()
+  check(
+    '重新打开设置仍显示同步中（状态没被卸载丢掉）',
+    (reopened.includes('同步中') || reopened.includes('正在推送')) &&
+      !reopened.includes('开始同步'),
+    reopened.slice(0, 160)
+  )
+  await shoot('04-sync-survives-remount')
+  await page('Fetch.disable')
 } catch (error) {
   console.log('  ⚠️ 测试中断：', error instanceof Error ? error.message : error)
   await dumpDiagnostics()

@@ -692,3 +692,43 @@ api.deepseek.com
 - **Caddy 证书链隐患**：默认签发的 ECDSA 证书链到 **ISRG Root X2**，Windows 与部分安卓设备**不信任 X2**（只信 X1）。表现为浏览器 `ERR_CONNECTION_RESET`、手机连不上，而 `node`/`openssl` 反而正常（自带 CA 库）。已在两个站点加 `key_type rsa2048`，删掉旧证书强制重签，链变为 YR1 → ISRG Root X1。
 - **本机 Kaspersky 仍会拦 Schannel 应用**（Chrome/curl/PowerShell 对 8443 握手被重置，openssl/Node 正常）——本地验收走 SSH 隧道 + 明文 HTTP 绕开。
 - 开发版改用 **release 密钥签名**，否则从发行版升级到开发版必须卸载（本地历史全丢）。
+
+### 官方 Key 由用户自带（v0.9.0A-debug，2026-11-18）
+
+**要求：服务端不留任何可解出 Key 的东西，只留指纹。**
+
+**链路**
+
+- 用户在设置里填入自己的 DeepSeek Key → 先由网关调一次 `GET /models` 验证
+- 通过后：① 本机用 **WebCrypto AES-GCM** 加密保存（主密钥也在本机 IndexedDB）；
+  ② 服务端只存 `sha256(key)` 前 16 位指纹 + 掩码（`sk-…e655`）
+- 之后每个聊天请求把 Key 放进 `x-deepseek-key` 头；网关用它替换 `x-api-key` 转发上游，
+  **用完随请求对象回收**，不写库、不写日志、不回响应
+
+**验证过的硬事实**
+
+| 断言 | 结果 |
+|---|---|
+| 绑定接口只返回掩码+指纹 | ✅ `{"masked":"sk-…e655","fingerprint":"6b99b06aa3cd8e96"}` |
+| `auth.db` / `-wal` 里搜不到原始 Key | ✅ 搜不到 |
+| 关掉实例兜底（`ALLOW_INSTANCE_KEY=0`）后 App 仍能聊天 | ✅ 回复「收到」，证明用的是用户 Key |
+| 无效 Key 被上游拒绝 | ✅ 上游回 `Your api key: ****1111 is invalid` |
+| 诊断日志脱敏 | ✅ `测试泄漏：sk-***` |
+
+**配置**
+
+- `ALLOW_INSTANCE_KEY` 默认 `0`：用户必须自带 Key。
+  过渡期曾设 `1` 让旧版 App 继续可用；新版装好后应保持 `0`。
+- `DEEPSEEK_API_KEY` 已不再参与转发，只在 `ALLOW_INSTANCE_KEY=1` 时作为兜底。
+
+**踩坑**
+
+- **`.gitignore` 被压成一行**：之前多次 PowerShell `-replace` + `-NoNewline` 把换行吞了，
+  导致 `node_modules/`、`keystore/`、`delivery/` 全部失效，`git add -A` 直接把令牌文件加了进去
+  （被 GitHub push protection 拦住才发现）。教训：**改 .gitignore 后必须 `git check-ignore` 验证**。
+- **开发者自己机器上的 Kaspersky 会拦 Schannel 应用**（Chrome/curl/PowerShell 对 8443 握手被重置），
+  openssl/Node 正常 → 本地 UI 验收改用 SSH 隧道 + 明文 HTTP。
+- **`upstreamHeaders` 里原先用全局 `API_KEY`**，改成传入 key 时容易漏改调用点；
+  TS 报 `Expected 3 arguments, but got 2` 正好兜住了。
+- **UI 状态要分两种**：`hasLocal`（本机能发请求）与「服务端有指纹」（换设备后为真）。
+  混成一个布尔会出现「界面说已配置，一聊天报缺少 Key」。

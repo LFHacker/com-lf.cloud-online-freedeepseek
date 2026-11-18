@@ -95,3 +95,46 @@ export const changePassword = (
   oldPassword: string,
   newPassword: string
 ): Promise<{ token?: string }> => post('/auth/password', { oldPassword, newPassword }, token)
+
+/** 官方 Key 绑定信息（服务端只回掩码与指纹） */
+export type UpstreamKeyState = {
+  bound: boolean
+  masked?: string
+  fingerprint?: string
+  validatedAt?: number
+}
+
+const tokenOf = (token: string) => ({ 'x-api-key': token })
+
+export const getUpstreamKey = async (token: string): Promise<{ upstreamKey: UpstreamKeyState }> => {
+  const response = await fetch(`${apiOrigin()}/auth/upstream-key`, { headers: tokenOf(token) })
+  if (!response.ok) {
+    await toError(response)
+  }
+  return (await response.json()) as { upstreamKey: UpstreamKeyState }
+}
+
+export const bindUpstreamKey = async (
+  token: string,
+  key: string
+): Promise<{ upstreamKey: UpstreamKeyState; sharedAccounts: number }> => {
+  const response = await fetch(`${apiOrigin()}/auth/upstream-key`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...tokenOf(token) },
+    body: JSON.stringify({ key }),
+  })
+  if (!response.ok) {
+    await toError(response)
+  }
+  return (await response.json()) as { upstreamKey: UpstreamKeyState; sharedAccounts: number }
+}
+
+export const unbindUpstreamKey = async (token: string): Promise<void> => {
+  const response = await fetch(`${apiOrigin()}/auth/upstream-key`, {
+    method: 'DELETE',
+    headers: tokenOf(token),
+  })
+  if (!response.ok) {
+    await toError(response)
+  }
+}

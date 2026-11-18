@@ -9,7 +9,8 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { AuthFailure, AuthStore } from '../src/auth/store.ts'
+import { AuthFailure, AuthStore, keyFingerprint, maskKey } from '../src/auth/store.ts'
+import { redactSecrets, REDACTED } from '../src/redact.ts'
 import { MemoryRegistry } from '../src/memory/registry.ts'
 
 let pass = 0
@@ -185,7 +186,56 @@ try {
   }
 }
 
-console.log(`\n=== PASS=${pass}  FAIL=${fail} ===`)
+// ── 7. 官方 Key：只留指纹 ──────────────────────────────
+  {
+    const store = new AuthStore(join(dir, 'auth-key.db'))
+    const user = store.createUser('keyuser@example.com', 'keypassword123')
+    const fakeKey = 'sk-' + 'a1b2c3d4'.repeat(8)
+
+    check('未绑定前查不到 Key 信息', store.getUpstreamKey(user.id) === null)
+
+    const info = store.setUpstreamKey(user.id, fakeKey)
+    check('指纹长度 16', info.fingerprint.length === 16, info.fingerprint)
+    check('指纹是 sha256 前缀', keyFingerprint(fakeKey).slice(0, 16) === info.fingerprint)
+    check('掩码只露首尾', info.masked.startsWith('sk-') && info.masked.includes('…'), info.masked)
+    check('掩码不含完整 Key', !info.masked.includes(fakeKey.slice(6, 20)))
+
+    const read = store.getUpstreamKey(user.id)
+    check('能读回绑定信息', read?.fingerprint === info.fingerprint)
+    check('读回的信息里没有原始 Key', !JSON.stringify(read).includes(fakeKey))
+
+    // 关键断言：整个库文件里都不应出现原始 Key
+    const { readFileSync: rf } = await import('node:fs')
+    const dbBytes = rf(join(dir, 'auth-key.db')).toString('latin1')
+    check('数据库文件里搜不到原始 Key', !dbBytes.includes(fakeKey))
+    check('数据库文件里搜不到 Key 的正文片段', !dbBytes.includes(fakeKey.slice(10, 30)))
+
+    // 同一个 Key 被两个账号绑定 → 指纹计数 2
+    const other = store.createUser('keyuser2@example.com', 'keypassword123')
+    store.setUpstreamKey(other.id, fakeKey)
+    check('同一指纹被两个账号使用会被发现', store.fingerprintOwners(info.fingerprint) === 2)
+
+    // 换 Key 后指纹变化
+    const second = store.setUpstreamKey(user.id, 'sk-' + 'ffffffff'.repeat(8))
+    check('换 Key 后指纹更新', second.fingerprint !== info.fingerprint)
+
+    store.clearUpstreamKey(user.id)
+    check('删除后查不到', store.getUpstreamKey(user.id) === null)
+    check('另一个账号不受影响', store.getUpstreamKey(other.id) !== null)
+    store.close()
+  }
+
+  // ── 8. 日志脱敏 ────────────────────────────────────────
+  {
+    const raw = 'Bearer sk-abcdefghijklmnopqrstuvwxyz0123456789'
+    check('裸 Key 被脱敏', redactSecrets(raw).includes(REDACTED) && !redactSecrets(raw).includes('abcdefghijklmnop'))
+    check('带字段名的被脱敏', !redactSecrets('x-deepseek-key: sk-abcdefghijklmnopqrstuvwxyz').includes('abcdefghijklmnop'))
+    check('JSON 里的 key 被脱敏', !redactSecrets('{"key":"sk-abcdefghijklmnopqrstuvwxyz"}').includes('abcdefghijklmnop'))
+    check('普通文本不受影响', redactSecrets('我今天想学 Python') === '我今天想学 Python')
+    check('空串安全', redactSecrets('') === '')
+  }
+
+  console.log(`\n=== PASS=${pass}  FAIL=${fail} ===`)
 if (fail > 0) {
   process.exitCode = 1
 }

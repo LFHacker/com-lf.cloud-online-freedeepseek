@@ -44,6 +44,7 @@ import { Modal } from '../base/Modal.js'
 import { Select } from '../base/Select.js'
 import { showToast } from '../base/toastState.js'
 import { AccountField } from './AccountField.js'
+import { UpstreamKeyField } from './UpstreamKeyField.js'
 import { closeSettings, useSettingsDialog, type SettingsSection } from './settingsDialogState.js'
 import styles from './Settings.module.css'
 
@@ -116,6 +117,7 @@ const SettingsContent = () => {
           ) : (
             <>
               <AccountField />
+              <UpstreamKeyField />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
               <SettingCell

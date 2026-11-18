@@ -87,6 +87,24 @@ create table if not exists auth_sessions (
 );
 create index if not exists idx_auth_sessions_user on auth_sessions(user_id);
 create index if not exists idx_auth_sessions_exp on auth_sessions(expires_at);
+
+/**
+ * 用户绑定的官方 Key —— **只存指纹，不存 Key 本身**。
+ *
+ * 原始 Key 永远只存在于用户设备上：每次请求由客户端放在 x-deepseek-key 头里带来，
+ * 网关转发完就随请求对象一起回收，不写库、不写日志。
+ * 这里留一行指纹（sha256 前 16 位）只为了回答两个问题：
+ *   · 这个账号配过 Key 没有
+ *   · 有没有多个账号共用同一个 Key（泄漏/盗用的信号）
+ * 指纹不可逆，也无法用于任何请求。
+ */
+create table if not exists user_upstream_keys (
+  user_id       text primary key,
+  fingerprint   text not null,
+  masked        text not null,        -- 形如 sk-…a1b2，仅用于界面回显
+  validated_at  integer not null,
+  created_at    integer not null
+);
 `
 
 const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex')
@@ -117,6 +135,21 @@ const hashPassword = (password: string, salt: Buffer) =>
     p: SCRYPT_P,
     maxmem: 128 * SCRYPT_N * SCRYPT_R * 2,
   })
+
+export type UpstreamKeyInfo = {
+  fingerprint: string
+  masked: string
+  validatedAt: number
+}
+
+/** 指纹：sha256 前 16 位十六进制。不可逆、不可用于请求 */
+export const keyFingerprint = (key: string): string => sha256Hex(key).slice(0, 16)
+
+/** 掩码：只露前 3 位和后 4 位，够用户确认是不是自己那把 */
+export const maskKey = (key: string): string => {
+  const trimmed = key.trim()
+  return trimmed.length <= 8 ? 'sk-…' : `${trimmed.slice(0, 3)}…${trimmed.slice(-4)}`
+}
 
 export class AuthStore {
   private readonly db: DatabaseSync
@@ -294,6 +327,50 @@ export class AuthStore {
 
   revokeAll(userId: string): void {
     this.db.prepare('delete from auth_sessions where user_id = ?').run(userId)
+  }
+
+  /** 记录（或更新）指纹；同一次调用不写两次 */
+  setUpstreamKey(userId: string, key: string, validatedAt = Date.now()): UpstreamKeyInfo {
+    const info: UpstreamKeyInfo = {
+      fingerprint: keyFingerprint(key),
+      masked: maskKey(key),
+      validatedAt,
+    }
+    this.db
+      .prepare(
+        `insert into user_upstream_keys (user_id, fingerprint, masked, validated_at, created_at)
+         values (?, ?, ?, ?, ?)
+         on conflict(user_id) do update set
+           fingerprint = excluded.fingerprint,
+           masked = excluded.masked,
+           validated_at = excluded.validated_at`
+      )
+      .run(userId, info.fingerprint, info.masked, info.validatedAt, Date.now())
+    return info
+  }
+
+  getUpstreamKey(userId: string): UpstreamKeyInfo | null {
+    const row = this.db
+      .prepare('select fingerprint, masked, validated_at from user_upstream_keys where user_id = ?')
+      .get(userId) as { fingerprint: string; masked: string; validated_at: number } | undefined
+    return row
+      ? { fingerprint: row.fingerprint, masked: row.masked, validatedAt: row.validated_at }
+      : null
+  }
+
+  clearUpstreamKey(userId: string): void {
+    this.db.prepare('delete from user_upstream_keys where user_id = ?').run(userId)
+  }
+
+  /** 同一个指纹被几个账号使用（>1 = 可能在共用或泄漏） */
+  fingerprintOwners(fingerprint: string): number {
+    return Number(
+      (
+        this.db
+          .prepare('select count(*) n from user_upstream_keys where fingerprint = ?')
+          .get(fingerprint) as { n: number }
+      ).n
+    )
   }
 
   sessionCount(userId: string): number {

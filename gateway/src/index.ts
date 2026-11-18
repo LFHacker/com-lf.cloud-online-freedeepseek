@@ -26,8 +26,9 @@ import { createRateLimiter } from './rate-limit.ts'
 const CLIENT_LOG_PATH = process.env.CLIENT_LOG_PATH ?? '/var/log/ds-gateway/client.log'
 import { MemoryStore, type MemoryScope } from './memory/store.ts'
 import { MemoryRegistry } from './memory/registry.ts'
-import { AuthFailure, AuthStore, type User } from './auth/store.ts'
+import { AuthFailure, AuthStore, keyFingerprint, type User } from './auth/store.ts'
 import { randomBytes } from 'node:crypto'
+import { redactSecrets } from './redact.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
 
@@ -102,6 +103,13 @@ const ADMIN_EMAIL = (process.env.ADMIN_EMAIL ?? 'admin@l-f-cloud.online').trim()
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? ''
 /** 是否允许自助注册；关掉就只能由管理员建号 */
 const ALLOW_SIGNUP = (process.env.ALLOW_SIGNUP ?? '1') !== '0'
+/**
+ * 是否允许「没带自己 Key 的请求」回落到实例 Key。
+ * 默认 **关闭**：用户配了自己的 Key 就必须用自己的，
+ * 否则会出现「他以为在花自己的额度，其实在花你的」这种账目错乱。
+ */
+const ALLOW_INSTANCE_KEY = (process.env.ALLOW_INSTANCE_KEY ?? '0') === '1'
+
 /** 本地会话是否也读取全局记忆。默认 0 = 完全隔离（不写也不读），心智模型最简单 */
 const MEMORY_LOCAL_READS_GLOBAL = (process.env.MEMORY_LOCAL_READS_GLOBAL ?? '0') === '1'
 const MEMORY_MAX_HITS = Number(process.env.MEMORY_MAX_HITS ?? 4)
@@ -369,7 +377,7 @@ const readGatewayToken = (req: IncomingMessage): { token: string; style: AuthSty
   return null
 }
 
-const upstreamHeaders = (req: IncomingMessage, style: AuthStyle): Record<string, string> => {
+const upstreamHeaders = (req: IncomingMessage, style: AuthStyle, apiKey: string): Record<string, string> => {
   const headers: Record<string, string> = {}
   for (const name of FORWARD_REQUEST_HEADERS) {
     const value = req.headers[name]
@@ -379,9 +387,9 @@ const upstreamHeaders = (req: IncomingMessage, style: AuthStyle): Record<string,
   }
   // 关键一步：用真 Key 替换掉客户端的网关令牌，鉴权风格跟随客户端
   if (style === 'x-api-key') {
-    headers['x-api-key'] = API_KEY
+    headers['x-api-key'] = apiKey
   } else {
-    headers.authorization = `Bearer ${API_KEY}`
+    headers.authorization = `Bearer ${apiKey}`
   }
   return headers
 }
@@ -466,8 +474,32 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
     json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或无效的访问令牌' })
     return
   }
-  // 上游仍然用 DeepSeek Key 转发，客户端令牌只用于识别「你是谁」
   const inbound = readGatewayToken(req)
+  /**
+   * 官方 Key 来自**客户端请求头**，不是服务器配置。
+   * 它只在本次请求的内存里存在：转发完随请求对象回收，
+   * 不写库、不写日志、不进响应。
+   */
+  const clientKey = (readHeader(req, 'x-deepseek-key') ?? '').trim()
+  const upstreamKey = clientKey.length >= 20 ? clientKey : ALLOW_INSTANCE_KEY ? API_KEY : ''
+  if (!upstreamKey) {
+    json(res, 409, {
+      ok: false,
+      error: 'no_upstream_key',
+      message: '还没有填写 DeepSeek 官方 Key，请在设置里填入后重试',
+    })
+    return
+  }
+  // 指纹只在变化时写一次，用于判断「这个账号配过 Key 没有」
+  const fingerprint = keyFingerprint(upstreamKey)
+  const known = authStore.getUpstreamKey(user.id)
+  if (!known || known.fingerprint !== fingerprint) {
+    try {
+      authStore.setUpstreamKey(user.id, upstreamKey)
+    } catch (error) {
+      console.warn('[gateway] 记录 Key 指纹失败（不影响本次请求）:', error instanceof Error ? error.message : error)
+    }
+  }
   // 本次请求使用**这个用户自己的**记忆库
   const memory = memoryFor(user)
 
@@ -645,7 +677,7 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
   try {
     upstream = await fetch(`${UPSTREAM}${pathname}`, {
       method,
-      headers: upstreamHeaders(req, inbound?.style ?? `x-api-key`),
+      headers: upstreamHeaders(req, inbound?.style ?? `x-api-key`, upstreamKey),
       body,
       duplex: 'half',
       signal: controller.signal,
@@ -768,7 +800,8 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       ip: (typeof req.headers['x-forwarded-for'] === 'string'
             ? req.headers['x-forwarded-for'].split(',')[0].trim()
             : '') || req.socket.remoteAddress || '',
-      entry: text.length > 4000 ? `${text.slice(0, 4000)}…` : text,
+      // 用户可能把官方 Key 贴进任何地方；落盘前一律脱敏
+      entry: redactSecrets(text.length > 4000 ? `${text.slice(0, 4000)}…` : text),
     })
     try {
       await appendFile(CLIENT_LOG_PATH, `${line}\n`)
@@ -791,7 +824,8 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       node: process.version,
       upstream: UPSTREAM,
       defaultModel: DEFAULT_MODEL,
-      hasApiKey: API_KEY.length > 0,
+      /** 实例 Key 仅作可选兜底；用户自带 Key 时永不使用 */
+      instanceKey: ALLOW_INSTANCE_KEY ? (API_KEY.length > 0 ? 'allowed' : 'missing') : 'disabled',
       hasGatewayToken: GATEWAY_TOKEN.length > 0,
       contextBudgetTokens: CONTEXT_BUDGET_TOKENS,
       allowedOrigins: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : 'any (echo)',
@@ -943,9 +977,14 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         return
       }
       const store = memoryFor(user)
+      const bound = authStore.getUpstreamKey(user.id)
       json(res, 200, {
         ok: true,
         user: payloadUser(user),
+        /** 只回掩码与指纹；原始 Key 只在设备上 */
+        upstreamKey: bound
+          ? { bound: true, masked: bound.masked, fingerprint: bound.fingerprint, validatedAt: bound.validatedAt }
+          : { bound: false },
         /** 旧网关令牌登录时是 true：提示前端可以引导去设置密码 */
         legacyToken: ((inbound: string) => Boolean(inbound) && sameToken(inbound, GATEWAY_TOKEN))(
           readGatewayToken(req)?.token ?? ''
@@ -978,6 +1017,88 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       } catch (error) {
         authError(error)
       }
+      return
+    }
+
+    /**
+     * 绑定官方 Key。
+     *
+     * 处理完这个请求之后，**服务端只剩一个不可逆指纹**：
+     * 原始 Key 立刻离开内存，不写库、不进日志、不回响应。
+     */
+    if (req.method === 'POST' && url.pathname === '/auth/upstream-key') {
+      const user = userFromRequest(req)
+      if (!user) {
+        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const key = str(body.key).trim()
+      if (key.length < 20 || !/^sk-/.test(key)) {
+        fail(400, 'invalid_key', '看起来不是有效的 DeepSeek Key（应以 sk- 开头）')
+        return
+      }
+      // 用它真调一次上游：能列出模型才算有效
+      let valid = false
+      try {
+        const probe = await fetch(`${UPSTREAM}/models`, {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(12_000),
+        })
+        valid = probe.ok
+        await probe.text()
+      } catch (error) {
+        console.warn('[gateway] 校验官方 Key 时网络失败:', error instanceof Error ? error.message : error)
+        fail(502, 'upstream_unreachable', '暂时联系不上 DeepSeek，请稍后重试')
+        return
+      }
+      if (!valid) {
+        fail(400, 'invalid_key', 'DeepSeek 拒绝了这把 Key（可能已失效或输错）')
+        return
+      }
+      const info = authStore.setUpstreamKey(user.id, key)
+      const shared = authStore.fingerprintOwners(info.fingerprint)
+      if (shared > 1) {
+        console.warn(`[gateway] 指纹 ${info.fingerprint} 被 ${shared} 个账号使用，可能存在共用/泄露`)
+      }
+      console.log(`[gateway] ${user.email} 绑定了官方 Key（指纹 ${info.fingerprint}）`)
+      json(res, 200, {
+        ok: true,
+        upstreamKey: { bound: true, masked: info.masked, fingerprint: info.fingerprint, validatedAt: info.validatedAt },
+        /** 同一把 Key 被多个账号用着，前端可提示 */
+        sharedAccounts: shared,
+      })
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/auth/upstream-key') {
+      const user = userFromRequest(req)
+      if (!user) {
+        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        return
+      }
+      const info = authStore.getUpstreamKey(user.id)
+      json(res, 200, {
+        ok: true,
+        upstreamKey: info
+          ? { bound: true, masked: info.masked, fingerprint: info.fingerprint, validatedAt: info.validatedAt }
+          : { bound: false },
+      })
+      return
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/auth/upstream-key') {
+      const user = userFromRequest(req)
+      if (!user) {
+        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        return
+      }
+      authStore.clearUpstreamKey(user.id)
+      console.log(`[gateway] ${user.email} 删除了官方 Key 指纹`)
+      json(res, 200, { ok: true })
       return
     }
 
@@ -1094,8 +1215,8 @@ const server = createServer((req, res) => {
   })
 })
 
-if (!API_KEY || !GATEWAY_TOKEN) {
-  console.error('[gateway] 拒绝启动：必须同时配置 DEEPSEEK_API_KEY 与 GATEWAY_TOKEN')
+if (!GATEWAY_TOKEN) {
+  console.error('[gateway] 拒绝启动：必须配置 GATEWAY_TOKEN（管理员令牌）')
   process.exit(1)
 }
 

@@ -1,4 +1,5 @@
 import { translate, type TranslationMessage } from '../../i18n/index.js'
+import { cachedUpstreamKey } from '../secure/upstreamKey.js'
 import { useSettings } from '../settings.js'
 import { readMessageEvent } from './parseEvent.js'
 import { readServerSentEvents } from './sse.js'
@@ -89,12 +90,17 @@ export const request = async (url: string, init: RequestInit): Promise<Response>
   return response
 }
 
-const anthropicHeaders = (apiKey: string, beta: boolean): Record<string, string> => ({
-  // DeepSeek 兼容接口的鉴权方式，也可使用 Authorization: Bearer。
-  'x-api-key': apiKey,
-  // Files API 和通过 file_id 引用图片时必传；纯文本聊天无需携带。
-  ...(beta ? { 'anthropic-beta': FILES_BETA } : {}),
-})
+const anthropicHeaders = (apiKey: string, beta: boolean): Record<string, string> => {
+  const upstream = cachedUpstreamKey()
+  return {
+    // 自建网关：x-api-key 是**我们的会话令牌**（认「你是谁」）
+    'x-api-key': apiKey,
+    // 官方 Key 由用户本地输入、随请求带给网关转发；网关不留存，只记指纹
+    ...(upstream ? { 'x-deepseek-key': upstream } : {}),
+    // Files API 和通过 file_id 引用图片时必传；纯文本聊天无需携带。
+    ...(beta ? { 'anthropic-beta': FILES_BETA } : {}),
+  }
+}
 
 /** 自建网关用于区分会话与记忆模式的两个头；直连官方时它们会被忽略 */
 export type SessionMeta = {

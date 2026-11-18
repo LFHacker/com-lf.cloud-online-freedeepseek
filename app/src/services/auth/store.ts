@@ -8,6 +8,7 @@
 import { create } from 'zustand'
 import { ApiError } from '../api/client.js'
 import { setApiKey, useSettings } from '../settings.js'
+import { loadUpstreamKey } from '../secure/upstreamKey.js'
 import * as api from './client.js'
 
 export type AuthStatus = 'unknown' | 'signedOut' | 'signedIn'
@@ -42,6 +43,8 @@ const message = (error: unknown): string =>
  * 只有服务端明确说 401 才清令牌。
  */
 export const initAuth = async (): Promise<void> => {
+  // 先把本地加密保存的官方 Key 解进内存，请求头要用
+  await loadUpstreamKey().catch(() => null)
   const token = currentToken()
   if (!token) {
     useAuth.setState({ status: 'signedOut', user: null })

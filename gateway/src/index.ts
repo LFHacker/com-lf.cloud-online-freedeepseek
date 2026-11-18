@@ -1163,6 +1163,102 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   }
 
   /**
+   * 会话云端同步：把手机上的会话推到服务器。
+   *
+   * body: { sessions: [{ id, title, createdAt, updatedAt, payload }] }
+   * 返回写入/跳过条数；服务端按 updatedAt 取较新者，旧数据不会覆盖新数据。
+   *
+   * 为什么整条会话存成 JSON：会话结构还会变（分支、附件、引用），
+   * 拆成列每改一次都要迁移，而服务端并不需要理解内容。
+   */
+  if (req.method === 'POST' && url.pathname === '/sync/sessions') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    /**
+     * 会话正文可能很大（一条长对话几百 KB），所以这里用 8MB 上限，
+     * 并自己解析 —— 不能复用 auth 路由里那个 16KB 的 readJsonBody。
+     */
+    const read = await readBodyCapped(req, 8 * 1024 * 1024)
+    if (!read.ok) {
+      json(res, 413, { ok: false, error: 'too_large', message: '单次同步体积过大' })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      body = JSON.parse(read.buffer.toString('utf8')) as Record<string, unknown>
+    } catch {
+      json(res, 400, { ok: false, error: 'bad_json', message: '请求体不是合法 JSON' })
+      return
+    }
+    const list = Array.isArray(body.sessions)
+      ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
+      : []
+    if (list.length === 0) {
+      json(res, 200, { ok: true, written: 0, skipped: 0 })
+      return
+    }
+    // 单次上限：防止有人一次推 10 万条把库撑爆（正常批量是 50 条/次）
+    if (list.length > 500) {
+      json(res, 413, { ok: false, error: 'too_many', message: '一次最多同步 500 条会话' })
+      return
+    }
+    try {
+      const result = authStore.upsertSessions(
+        user.id,
+        list
+          .filter((item) => typeof item.id === 'string' && typeof item.payload === 'string')
+          .map((item) => ({
+            id: String(item.id),
+            title: typeof item.title === 'string' ? item.title : '',
+            createdAt: Number(item.createdAt ?? Date.now()),
+            updatedAt: Number(item.updatedAt ?? Date.now()),
+            payload: String(item.payload),
+          }))
+      )
+      json(res, 200, { ok: true, ...result })
+    } catch (error) {
+      console.warn('[gateway] 会话同步失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'sync_failed', message: '同步失败，请稍后重试' })
+    }
+    return
+  }
+
+  /** 会话清单（不含正文）：App 用它比对哪些需要下载 */
+  if (req.method === 'GET' && url.pathname === '/sync/sessions') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    json(res, 200, { ok: true, sessions: authStore.listSessions(user.id) })
+    return
+  }
+
+  /** 单条会话全文 */
+  if (req.method === 'GET' && url.pathname === '/sync/session') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = (url.searchParams.get('id') ?? '').trim()
+    if (!id) {
+      json(res, 400, { ok: false, error: 'bad_session', message: '缺少会话 id' })
+      return
+    }
+    const found = authStore.readSession(user.id, id)
+    if (!found) {
+      json(res, 404, { ok: false, error: 'not_found', message: '云端没有这条会话' })
+      return
+    }
+    json(res, 200, { ok: true, updatedAt: found.updatedAt, payload: found.payload })
+    return
+  }
+
+  /**
    * 该账号（= 它绑定的那个 Key）下**所有会话**的用量合计。
    *
    * 数据来自服务端账本（usage_events），所以重装、换设备都不会丢，

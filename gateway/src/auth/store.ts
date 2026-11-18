@@ -106,6 +106,27 @@ create index if not exists idx_auth_sessions_exp on auth_sessions(expires_at);
 
 /** 改名记录：用于限频（24h 内最多 3 次） */
 /**
+ * 会话云端同步。
+ *
+ * 只存**整条会话的 JSON**（payload），不拆字段：
+ *  · 会话结构还会变（分支、附件、引用），拆成列每改一次都要迁移
+ *  · 服务端不需要理解会话内容，只需要"按 id 存取 + 按时间比对"
+ *
+ * 放在 auth.db 而不是记忆库：会话属于账号，不属于记忆；
+ * 而且备份脚本已经覆盖 auth.db，跟着一起进备份。
+ */
+create table if not exists user_sessions (
+  user_id    text not null,
+  session_id text not null,
+  title      text,
+  created_at integer not null,
+  updated_at integer not null,
+  payload    text not null,
+  primary key (user_id, session_id)
+);
+create index if not exists idx_user_sessions_time on user_sessions(user_id, updated_at desc);
+
+/**
  * 用量账本。
  *
  * 为什么落在服务端：手机端只在消息里存 usage，重装/换设备就没了，
@@ -595,6 +616,77 @@ export class AuthStore {
 
   revokeAll(userId: string): void {
     this.db.prepare('delete from auth_sessions where user_id = ?').run(userId)
+  }
+
+  // ── 会话云端同步 ──────────────────────────────────────
+
+  /**
+   * 批量写入会话。
+   *
+   * 用"取较新者"的 upsert：两台设备都改过同一个会话时，
+   * 保留 updatedAt 更大的那份，避免旧数据把新数据覆盖掉。
+   */
+  upsertSessions(
+    userId: string,
+    sessions: Array<{ id: string; title: string; createdAt: number; updatedAt: number; payload: string }>
+  ): { written: number; skipped: number } {
+    const statement = this.db.prepare(
+      `insert into user_sessions (user_id, session_id, title, created_at, updated_at, payload)
+       values (?, ?, ?, ?, ?, ?)
+       on conflict(user_id, session_id) do update set
+         title = excluded.title,
+         created_at = excluded.created_at,
+         updated_at = excluded.updated_at,
+         payload = excluded.payload
+       where excluded.updated_at > user_sessions.updated_at`
+    )
+    let written = 0
+    this.db.exec('begin')
+    try {
+      for (const session of sessions) {
+        const result = statement.run(
+          userId,
+          session.id,
+          session.title,
+          session.createdAt,
+          session.updatedAt,
+          session.payload
+        )
+        if (Number(result.changes) > 0) {
+          written += 1
+        }
+      }
+      this.db.exec('commit')
+    } catch (error) {
+      this.db.exec('rollback')
+      throw error
+    }
+    return { written, skipped: sessions.length - written }
+  }
+
+  /** 会话列表（不含 payload，用于拉取前先比对） */
+  listSessions(userId: string): Array<{ id: string; title: string; createdAt: number; updatedAt: number }> {
+    return (
+      this.db
+        .prepare(
+          `select session_id id, title, created_at, updated_at from user_sessions
+            where user_id = ? order by updated_at desc`
+        )
+        .all(userId) as Array<{ id: string; title: string; created_at: number; updated_at: number }>
+    ).map((row) => ({
+      id: row.id,
+      title: row.title,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }))
+  }
+
+  /** 单条会话全文 */
+  readSession(userId: string, sessionId: string): { payload: string; updatedAt: number } | null {
+    const row = this.db
+      .prepare('select payload, updated_at from user_sessions where user_id = ? and session_id = ?')
+      .get(userId, sessionId) as { payload: string; updated_at: number } | undefined
+    return row ? { payload: row.payload, updatedAt: row.updated_at } : null
   }
 
   // ── 用量账本 ──────────────────────────────────────────

@@ -29,6 +29,7 @@ import { MemoryRegistry } from './memory/registry.ts'
 import { AuthFailure, AuthStore, keyFingerprint, type User } from './auth/store.ts'
 import { randomBytes } from 'node:crypto'
 import { redactSecrets } from './redact.ts'
+import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
 
@@ -139,6 +140,73 @@ if (MEMORY_ENABLED) {
  * 这比「暂时没有记忆」危险得多。
  */
 const authStore = new AuthStore(AUTH_DB_PATH)
+
+/** 邮件通道；没配就退化成"验证码只能打印到日志"（仅开发用） */
+const SMTP: SmtpConfig | null = readSmtpConfig(process.env)
+const MAIL_ENABLED = SMTP !== null
+if (!MAIL_ENABLED) {
+  console.warn('[gateway] 未配置 SMTP_*，邮箱验证码将无法发送（注册/找回不可用）')
+}
+
+/** 验证码有效期与重发冷却 */
+const CODE_TTL_MS = Number(process.env.CODE_TTL_MS ?? 10 * 60_000)
+const CODE_COOLDOWN_MS = Number(process.env.CODE_COOLDOWN_MS ?? 60_000)
+/** 每邮箱每小时最多发几次（内存计数，重启清零；够挡住手滑与轻度滥用） */
+const CODE_HOURLY_LIMIT = Number(process.env.CODE_HOURLY_LIMIT ?? 5)
+const codeHourly = new Map<string, number[]>()
+
+/**
+ * 每账号限流与每日配额。
+ *
+ * 全局限流只能挡住"一个 IP 刷"，挡不住"一个账号被刷爆影响所有人"。
+ * 这里按 user_id 再压一层：
+ *   · 每分钟请求数上限（默认 30）
+ *   · 每日请求数上限（默认 2000）
+ * 计数放内存（重启清零）：配额是防滥用，不是计费依据。
+ */
+const USER_RATE_MAX = Number(process.env.USER_RATE_MAX ?? 30)
+const USER_DAILY_MAX = Number(process.env.USER_DAILY_MAX ?? 2000)
+type UsageBucket = { minuteStart: number; minuteCount: number; day: string; dayCount: number }
+const usageByUser = new Map<string, UsageBucket>()
+
+const checkUserQuota = (userId: string): { allowed: boolean; reason?: 'minute' | 'daily'; retryAfterSeconds?: number } => {
+  const now = Date.now()
+  const day = new Date(now).toISOString().slice(0, 10)
+  let bucket = usageByUser.get(userId)
+  if (!bucket) {
+    bucket = { minuteStart: now, minuteCount: 0, day, dayCount: 0 }
+    usageByUser.set(userId, bucket)
+  }
+  if (now - bucket.minuteStart >= 60_000) {
+    bucket.minuteStart = now
+    bucket.minuteCount = 0
+  }
+  if (bucket.day !== day) {
+    bucket.day = day
+    bucket.dayCount = 0
+  }
+  if (bucket.minuteCount >= USER_RATE_MAX) {
+    return { allowed: false, reason: 'minute', retryAfterSeconds: Math.ceil((bucket.minuteStart + 60_000 - now) / 1000) }
+  }
+  if (bucket.dayCount >= USER_DAILY_MAX) {
+    return { allowed: false, reason: 'daily' }
+  }
+  bucket.minuteCount += 1
+  bucket.dayCount += 1
+  return { allowed: true }
+}
+
+const allowCodeSend = (email: string): boolean => {
+  const now = Date.now()
+  const list = (codeHourly.get(email) ?? []).filter((at) => now - at < 3_600_000)
+  if (list.length >= CODE_HOURLY_LIMIT) {
+    codeHourly.set(email, list)
+    return false
+  }
+  list.push(now)
+  codeHourly.set(email, list)
+  return true
+}
 
 /** 首次部署：没有账号就建一个管理员，密码随机并打印一次 */
 const bootstrapAdmin = (): User => {
@@ -474,6 +542,22 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
     json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或无效的访问令牌' })
     return
   }
+  // 每账号限流 / 每日配额：放在最前面，配额满了连上游都不碰
+  const quota = checkUserQuota(user.id)
+  if (!quota.allowed) {
+    if (quota.retryAfterSeconds) {
+      res.setHeader('Retry-After', String(quota.retryAfterSeconds))
+    }
+    json(res, 429, {
+      ok: false,
+      error: 'user_quota',
+      message:
+        quota.reason === 'daily'
+          ? '今日请求数已达上限，明天再来'
+          : `请求过于频繁，请 ${quota.retryAfterSeconds ?? 60} 秒后再试`,
+    })
+    return
+  }
   const inbound = readGatewayToken(req)
   /**
    * 官方 Key 来自**客户端请求头**，不是服务器配置。
@@ -780,21 +864,34 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   // 由 App 把每一步 POST 上来，落成 jsonl，事后直接在服务器上读。
   // 鉴权与聊天接口共用网关令牌；日志按行追加，超过 2 MB 自动轮转。
   if (req.method === 'POST' && url.pathname === '/client-log') {
-    // 令牌也可以走查询参数：客户端用 text/plain 发简单请求可以**绕过 CORS 预检**，
-    // 导入卡死时预检失败会连日志都发不出来（这正是我们最需要日志的时刻）。
-    const queryToken = url.searchParams.get('t') ?? ''
-    const auth = readGatewayToken(req)
-    const token = queryToken || auth?.token || ''
-    if (!sameToken(token, GATEWAY_TOKEN)) {
-      json(res, 401, { ok: false, error: 'unauthorized' })
-      return
-    }
+    /**
+     * ⚠️ 令牌**不能**放查询串：Caddy 的访问日志会记录完整 URL，
+     * 实测泄漏了 97 条带令牌的记录。现在改成两种都不进日志的方式：
+     *   ① 请求头 x-api-key（会触发 CORS 预检，但顺序正常时没问题）
+     *   ② 请求体首行 `x-ds-token: <令牌>`（text/plain 简单请求，无预检）
+     */
     const body = await readBodyCapped(req, 16 * 1024)
     if (!body.ok) {
       json(res, 413, { ok: false, error: 'too_large' })
       return
     }
-    const text = body.buffer.toString('utf8')
+    const rawText = body.buffer.toString('utf8')
+    /**
+     * 令牌来源（两者都不进访问日志）：
+     *  ① 请求头 x-api-key
+     *  ② 请求体首行 `x-ds-token: <令牌>` —— 给「用 text/plain 发简单请求、无预检」的场景
+     */
+    const headerToken = readGatewayToken(req)?.token ?? ''
+    const firstLine = rawText.split('\n', 1)[0] ?? ''
+    const bodyToken = /^x-ds-token:\s*\S+$/.test(firstLine.trim())
+      ? firstLine.trim().replace(/^x-ds-token:\s*/, '')
+      : ''
+    const text = bodyToken ? rawText.slice(firstLine.length + 1) : rawText
+    const token = headerToken || bodyToken
+    if (!token || !userFromToken(token)) {
+      json(res, 401, { ok: false, error: 'unauthorized' })
+      return
+    }
     const line = JSON.stringify({
       at: new Date().toISOString(),
       ip: (typeof req.headers['x-forwarded-for'] === 'string'
@@ -909,6 +1006,11 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const map: Record<string, [number, string]> = {
         invalidEmail: [400, '邮箱格式不正确'],
+        badCode: [400, '验证码不正确或已过期'],
+        codeExpired: [400, '验证码已过期，请重新获取'],
+        codeTooManyAttempts: [429, '这条验证码试错次数过多，请重新获取'],
+        tooManyCodes: [429, '发送太频繁，请稍后再试'],
+        mail_failed: [502, '验证码邮件发送失败，请稍后重试'],
         weakPassword: [400, '密码至少 8 位'],
         emailTaken: [409, '该邮箱已注册'],
         badCredentials: [401, '邮箱或密码不正确'],
@@ -926,6 +1028,107 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       createdAt: user.createdAt,
     })
 
+    /** 发验证码。用途决定邮件文案，也决定"邮箱是否已注册"要不要报错 */
+    if (req.method === 'POST' && url.pathname === '/auth/send-code') {
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const email = str(body.email).trim()
+      const purpose = str(body.purpose) === 'reset' ? 'reset' : 'register'
+      if (purpose === 'register' && authStore.findByEmail(email)) {
+        fail(409, 'emailTaken', '该邮箱已注册，直接登录或找回密码')
+        return
+      }
+      // ⚠️ 重置密码时无论邮箱是否存在都回 ok，避免被用来探测哪些邮箱注册过
+      const exists = Boolean(authStore.findByEmail(email))
+      if (purpose === 'reset' && !exists) {
+        json(res, 200, { ok: true, cooldownSeconds: Math.ceil(CODE_COOLDOWN_MS / 1000) })
+        return
+      }
+      if (!allowCodeSend(email.toLowerCase())) {
+        fail(429, 'tooManyCodes', '这个邮箱发送太频繁，请稍后再试')
+        return
+      }
+      let code = ''
+      try {
+        code = authStore.issueEmailCode(email, purpose, {
+          cooldownMs: CODE_COOLDOWN_MS,
+          ttlMs: CODE_TTL_MS,
+        })
+      } catch (error) {
+        authError(error)
+        return
+      }
+      if (!SMTP) {
+        console.log(`[gateway] 未配置邮件通道，验证码（${purpose}）: ${email} -> ${code}`)
+        json(res, 200, {
+          ok: true,
+          cooldownSeconds: Math.ceil(CODE_COOLDOWN_MS / 1000),
+          delivered: false,
+        })
+        return
+      }
+      try {
+        await sendMail(SMTP, {
+          to: email,
+          subject:
+            purpose === 'register' ? '【自由的deepseek】注册验证码' : '【自由的deepseek】重置密码验证码',
+          text: [
+            purpose === 'register' ? '你正在注册 自由的deepseek。' : '你正在重置 自由的deepseek 的密码。',
+            '',
+            `验证码：${code}`,
+            '',
+            `有效期为 ${Math.round(CODE_TTL_MS / 60_000)} 分钟。`,
+            '如果这不是你本人的操作，请忽略这封邮件，你的账号不会发生任何变化。',
+          ].join('\n'),
+        })
+      } catch (error) {
+        console.warn('[gateway] 验证码邮件发送失败:', error instanceof Error ? error.message : error)
+        fail(502, 'mail_failed', '验证码邮件发送失败，请稍后重试')
+        return
+      }
+      console.log(`[gateway] 已发送 ${purpose} 验证码到 ${email}`)
+      json(res, 200, { ok: true, cooldownSeconds: Math.ceil(CODE_COOLDOWN_MS / 1000), delivered: true })
+      return
+    }
+
+    /** 重置密码：申请 → 校验码 → 改密并吊销所有会话 */
+    if (req.method === 'POST' && url.pathname === '/auth/reset') {
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const email = str(body.email).trim()
+      const code = str(body.code).trim()
+      const newPassword = str(body.newPassword)
+      const user = authStore.findByEmail(email)
+      if (!user) {
+        // 与"码不对"同一个错误，不泄露邮箱是否存在
+        fail(400, 'badCode', '验证码不正确或已过期')
+        return
+      }
+      try {
+        authStore.verifyEmailCode(email, 'reset', code)
+        authStore.setPassword(user.id, newPassword)
+        authStore.consumeEmailCode(email, 'reset')
+        authStore.clearLoginFailures(email)
+      } catch (error) {
+        authError(error)
+        return
+      }
+      // 改密码会吊销全部会话；给当前设备发一个新的，避免用户"改完就被踢"
+      const session = authStore.createSession(user.id, device())
+      console.log(`[gateway] ${user.email} 通过邮箱验证码重置了密码`)
+      json(res, 200, {
+        ok: true,
+        token: session.token,
+        expiresAt: session.expiresAt,
+        user: payloadUser(user),
+      })
+      return
+    }
+
     if (req.method === 'POST' && url.pathname === '/auth/register') {
       if (!ALLOW_SIGNUP) {
         fail(403, 'signup_disabled', '本实例未开放注册，请联系管理员')
@@ -935,10 +1138,19 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       if (!body) {
         return
       }
+      const email = str(body.email).trim()
+      const code = str(body.code).trim()
+      if (!code) {
+        fail(400, 'badCode', '请输入邮箱收到的验证码')
+        return
+      }
       try {
-        const user = authStore.createUser(str(body.email), str(body.password))
+        // 先验码再建号：验证码错误时不要留下半个账号
+        authStore.verifyEmailCode(email, 'register', code)
+        const user = authStore.createUser(email, str(body.password))
+        authStore.consumeEmailCode(email, 'register')
         const session = authStore.createSession(user.id, device())
-        console.log(`[gateway] 新注册：${user.email}`)
+        console.log(`[gateway] 新注册（邮箱已验证）：${user.email}`)
         json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
       } catch (error) {
         authError(error)
@@ -951,11 +1163,28 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       if (!body) {
         return
       }
+      const email = str(body.email)
+      // 退避期内即使密码正确也拒绝 —— 否则撞库方仍能靠"是否返回 401"区分密码对错
+      const retryAfter = authStore.loginRetryAfter(email)
+      if (retryAfter > 0) {
+        res.setHeader('Retry-After', String(retryAfter))
+        fail(429, 'loginBackoff', `失败次数过多，请 ${retryAfter} 秒后再试`)
+        return
+      }
       try {
-        const user = authStore.verifyPassword(str(body.email), str(body.password))
+        const user = authStore.verifyPassword(email, str(body.password))
+        authStore.clearLoginFailures(email)
         const session = authStore.createSession(user.id, device())
         json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
       } catch (error) {
+        if (error instanceof AuthFailure && error.key === 'badCredentials') {
+          const guard = authStore.noteLoginFailure(email)
+          if (guard.retryAfterSeconds > 0) {
+            res.setHeader('Retry-After', String(guard.retryAfterSeconds))
+            fail(429, 'loginBackoff', `失败次数过多，请 ${guard.retryAfterSeconds} 秒后再试`)
+            return
+          }
+        }
         authError(error)
       }
       return

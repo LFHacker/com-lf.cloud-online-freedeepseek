@@ -80,10 +80,10 @@ export const signIn = async (email: string, password: string): Promise<boolean> 
   }
 }
 
-export const signUp = async (email: string, password: string): Promise<boolean> => {
+export const signUp = async (email: string, password: string, code: string): Promise<boolean> => {
   useAuth.setState({ busy: true, error: null })
   try {
-    applySession(await api.register(email.trim(), password))
+    applySession(await api.register(email.trim(), password, code.trim()))
     return true
   } catch (error) {
     useAuth.setState({ busy: false, error: message(error) })
@@ -107,3 +107,22 @@ export const replaceToken = (token: string): void => {
 }
 
 export const clearAuthError = (): void => useAuth.setState({ error: null })
+
+/** 忘记密码：用邮箱验证码重置，成功后直接进入登录态 */
+export const resetWithCode = async (email: string, code: string, newPassword: string): Promise<boolean> => {
+  useAuth.setState({ busy: true, error: null })
+  try {
+    applySession(await api.resetPassword(email.trim(), code.trim(), newPassword))
+    return true
+  } catch (error) {
+    useAuth.setState({ busy: false, error: message(error) })
+    return false
+  }
+}
+
+/** 发验证码；成功返回冷却秒数，失败抛错由界面显示 */
+export const requestCode = async (email: string, purpose: 'register' | 'reset'): Promise<number> => {
+  const result = await api.sendCode(email.trim(), purpose)
+  return result.cooldownSeconds ?? 60
+}
+

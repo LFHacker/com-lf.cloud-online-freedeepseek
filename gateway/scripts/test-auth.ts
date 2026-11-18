@@ -42,22 +42,22 @@ try {
   expectFailure('邮箱格式非法被拒', 'invalidEmail', () => auth.createUser('not-an-email', 'password123'))
   expectFailure('密码太短被拒', 'weakPassword', () => auth.createUser('a@b.com', 'short'))
 
-  const alice = auth.createUser('Alice@Example.COM', 'alicepassword', 'admin')
+  const alice = auth.createUser('Alice@Example.COM', 'Tr0ub4dor-9x', 'admin')
   check('邮箱统一小写存储', alice.email === 'alice@example.com', alice.email)
   check('角色可设为 admin', alice.role === 'admin')
 
-  expectFailure('重复邮箱被拒', 'emailTaken', () => auth.createUser('alice@example.com', 'anotherpass'))
+  expectFailure('重复邮箱被拒', 'emailTaken', () => auth.createUser('alice@example.com', 'An0ther-Pass-7'))
 
-  const bob = auth.createUser('bob@example.com', 'bobpassword')
+  const bob = auth.createUser('bob@example.com', 'B0b-Str0ng-9')
   check('用户 id 可用于目录名', /^u_[0-9a-f]{16}$/.test(bob.id), bob.id)
   check('用户数正确', auth.countUsers() === 2)
 
   // ── 2. 密码校验 ────────────────────────────────────────
-  check('正确密码通过', auth.verifyPassword('alice@example.com', 'alicepassword').id === alice.id)
-  check('大小写邮箱都能登录', auth.verifyPassword('ALICE@example.com', 'alicepassword').id === alice.id)
-  expectFailure('错误密码被拒', 'badCredentials', () => auth.verifyPassword('alice@example.com', 'wrongpass'))
+  check('正确密码通过', auth.verifyPassword('alice@example.com', 'Tr0ub4dor-9x').id === alice.id)
+  check('大小写邮箱都能登录', auth.verifyPassword('ALICE@example.com', 'Tr0ub4dor-9x').id === alice.id)
+  expectFailure('错误密码被拒', 'badCredentials', () => auth.verifyPassword('alice@example.com', 'Wr0ng-Pass-1'))
   expectFailure('不存在的邮箱被拒（且与密码错同一个 key）', 'badCredentials', () =>
-    auth.verifyPassword('nobody@example.com', 'whatever')
+    auth.verifyPassword('nobody@example.com', 'Wh4tever-Pass-2')
   )
 
   // ── 3. 会话 ────────────────────────────────────────────
@@ -75,12 +75,12 @@ try {
   check('另一个会话不受影响', auth.resolveToken(s2.token)?.id === alice.id)
 
   // 改密码应踢掉所有会话
-  auth.setPassword(alice.id, 'newalicepassword')
+  auth.setPassword(alice.id, 'newTr0ub4dor-9x')
   check('改密码后旧会话全部失效', auth.resolveToken(s2.token) === null)
-  check('新密码可登录', auth.verifyPassword('alice@example.com', 'newalicepassword').id === alice.id)
+  check('新密码可登录', auth.verifyPassword('alice@example.com', 'newTr0ub4dor-9x').id === alice.id)
   check('旧密码失效', (() => {
     try {
-      auth.verifyPassword('alice@example.com', 'alicepassword')
+      auth.verifyPassword('alice@example.com', 'Tr0ub4dor-9x')
       return false
     } catch {
       return true
@@ -88,7 +88,7 @@ try {
   })())
 
   // ── 4. 停用账号 ────────────────────────────────────────
-  const disabled = auth.createUser('carol@example.com', 'carolpassword')
+  const disabled = auth.createUser('carol@example.com', 'Car0l-Str0ng-8')
   const carolSession = auth.createSession(disabled.id)
   const db = new DatabaseSync(join(dir, 'auth.db'))
   db.prepare("update users set status = 'disabled' where id = ?").run(disabled.id)
@@ -189,7 +189,7 @@ try {
 // ── 7. 官方 Key：只留指纹 ──────────────────────────────
   {
     const store = new AuthStore(join(dir, 'auth-key.db'))
-    const user = store.createUser('keyuser@example.com', 'keypassword123')
+    const user = store.createUser('keyuser@example.com', 'K3y-Pass-9931')
     // ⚠️ 假 Key 必须运行时拼出来：源码里出现 sk-<长串> 会被 GitHub 推送保护拦下
     const fakeKey = ['sk', 'a1b2c3d4'.repeat(8)].join('-')
 
@@ -212,7 +212,7 @@ try {
     check('数据库文件里搜不到 Key 的正文片段', !dbBytes.includes(fakeKey.slice(10, 30)))
 
     // 同一个 Key 被两个账号绑定 → 指纹计数 2
-    const other = store.createUser('keyuser2@example.com', 'keypassword123')
+    const other = store.createUser('keyuser2@example.com', 'K3y-Pass-9931')
     store.setUpstreamKey(other.id, fakeKey)
     check('同一指纹被两个账号使用会被发现', store.fingerprintOwners(info.fingerprint) === 2)
 
@@ -237,6 +237,103 @@ try {
     check('空串安全', redactSecrets('') === '')
   }
 
+  // ── 9. 邮箱验证码 ──────────────────────────────────────
+  {
+    const store = new AuthStore(join(dir, 'auth-code.db'))
+    const email = 'code@example.com'
+
+    const code = store.issueEmailCode(email, 'register', { cooldownMs: 60_000, ttlMs: 600_000 })
+    check('验证码是 6 位数字', /^\d{6}$/.test(code), code)
+
+    // 冷却期内重发应被拒
+    let cooled = false
+    try { store.issueEmailCode(email, 'register', { cooldownMs: 60_000, ttlMs: 600_000 }) } catch (e) {
+      cooled = e instanceof AuthFailure && e.key === 'tooManyCodes'
+    }
+    check('冷却期内重发被拒', cooled)
+
+    // 错误的码要报错，且不消费
+    let bad = false
+    try { store.verifyEmailCode(email, 'register', '000000') } catch (e) {
+      bad = e instanceof AuthFailure && e.key === 'badCode'
+    }
+    check('错误验证码被拒', bad)
+    store.verifyEmailCode(email, 'register', code)
+    check('正确验证码通过', true)
+
+    // 重发会让旧码立即失效（主键覆盖）
+    const db2 = new DatabaseSync(join(dir, 'auth-code.db'))
+    db2.prepare('update email_codes set created_at = 0 where email = ? and purpose = ?').run(email, 'register')
+    db2.close()
+    const code2 = store.issueEmailCode(email, 'register', { cooldownMs: 60_000, ttlMs: 600_000 })
+    let oldDead = false
+    try { store.verifyEmailCode(email, 'register', code) } catch (e) {
+      oldDead = e instanceof AuthFailure && e.key === 'badCode'
+    }
+    check('重发后旧码立即失效', oldDead)
+    store.verifyEmailCode(email, 'register', code2)
+
+    // 用掉之后不能再用
+    store.consumeEmailCode(email, 'register')
+    let consumed = false
+    try { store.verifyEmailCode(email, 'register', code2) } catch (e) {
+      consumed = e instanceof AuthFailure && e.key === 'badCode'
+    }
+    check('用过的码不能重放', consumed)
+
+    // 5 次错码后作废
+    const email2 = 'code2@example.com'
+    const c3 = store.issueEmailCode(email2, 'reset', { cooldownMs: 0, ttlMs: 600_000 })
+    for (let i = 0; i < 5; i += 1) {
+      try { store.verifyEmailCode(email2, 'reset', '999999') } catch { /* 预期失败 */ }
+    }
+    let locked = false
+    try { store.verifyEmailCode(email2, 'reset', c3) } catch (e) {
+      locked = e instanceof AuthFailure && e.key === 'codeTooManyAttempts'
+    }
+    check('错 5 次后正确码也不再放行', locked)
+    store.close()
+  }
+
+  // ── 10. 密码强度 ───────────────────────────────────────
+  {
+    const store = new AuthStore(join(dir, 'auth-strength.db'))
+    const weak = ['12345678', 'password123', '1111111111', 'abcdefghij']
+    for (const pw of weak) {
+      let rejected = false
+      try { store.createUser('w@example.com', pw) } catch (e) {
+        rejected = e instanceof AuthFailure && e.key === 'weakPassword'
+      }
+      check(`弱口令被拒：${pw}`, rejected)
+    }
+    let tooShort = false
+    try { store.createUser('w@example.com', 'Ab1!x') } catch (e) {
+      tooShort = e instanceof AuthFailure && e.key === 'weakPassword'
+    }
+    check('太短被拒', tooShort)
+    let sameAsEmail = false
+    try { store.createUser('alice.wonder@example.com', 'alice.wonder123') } catch (e) {
+      sameAsEmail = e instanceof AuthFailure && e.key === 'weakPassword'
+    }
+    check('与邮箱雷同被拒', sameAsEmail)
+    const ok = store.createUser('strong@example.com', 'Correct-Horse-9')
+    check('强密码通过', ok.email === 'strong@example.com')
+    store.close()
+  }
+
+  // ── 11. 登录失败退避 ───────────────────────────────────
+  {
+    const store = new AuthStore(join(dir, 'auth-guard.db'))
+    const user = store.createUser('guard@example.com', 'Correct-Horse-9')
+    for (let i = 0; i < 4; i += 1) store.noteLoginFailure(user.email)
+    check('前 4 次失败不锁', store.loginRetryAfter(user.email) === 0)
+    const fifth = store.noteLoginFailure(user.email)
+    check('第 5 次失败开始退避', fifth.retryAfterSeconds > 0, String(fifth.retryAfterSeconds))
+    check('退避期可查询', store.loginRetryAfter(user.email) > 0)
+    store.clearLoginFailures(user.email)
+    check('成功登录后清零', store.loginRetryAfter(user.email) === 0)
+    store.close()
+  }
   console.log(`\n=== PASS=${pass}  FAIL=${fail} ===`)
 if (fail > 0) {
   process.exitCode = 1

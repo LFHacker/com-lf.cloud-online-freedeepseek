@@ -16,7 +16,7 @@
  * 4. 与记忆库分开：这是 auth.db，记忆是每用户一个 memory.db。
  */
 import { DatabaseSync } from 'node:sqlite'
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 
@@ -38,6 +38,10 @@ export type AuthError =
   | 'badCredentials'
   | 'disabled'
   | 'invalidToken'
+  | 'badCode'
+  | 'codeExpired'
+  | 'codeTooManyAttempts'
+  | 'tooManyCodes'
 
 /** 认证失败：key 给前端做文案，不包含任何可用于探测的信息 */
 export class AuthFailure extends Error {
@@ -89,6 +93,27 @@ create index if not exists idx_auth_sessions_user on auth_sessions(user_id);
 create index if not exists idx_auth_sessions_exp on auth_sessions(expires_at);
 
 /**
+ * 邮箱验证码。只存 sha256(code)；主键 (email,purpose) 保证重发即覆盖，旧码立即失效。
+ */
+create table if not exists email_codes (
+  email       text not null,
+  purpose     text not null check (purpose in ('register','reset')),
+  code_hash   text not null,
+  expires_at  integer not null,
+  attempts    integer not null default 0,
+  created_at  integer not null,
+  primary key (email, purpose)
+);
+
+/** 登录失败退避：按账号记，不按 IP（分布式撞库换 IP 就绕过了） */
+create table if not exists login_guards (
+  email         text primary key,
+  failures      integer not null default 0,
+  locked_until  integer not null default 0,
+  last_failure  integer not null
+);
+
+/**
  * 用户绑定的官方 Key —— **只存指纹，不存 Key 本身**。
  *
  * 原始 Key 永远只存在于用户设备上：每次请求由客户端放在 x-deepseek-key 头里带来，
@@ -117,8 +142,34 @@ const normalizeEmail = (email: string): string => email.trim().toLowerCase()
 /** 邮箱校验：够用即可（不追求 RFC 5322 全集，那种正则通常写错） */
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/
 
-const MIN_PASSWORD = 8
+const MIN_PASSWORD = 10
 const MAX_PASSWORD = 200
+const COMMON_PASSWORDS = new Set([
+  '12345678', '123456789', '1234567890', 'password', 'password1', 'password123',
+  'qwertyuiop', 'qwerty123', '11111111', '00000000', 'abc123456', 'iloveyou',
+  'admin123', 'letmein1', 'welcome1', 'passw0rd', 'zxcvbnm123', 'asdfghjkl',
+])
+
+/** 只查长度不够：12345678 能过等于没规则。额外拒绝弱口令/单字符重复/序列/与邮箱雷同 */
+const isWeakPassword = (password: string, email?: string): boolean => {
+  const lower = password.toLowerCase()
+  if (COMMON_PASSWORDS.has(lower)) {
+    return true
+  }
+  if (/^(.)\1+$/.test(password)) {
+    return true
+  }
+  if (/^(0123456789|abcdefghij|qwertyuiop|asdfghjkl)/i.test(password)) {
+    return true
+  }
+  if (email) {
+    const local = email.split('@')[0]?.toLowerCase() ?? ''
+    if (local.length >= 3 && lower.includes(local)) {
+      return true
+    }
+  }
+  return false
+}
 
 const toUser = (row: Record<string, unknown>): User => ({
   id: String(row.id),
@@ -196,7 +247,7 @@ export class AuthStore {
     if (!EMAIL_RE.test(normalized)) {
       throw new AuthFailure('invalidEmail')
     }
-    if (password.length < MIN_PASSWORD || password.length > MAX_PASSWORD) {
+    if (password.length < MIN_PASSWORD || password.length > MAX_PASSWORD || isWeakPassword(password, normalized)) {
       throw new AuthFailure('weakPassword')
     }
     if (this.findByEmail(normalized)) {
@@ -228,7 +279,12 @@ export class AuthStore {
 
   /** 改密码：同时踢掉该用户所有会话（改密码意味着旧令牌应当失效） */
   setPassword(userId: string, password: string): void {
-    if (password.length < MIN_PASSWORD || password.length > MAX_PASSWORD) {
+    const owner = this.findById(userId)
+    if (
+      password.length < MIN_PASSWORD ||
+      password.length > MAX_PASSWORD ||
+      isWeakPassword(password, owner?.email)
+    ) {
       throw new AuthFailure('weakPassword')
     }
     const salt = randomBytes(SALT_BYTES)
@@ -329,6 +385,118 @@ export class AuthStore {
     this.db.prepare('delete from auth_sessions where user_id = ?').run(userId)
   }
 
+  // ── 邮箱验证码 ────────────────────────────────────────
+
+  /** 生成并落库一个验证码，返回明文供发送；冷却期内抛 tooManyCodes */
+  issueEmailCode(
+    email: string,
+    purpose: 'register' | 'reset',
+    options: { cooldownMs: number; ttlMs: number }
+  ): string {
+    const normalized = normalizeEmail(email)
+    if (!EMAIL_RE.test(normalized)) {
+      throw new AuthFailure('invalidEmail')
+    }
+    const now = Date.now()
+    const existing = this.db
+      .prepare('select created_at from email_codes where email = ? and purpose = ?')
+      .get(normalized, purpose) as { created_at: number } | undefined
+    if (existing && now - existing.created_at < options.cooldownMs) {
+      throw new AuthFailure('tooManyCodes')
+    }
+    // 6 位数字：用 crypto 的均匀随机，Math.random 在并发下不均匀
+    const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
+    this.db
+      .prepare(
+        `insert into email_codes (email, purpose, code_hash, expires_at, attempts, created_at)
+         values (?, ?, ?, ?, 0, ?)
+         on conflict(email, purpose) do update set
+           code_hash = excluded.code_hash,
+           expires_at = excluded.expires_at,
+           attempts = 0,
+           created_at = excluded.created_at`
+      )
+      .run(normalized, purpose, sha256Hex(code), now + options.ttlMs, now)
+    return code
+  }
+
+  /** 校验验证码；失败抛 badCode / codeExpired / codeTooManyAttempts。成功后不消费，由调用方决定 */
+  verifyEmailCode(email: string, purpose: 'register' | 'reset', code: string): void {
+    const normalized = normalizeEmail(email)
+    const row = this.db
+      .prepare('select code_hash, expires_at, attempts from email_codes where email = ? and purpose = ?')
+      .get(normalized, purpose) as
+      | { code_hash: string; expires_at: number; attempts: number }
+      | undefined
+    if (!row) {
+      throw new AuthFailure('badCode')
+    }
+    if (row.attempts >= 5) {
+      throw new AuthFailure('codeTooManyAttempts')
+    }
+    if (row.expires_at < Date.now()) {
+      throw new AuthFailure('codeExpired')
+    }
+    if (row.code_hash !== sha256Hex(code.trim())) {
+      this.db
+        .prepare('update email_codes set attempts = attempts + 1 where email = ? and purpose = ?')
+        .run(normalized, purpose)
+      throw new AuthFailure('badCode')
+    }
+  }
+
+  /** 用掉验证码（成功后调用），防止同一个码被重放 */
+  consumeEmailCode(email: string, purpose: 'register' | 'reset'): void {
+    this.db
+      .prepare('delete from email_codes where email = ? and purpose = ?')
+      .run(normalizeEmail(email), purpose)
+  }
+
+  // ── 登录失败退避 ──────────────────────────────────────
+
+  /** 该邮箱当前是否处于退避期；是则返回剩余秒数 */
+  loginRetryAfter(email: string): number {
+    const row = this.db
+      .prepare('select locked_until from login_guards where email = ?')
+      .get(normalizeEmail(email)) as { locked_until: number } | undefined
+    if (!row || row.locked_until <= Date.now()) {
+      return 0
+    }
+    return Math.ceil((row.locked_until - Date.now()) / 1000)
+  }
+
+  /**
+   * 记一次失败。前 4 次不锁；第 5 次起按 1/2/4/8… 分钟退避（上限 1 小时）。
+   * 指数退避优于此前的永久锁定：既挡住撞库，也不会因为别人恶意失败把你锁死。
+   */
+  noteLoginFailure(email: string): { failures: number; retryAfterSeconds: number } {
+    const normalized = normalizeEmail(email)
+    const now = Date.now()
+    const row = this.db
+      .prepare('select failures from login_guards where email = ?')
+      .get(normalized) as { failures: number } | undefined
+    const failures = (row?.failures ?? 0) + 1
+    let lockedUntil = 0
+    if (failures >= 5) {
+      const minutes = Math.min(60, 2 ** (failures - 5))
+      lockedUntil = now + minutes * 60_000
+    }
+    this.db
+      .prepare(
+        `insert into login_guards (email, failures, locked_until, last_failure)
+         values (?, ?, ?, ?)
+         on conflict(email) do update set
+           failures = excluded.failures,
+           locked_until = excluded.locked_until,
+           last_failure = excluded.last_failure`
+      )
+      .run(normalized, failures, lockedUntil, now)
+    return { failures, retryAfterSeconds: lockedUntil ? Math.ceil((lockedUntil - now) / 1000) : 0 }
+  }
+
+  clearLoginFailures(email: string): void {
+    this.db.prepare('delete from login_guards where email = ?').run(normalizeEmail(email))
+  }
   /** 记录（或更新）指纹；同一次调用不写两次 */
   setUpstreamKey(userId: string, key: string, validatedAt = Date.now()): UpstreamKeyInfo {
     const info: UpstreamKeyInfo = {

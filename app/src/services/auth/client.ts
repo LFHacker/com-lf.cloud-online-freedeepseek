@@ -80,8 +80,8 @@ const get = async <T>(path: string, token: string): Promise<T> => {
 export const login = (email: string, password: string): Promise<AuthSession> =>
   post<AuthSession>('/auth/login', { email, password })
 
-export const register = (email: string, password: string): Promise<AuthSession> =>
-  post<AuthSession>('/auth/register', { email, password })
+export const register = (email: string, password: string, code: string): Promise<AuthSession> =>
+  post<AuthSession>('/auth/register', { email, password, code })
 
 export const logout = (token: string): Promise<unknown> => post('/auth/logout', {}, token)
 
@@ -138,3 +138,13 @@ export const unbindUpstreamKey = async (token: string): Promise<void> => {
     await toError(response)
   }
 }
+
+export type SendCodeResult = { ok: boolean; cooldownSeconds: number; delivered?: boolean }
+
+/** 发验证码。purpose 决定文案，也决定服务端要不要报"邮箱已注册" */
+export const sendCode = (email: string, purpose: 'register' | 'reset'): Promise<SendCodeResult> =>
+  post<SendCodeResult>('/auth/send-code', { email, purpose })
+
+/** 用验证码重置密码；成功后直接返回新会话，不用再登录一次 */
+export const resetPassword = (email: string, code: string, newPassword: string): Promise<AuthSession> =>
+  post<AuthSession>('/auth/reset', { email, code, newPassword })

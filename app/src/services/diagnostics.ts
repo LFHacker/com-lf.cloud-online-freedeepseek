@@ -26,10 +26,16 @@ export const reportStep = (step: string, detail?: unknown): void => {
       detail: detail === undefined ? undefined : detail,
       ua: typeof navigator === 'undefined' ? '' : navigator.userAgent.slice(0, 140),
     })
-    void fetch(`${apiOrigin()}/client-log?t=${encodeURIComponent(token)}`, {
+    /**
+     * ⚠️ 令牌放在**请求体首行**，不能放查询串：
+     * 查询串会被 Caddy 访问日志原样记录（实测泄漏过 97 条带令牌的记录）。
+     * 请求体不进访问日志；同时保持 text/plain 简单请求，不触发 CORS 预检
+     * （导入卡死时最需要日志，那一刻预检失败会连日志都发不出去）。
+     */
+    void fetch(`${apiOrigin()}/client-log`, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
-      body: payload,
+      body: `x-ds-token: ${token}\n${payload}`,
       keepalive: true,
     })
       .then((response) => {

@@ -140,6 +140,10 @@ export class MemoryStore {
    * 一个切片是 500 字内的片段，命中它但缺前后文时，模型看到的是半句话。
    */
   private readonly neighborExpand: boolean
+  /** 注入时给多少条命中带上下文（实测全带会把注入块撑到 2600 字，反而降分） */
+  private readonly contextHits: number
+  /** 每条上下文最多多少字 */
+  private readonly contextChars: number
   private lastHits = 0
   /** 后台向量化任务，测试与关停时用 */
   private readonly pending = new Set<Promise<void>>()
@@ -169,6 +173,8 @@ export class MemoryStore {
      * 想试试就设 MEMORY_NEIGHBORS=1。
      */
     this.neighborExpand = (process.env.MEMORY_NEIGHBORS ?? '0') !== '0'
+    this.contextHits = Number(process.env.MEMORY_CONTEXT_HITS ?? 2)
+    this.contextChars = Number(process.env.MEMORY_CONTEXT_CHARS ?? 300)
     this.freshnessBoost =
       options.freshnessBoost ?? Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25)
   }
@@ -922,13 +928,19 @@ export class MemoryStore {
      * 带上回答的原因：用户问「Flutter 找不到 Chrome 怎么办」时，
      * 他这句话里只有报错，解法在回答里——只给问题，模型只能复述报错。
      */
-    const lines = hits.map((hit) => {
+    const lines = hits.map((hit, index) => {
       const head = `[${formatDay(hit.createdAt)} · 会话 ${hit.sessionId.slice(0, 8)}]`
-      const context = hit.context?.trim()
+      /**
+       * 只给**最相关的前几条**带上下文，且每条截断。
+       * 实测全带会把注入块从 690 字撑到 2600 字，回答级分数反而从 1.45 掉到 1.25 ——
+       * 相关信息被淹没在无关的回答里了。
+       */
+      const context = index < this.contextHits ? hit.context?.trim() : null
       if (!context) {
         return `${head} ${hit.body}`
       }
-      return `${head} 用户说：${hit.body}\n（当时助手的回答：${context}）`
+      const trimmed = context.length > this.contextChars ? `${context.slice(0, this.contextChars)}…` : context
+      return `${head} 用户说：${hit.body}\n（当时助手的回答：${trimmed}）`
     })
     return [
       '<回忆>',

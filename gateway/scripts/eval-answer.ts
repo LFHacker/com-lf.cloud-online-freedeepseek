@@ -68,16 +68,8 @@ const step = Math.max(1, Math.floor(all.length / sampleSize))
 const cases = all.filter((_, index) => index % step === 0).slice(0, sampleSize)
 
 const store = new MemoryStore({ dbPath })
-// 与生产的 buildRecallBlock 保持一致：把助手回答也当作资料的一部分
-const contextOf = (hits: MemoryHit[]): string =>
-  hits
-    .map((hit, index) => {
-      const context = hit.context?.trim()
-      return context
-        ? `[资料${index + 1}] 用户说：${hit.body}\n（当时助手的回答：${context}）`
-        : `[资料${index + 1}] ${hit.body}`
-    })
-    .join('\n\n')
+// 直接用生产的注入格式，保证评的就是线上看到的东西
+const contextOf = (hits: MemoryHit[]): string => store.buildRecallBlock(hits)
 
 const judge = async (query: string, truth: string, answer: string): Promise<number> => {
   const prompt = [

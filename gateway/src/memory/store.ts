@@ -20,6 +20,28 @@ import {
   type EmbeddingClient,
 } from './embed.ts'
 
+/**
+ * 这段话是不是在**纠正自己的事实**？
+ *
+ * 判据刻意保守：宁可漏判（档案晚点更新），也不要每句"我是…"都触发重建 ——
+ * 重建会打散 system 前缀缓存，每轮重建等于把缓存收益全丢掉。
+ *
+ * 覆盖三类实际出现过的说法：
+ *   · 明确纠正：说错了 / 记错了 / 不对，是 X / 改成 X
+ *   · 带年级的自我介绍：我是 2024 级 / 我 2024 级的
+ *   · 身份自述：我叫 X / 我是 X 专业的
+ */
+const looksLikeSelfCorrection = (text: string): boolean => {
+  if (text.length > 200) {
+    return false
+  }
+  return (
+    /说错|记错|纠正|更正|改口|不对[，,]|不是.{0,8}是/u.test(text) ||
+    /我[^。]{0,6}\d{4}[^。]{0,4}级/u.test(text) ||
+    /我(叫|是)[^。]{1,20}(专业|学院|学校|大学)/u.test(text)
+  )
+}
+
 export type MemoryScope = 'global' | 'local'
 
 export type MemoryHit = {
@@ -253,6 +275,17 @@ export class MemoryStore {
     // 助手回答仍然全量落库（P1 要求不丢数据），只是不参与跨会话召回。
     if (params.scope !== 'global' || params.role !== 'user' || params.index === false) {
       return { stored: true, chunks: 0 }
+    }
+
+    /**
+     * 用户在**纠正自己的事实**（"我说错了，是 2024 级"）时，必须让长期档案失效。
+     *
+     * 实测踩过：在 A 对话里把年级从 2022 改成 2024，档案 24 小时才重建，
+     * 于是 B 对话里模型仍然说 2022 —— 用户看到的字面是"记忆是错的"，
+     * 这类错误对信任的破坏比"少记一条"严重得多。
+     */
+    if (looksLikeSelfCorrection(body)) {
+      this.markProfileStale()
     }
 
     const chunks = splitIntoChunks(body)
@@ -562,6 +595,17 @@ export class MemoryStore {
       .prepare("select body, source_chunks, updated_at from memory_profile where id = 'stable'")
       .get() as { body: string; source_chunks: number; updated_at: number } | undefined
     return row ? { body: row.body, sourceChunks: row.source_chunks, updatedAt: row.updated_at } : null
+  }
+
+  /**
+   * 把长期档案标记为过期（updatedAt = 0）。
+   * 下一次请求会重建，重建时以最新说法为准。
+   *
+   * ⚠️ 只改 updated_at、不清空 body：万一重建失败（网络/额度），
+   * 还能退回旧档案说话 —— 空档案等于模型完全失忆，比"说旧值"更糟。
+   */
+  markProfileStale(): void {
+    this.db.prepare("update memory_profile set updated_at = 0 where id = 'stable'").run()
   }
 
   /** 写长期档案（整行替换） */
@@ -1008,6 +1052,12 @@ export class MemoryStore {
       '<回忆>',
       '以下是你在「其他对话」中与用户聊过的内容，按时间从近到远。',
       '只有确实与本轮问题相关时才引用；不相关就完全忽略，不要硬套。',
+      /**
+       * 冲突裁决：长期档案里存的是"用户最新更正过的事实"，
+       * 回忆里存的是历史原话（可能已被用户推翻，例如旧年级）。
+       * 不给这条规则，模型会同时看到 2022 和 2024，然后随机挑一个说。
+       */
+      '如果回忆内容与 <长期记忆> 冲突，**以 <长期记忆> 为准**（那是用户最新更正过的事实）。',
       '这些是原文摘录，不要补充其中没有的信息，也不要编造。',
       '',
       ...lines,

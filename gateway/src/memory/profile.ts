@@ -20,6 +20,8 @@ export type ProfileConfig = {
   maxAgeMs: number
   /** 新增切片超过这个比例才重建（默认 5%），避免一天内反复重建 */
   growthRatio: number
+  /** 被标记过期后，至少隔多久才真的重建（防止连续几句话都在说"我是…"时反复重建） */
+  minRebuildSeconds: number
   /** 生成用的样本切片数 */
   sampleSize: number
   /** 摘要最大字数 */
@@ -40,6 +42,7 @@ export const readProfileConfig = (env: NodeJS.ProcessEnv): ProfileConfig | null 
   }
   return {
     maxAgeMs: Number(env.MEMORY_PROFILE_MAX_AGE_HOURS ?? 24) * 3_600_000,
+    minRebuildSeconds: Number(env.MEMORY_PROFILE_MIN_REBUILD_SECONDS ?? 300),
     growthRatio: Number(env.MEMORY_PROFILE_GROWTH ?? 0.05),
     sampleSize: Number(env.MEMORY_PROFILE_SAMPLES ?? 60),
     maxChars: Number(env.MEMORY_PROFILE_CHARS ?? 900),
@@ -60,6 +63,10 @@ const PROMPT_HEAD = [
   '3. 每条一行，用「- 」开头，总量控制在 15 行以内',
   '4. 不要编造片段里没有的信息；不确定就不写',
   '5. 直接输出档案，不要前言后语',
+  '6. **如果同一件事有多次不同说法（例如年级从 2022 改成 2024），只写最新的那个。',
+  '   ⚠️ 旧值一个字都不要出现——不要写"此前误说2022级""已更正"这类补注。',
+  '   档案是给以后的自己看的，旧值留在里面会让回答把错的当成真的。**',
+  '7. 片段按时间排列时，越靠后的说法越新',
 ].join('\n')
 
 export type ProfileResult = { body: string; rebuilt: boolean }
@@ -80,7 +87,17 @@ export const ensureProfile = async (
   if (existing) {
     const age = now - existing.updatedAt
     const growth = existing.sourceChunks > 0 ? chunks / existing.sourceChunks - 1 : 1
-    const fresh = age < config.maxAgeMs && growth < config.growthRatio
+    /**
+     * updatedAt === 0 表示被显式标记为过期：用户刚纠正过自己的事实（"我说错了，是 2024 级"）。
+     * 这种情况必须重建——旧档案里留着错的年级，会一直压过新写入的记忆。
+     *
+     * 但不能一有纠正就立刻重建：连续几句话都含"我是…"时，重建会打散前缀缓存。
+     * 因此加一个最小间隔（默认 5 分钟），速率与准确性的折中。
+     */
+    const explicitStale = existing.updatedAt === 0
+    const minAgeMs = config.minRebuildSeconds * 1000
+    const fresh =
+      !(explicitStale && age > minAgeMs) && age < config.maxAgeMs && growth < config.growthRatio
     if (fresh) {
       return { body: existing.body, rebuilt: false }
     }

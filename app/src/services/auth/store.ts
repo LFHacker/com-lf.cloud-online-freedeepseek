@@ -10,6 +10,7 @@ import { ApiError } from '../api/client.js'
 import { setApiKey, useSettings } from '../settings.js'
 import { loadUpstreamKey } from '../secure/upstreamKey.js'
 import * as api from './client.js'
+import { pullSessions } from '../sync/index.js'
 
 export type AuthStatus = 'unknown' | 'signedOut' | 'signedIn'
 
@@ -53,6 +54,12 @@ export const initAuth = async (): Promise<void> => {
   try {
     const result = await api.me(token)
     useAuth.setState({ status: 'signedIn', user: result.user, error: null })
+    /**
+     * 登录成功 → 全量拉云端会话（换新手机就靠这一步恢复）。
+     * 失败不影响使用：本地有什么用什么。
+     */
+    void pullSessions()
+      .catch(() => undefined)
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
       setApiKey(null)

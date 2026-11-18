@@ -162,6 +162,7 @@ export const zh = {
   accountNameChanged: '用户名已更新',
   accountNameFailed: '修改失败',
   statsCache: '缓存命中',
+  statsHitRate: '命中率',
   statsCacheHint: '本轮的输入 token 里有百分之多少命中了上下文缓存',
   statsTokens: 'token',
   statsMemory: '记忆',

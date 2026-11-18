@@ -13,14 +13,17 @@ import {
 import styles from './SessionUsageBar.module.css'
 
 /**
- * 输入框下方的「本对话累计」。
+ * 标题栏下方的「本对话累计」，**只有一行**。
  *
- * 为什么放这里而不是回答下面：
- *   用户要的是**一直能看到**——"这个对话到现在一共花了多少"。
- *   挂在最后一条回答下方，一旦往上翻就看不见了；放在输入框上方则始终在视野里。
- *   单轮的用量仍然留在各自回答下方，两者回答的是不同问题。
+ * 为什么放在顶部而不是输入框上方：
+ *   这一行回答的是"这个对话到现在一共多少"，属于**会话的元信息**，
+ *   和标题是同一类东西；放在输入框上方会常驻占据正文高度，手机上一眼看去很挤。
+ *
+ * 为什么压成一行：原来三行（轮次 / 输入 / 输出 / 费用各占一行）在移动端吃掉半个屏幕，
+ * 而这是"偶尔扫一眼"的信息。现在用 `·` 分隔、允许折行，窄屏最多两行。
  *
  * 数据来源：消息里存的 usage（持久），所以刷新、切会话回来都还在。
+ * 单轮用量仍留在各自回答下方，两者回答的是不同问题。
  */
 export const SessionUsageBar = ({ session }: { session: Session }) => {
   const t = useTranslate()
@@ -67,6 +70,11 @@ export const SessionUsageBar = ({ session }: { session: Session }) => {
   const usage = { cacheHit: totals.cacheHit, cacheMiss: totals.cacheMiss, output: totals.output }
   const rate = hitRate(usage)
   const cost = costOf(usage, pricing)
+  const sep = (
+    <span className={styles.sep} aria-hidden>
+      ·
+    </span>
+  )
 
   return (
     <div className={styles.bar}>
@@ -74,31 +82,34 @@ export const SessionUsageBar = ({ session }: { session: Session }) => {
       <span className={styles.item}>
         {totals.turns} {t('statsTurns')}
       </span>
-      <span className={styles.sep} aria-hidden>
-        ·
-      </span>
+      {sep}
       <span className={styles.item}>
-        {t('statsTotalInput')} <b>{formatTokens(totals.cacheHit + totals.cacheMiss)}</b> token
-        {rate === null ? null : (
-          <>
-            （{t('statsCacheOf')} <b>{rate.toFixed(0)}%</b> {t('statsCacheHit')}）
-          </>
-        )}
+        {t('statsTotalInput')} <b>{formatTokens(totals.cacheHit + totals.cacheMiss)}</b>
       </span>
-      <span className={styles.sep} aria-hidden>
-        ·
-      </span>
+      {sep}
       <span className={styles.item}>
-        {t('statsTotalOutput')} <b>{formatTokens(totals.output)}</b> token
+        {t('statsCache')} <b>{formatTokens(totals.cacheHit)}</b>
       </span>
+      {sep}
+      <span className={styles.item}>
+        {t('statsTotalOutput')} <b>{formatTokens(totals.output)}</b>
+      </span>
+      {rate === null ? null : (
+        <>
+          {sep}
+          <span className={styles.item}>
+            {t('statsHitRate')} <b>{rate.toFixed(0)}%</b>
+          </span>
+        </>
+      )}
       {cost ? (
         <>
-          <span className={styles.sep} aria-hidden>
-            ·
-          </span>
-          <span className={styles.item} title={cost.peak ? t('statsPeak') : t('statsOffPeak')}>
-            {t('statsTotalCost')} <b>{formatCost(cost.total, cost.currency)}</b>（
-            {t('statsEstimate')}）
+          {sep}
+          <span
+            className={styles.item}
+            title={cost.peak ? t('statsPeak') : t('statsOffPeak')}
+          >
+            {t('statsTotalCost')} <b>{formatCost(cost.total, cost.currency)}</b>
           </span>
         </>
       ) : null}

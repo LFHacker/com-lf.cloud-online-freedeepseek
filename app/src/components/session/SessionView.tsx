@@ -34,13 +34,14 @@ export const SessionView = ({
           <div className={styles.headerCaveat}>{t('contentCaveat')}</div>
         </div>
       )}
+      {/* 会话累计放在标题下方：它是会话的元信息，和标题同一类东西 */}
+      <SessionUsageBar session={session} />
       <MessageList
         session={session}
         streaming={streaming}
         footer={
           <div className={styles.inputContainer}>
             <ChatInput sessionId={session.id} />
-            <SessionUsageBar session={session} />
           </div>
         }
       />

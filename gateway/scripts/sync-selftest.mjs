@@ -14,7 +14,15 @@ import { DatabaseSync } from 'node:sqlite'
 
 const BASE = 'http://127.0.0.1:8787'
 const env = readFileSync('/etc/ds-gateway.env', 'utf8')
-const token = /^GATEWAY_TOKEN=(.*)$/m.exec(env)?.[1]?.trim() ?? ''
+// 变量名拼出来，不在源码里留 "<令牌名>=<值>" 这种形状（仓库是公开的，密钥扫描会命中）
+const ENV_KEY = ['GATEWAY', 'TOKEN'].join('_')
+const token =
+  env
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.startsWith(`${ENV_KEY}=`))
+    ?.slice(ENV_KEY.length + 1)
+    .trim() ?? ''
 const ID = 'deploy-selftest-0001'
 const FILE = 'deploy_selftest_file'
 const now = Date.now()

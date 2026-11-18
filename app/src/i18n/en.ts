@@ -167,6 +167,7 @@ export const en = {
   accountNameChanged: 'Username updated',
   accountNameFailed: 'Update failed',
   statsCache: 'Cache',
+  statsHitRate: 'Hit rate',
   statsCacheHint: 'Share of this turn input tokens served from context cache',
   statsTokens: 'tokens',
   statsMemory: 'Memory',

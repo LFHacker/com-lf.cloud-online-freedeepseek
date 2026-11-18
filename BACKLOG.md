@@ -1377,3 +1377,31 @@ UI 冒烟截图在 `delivery/smoke/`（被 .gitignore 忽略，仅本机可见�
 4. 部署辅助脚本（拷到服务器 `/root/` 跑，独立不依赖仓库）：
    `gateway/scripts/sync-precheck.mjs`（读库核对迁移）、`gateway/scripts/sync-selftest.mjs`（真写一次再清场）
 
+---
+
+## 会话累计用量挪到顶部（v0.17.0B-debug，2026-11-18）
+
+**用户要求**：像参考图那样把「本对话累计」的输入/输出/费用挪到顶部去。
+
+**改法**
+
+| | 原来 | 现在 |
+|---|---|---|
+| 位置 | 输入框上方（`MessageList` 的 footer 里） | 标题下方（`SessionView` 里，滚动区之外） |
+| 形态 | 灰底卡片、三行 | 无背景一行、`·` 分隔，窄屏折两行 |
+| 对齐 | 消息列宽、居中 | **与正文左边缘对齐**（同 `--message-list-max-width` 计算） |
+| 新增 | — | 「缓存命中」token 数 + 「命中率」百分比 |
+
+**为什么放顶部**：这一行是**会话的元信息**（和标题同类），回答"这个对话一共多少"；
+放在输入框上方会常驻占用正文高度，手机上一眼看去很挤。单轮用量仍留在各自回答下方（回答的是另一个问题）。
+
+**顺手做的两件事**
+
+1. 加了 `scripts/shot-session-ui.mjs`：真网关 + 真 Chrome，10 秒出「桌面 1440×900 + 手机 390×844」两张会话页截图。
+   这类改动（多占一行、折行难看、手机上挤）在真机上试一轮要几分钟，有截图脚本能反复调。
+2. 该脚本踩到两个坑，写进注释里了：
+   · 造会话 payload 时 `rootMessageId: null` 在类型里表示**空会话**（`getVisibleMessages` 直接从 null 起步 → 返回空数组）；
+     要显式写首条消息 id，并接上 `selectedChildId` 链。
+   · usage 必须是 **Anthropic 原始字段**（`input_tokens` / `cache_read_input_tokens` / `output_tokens`）；
+     写成 `cacheHit/cacheMiss/output` 会被 `usageOf` 判成"没有用量"，整条累计直接不渲染。
+

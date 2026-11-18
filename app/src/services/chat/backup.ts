@@ -97,7 +97,17 @@ export const importHistory = (
         const result = await importArchive(source, onProgress, () => onStage?.('commit'), shouldCancel)
         imagesFailed = result.imagesFailed
       })
-      return { count, imagesFailed }
+      /**
+         * 导入成功 → 全量推送到云端（会话 + 全部附件）。
+         *
+         * 标准 App 的行为：用户导入完就不用管，换设备登录自然什么都在。
+         * 这里**不 await**：推送可能要几分钟（191MB 图片），
+         * 不该让导入按钮一直转；失败只影响"云端暂缺"，本地数据完好。
+         */
+        void import('../sync/full.js')
+          .then((sync) => sync.pushEverything())
+          .catch(() => undefined)
+        return { count, imagesFailed }
     } finally {
       if (copied) {
         // 副本占着 200+ MB，无论成败都要删

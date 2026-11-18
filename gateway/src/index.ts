@@ -31,7 +31,7 @@ import { randomBytes } from 'node:crypto'
 import { redactSecrets } from './redact.ts'
 import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
-import { AssistantTextCollector, extractUserMessages, injectRecall, injectStable } from './memory/wire.ts'
+import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
 import { ensureProfile, readProfileConfig } from './memory/profile.ts'
 import { isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
@@ -818,7 +818,34 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
       try {
         const profile = await ensureProfile(memory, PROFILE)
         if (profile.body) {
-          body = injectStable(body, ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'))
+          /**
+           * ⚠️ 档案**不放 system**，改成和回忆一起进尾部。
+           *
+           * 原因：档案里是会变的事实（年级、专业、在做什么）。
+           * 放 system 想省缓存，就只能靠"别刷新"保住前缀 —— 那必然记错。
+           * 放尾部则前缀（system + 历史）保持稳定，缓存照旧命中；
+           * 尾部这几百 token 按未命中价算，可以忽略。
+           *
+           * 顺序：档案在前（结论），回忆在后（证据）。
+           */
+          /**
+           * 三段内容，按可信度从高到低排：
+           *  ① 最近你说过的原话（未经摘要，一定最新）
+           *  ② 长期档案（摘要，可能滞后）
+           *  ③ 跨会话回忆（证据，可能已过时）
+           * 用户明确要求"记忆的更新应该是即时的"，所以原话必须原样带上。
+           */
+          const recent = memory
+            .recentUserMessages(PROFILE.recentMessages)
+            .reverse()
+            .map((item) => `- [${new Date(item.createdAt).toISOString().slice(0, 16).replace('T', ' ')}] ${item.body.slice(0, 200)}`)
+            .join('\n')
+          const blocks = [
+            recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
+            ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'),
+            prefix,
+          ].filter(Boolean)
+          body = injectRecall(body, blocks.join('\n\n'))
         }
       } catch (error) {
         console.warn(

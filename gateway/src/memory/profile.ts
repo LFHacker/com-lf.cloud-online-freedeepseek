@@ -22,6 +22,8 @@ export type ProfileConfig = {
   growthRatio: number
   /** 被标记过期后，至少隔多久才真的重建（防止连续几句话都在说"我是…"时反复重建） */
   minRebuildSeconds: number
+  /** 注入时带几条用户原话（未经摘要，保证最新事实不被旧值盖过） */
+  recentMessages: number
   /** 生成用的样本切片数 */
   sampleSize: number
   /** 摘要最大字数 */
@@ -42,8 +44,9 @@ export const readProfileConfig = (env: NodeJS.ProcessEnv): ProfileConfig | null 
   }
   return {
     maxAgeMs: Number(env.MEMORY_PROFILE_MAX_AGE_HOURS ?? 24) * 3_600_000,
-    minRebuildSeconds: Number(env.MEMORY_PROFILE_MIN_REBUILD_SECONDS ?? 300),
+    minRebuildSeconds: Number(env.MEMORY_PROFILE_MIN_REBUILD_SECONDS ?? 30),
     growthRatio: Number(env.MEMORY_PROFILE_GROWTH ?? 0.05),
+    recentMessages: Number(env.MEMORY_RECENT_MESSAGES ?? 5),
     sampleSize: Number(env.MEMORY_PROFILE_SAMPLES ?? 60),
     maxChars: Number(env.MEMORY_PROFILE_CHARS ?? 900),
     apiKey,
@@ -86,7 +89,6 @@ export const ensureProfile = async (
   const chunks = store.stats().chunks
   if (existing) {
     const age = now - existing.updatedAt
-    const growth = existing.sourceChunks > 0 ? chunks / existing.sourceChunks - 1 : 1
     /**
      * updatedAt === 0 表示被显式标记为过期：用户刚纠正过自己的事实（"我说错了，是 2024 级"）。
      * 这种情况必须重建——旧档案里留着错的年级，会一直压过新写入的记忆。
@@ -94,11 +96,20 @@ export const ensureProfile = async (
      * 但不能一有纠正就立刻重建：连续几句话都含"我是…"时，重建会打散前缀缓存。
      * 因此加一个最小间隔（默认 5 分钟），速率与准确性的折中。
      */
+    /**
+     * 重建判据（2026-11-18 重做）：
+     * 只要库里有新内容、且离上次重建超过 minRebuildSeconds，就重建。
+     *
+     * 之前的 24 小时 + 5% 增长是错的——用户改正自己的年级后，
+     * 档案里还留着旧值，于是别的对话里模型照旧说错。
+     * 现在档案放在**消息尾部**（见 injectRecall），前缀缓存不受影响，
+     * 所以可以放心地频繁重建，代价只是尾部那几百 token。
+     */
     const explicitStale = existing.updatedAt === 0
     const minAgeMs = config.minRebuildSeconds * 1000
-    const fresh =
-      !(explicitStale && age > minAgeMs) && age < config.maxAgeMs && growth < config.growthRatio
-    if (fresh) {
+    const changed = chunks !== existing.sourceChunks
+    const fresh = !explicitStale && !changed && age < config.maxAgeMs
+    if (fresh || age < minAgeMs) {
       return { body: existing.body, rebuilt: false }
     }
   }

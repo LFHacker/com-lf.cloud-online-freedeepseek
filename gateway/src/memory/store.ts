@@ -643,6 +643,29 @@ export class MemoryStore {
     return out
   }
 
+  /**
+   * 取最近几条**用户原话**（不经过任何摘要）。
+   *
+   * 为什么需要它：长期档案是"摘要"，天生滞后 —— 生成时要参考几十条旧切片，
+   * 用户刚更正的事实很容易被旧值盖过。实测：用户说"我不是2024级，是2025级"，
+   * 32 秒后档案重建，新会话里模型仍然答 2024。
+   * 原话没有这个问题：它就是用户刚才说的那句话本身。
+   */
+  recentUserMessages(limit: number): Array<{ body: string; createdAt: number }> {
+    return this.db
+      .prepare(
+        `select body, created_at from messages
+          where role = 'user'
+          order by created_at desc, id desc
+          limit ?`
+      )
+      .all(limit)
+      .map((row) => {
+        const record = row as { body: string; created_at: number }
+        return { body: record.body, createdAt: Number(record.created_at) }
+      })
+  }
+
   /** 按 id 取切片原文（评测与调试用） */
   chunkBody(chunkId: string): string | null {
     const row = this.db.prepare('select body from chunks where id = ?').get(chunkId) as
@@ -1057,7 +1080,10 @@ export class MemoryStore {
        * 回忆里存的是历史原话（可能已被用户推翻，例如旧年级）。
        * 不给这条规则，模型会同时看到 2022 和 2024，然后随机挑一个说。
        */
-      '如果回忆内容与 <长期记忆> 冲突，**以 <长期记忆> 为准**（那是用户最新更正过的事实）。',
+      '冲突时的优先级：<最近你说过> > <长期记忆> > 回忆。',
+      '  · <最近你说过> 是用户的原话（未摘要），**最新、最可信**',
+      '  · <长期记忆> 是摘要，可能滞后于原话',
+      '  · 回忆是更早的对话片段，可能已被用户推翻',
       '这些是原文摘录，不要补充其中没有的信息，也不要编造。',
       '',
       ...lines,

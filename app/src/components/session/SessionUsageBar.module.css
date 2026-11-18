@@ -1,0 +1,35 @@
+/* 输入框上方的"本对话累计"：常驻、克制、一眼能读完 */
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 auto 6px;
+  padding: 5px 10px;
+  max-width: 100%;
+  border-radius: 8px;
+  background: var(--bg-soft, rgba(0, 0, 0, 0.03));
+  color: var(--text-secondary, #8a8f99);
+  font-size: 12px;
+  line-height: 1.6;
+  user-select: text;
+}
+
+.label {
+  font-weight: 600;
+  color: var(--text-primary, #3c4149);
+  white-space: nowrap;
+}
+
+.item {
+  white-space: nowrap;
+}
+
+.item b {
+  font-weight: 600;
+  color: var(--text-primary, #3c4149);
+}
+
+.sep {
+  opacity: 0.45;
+}

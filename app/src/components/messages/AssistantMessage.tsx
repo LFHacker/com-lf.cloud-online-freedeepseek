@@ -35,7 +35,6 @@ export const AssistantMessage = memo(function AssistantMessage({
   busy,
   versions,
   onSelectVersion,
-  totals,
 }: {
   sessionId: string
   message: AssistantMessageType
@@ -44,8 +43,6 @@ export const AssistantMessage = memo(function AssistantMessage({
   busy: boolean
   versions: MessageVersions
   onSelectVersion: SelectMessageVersion
-  /** 整个会话的累计用量（由列表层算好传下来） */
-  totals?: { cacheHit: number; cacheMiss: number; output: number; turns: number }
 }) {
   const t = useTranslate()
   const view = useReplyView(message, streaming)
@@ -149,7 +146,7 @@ export const AssistantMessage = memo(function AssistantMessage({
         </div>
       ) : null}
       {/* 本轮用量：token、缓存命中率、记忆条数、估算费用 */}
-      {streaming ? null : <MessageStats usage={message.usage} isLast={isLast} totals={totals} />}
+      {streaming ? null : <MessageStats usage={message.usage} isLast={isLast} />}
       {streaming ? null : (
         <div className={styles.bottom}>
           <BranchSwitcher versions={versions} disabled={busy} onSelect={onSelectVersion} />

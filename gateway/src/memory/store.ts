@@ -315,29 +315,64 @@ export class MemoryStore {
   }
 
   async search(params: { text: string; excludeSessionId: string; limit?: number }): Promise<MemoryHit[]> {
+    return this.searchMulti({ texts: [params.text], excludeSessionId: params.excludeSessionId, limit: params.limit })
+  }
+
+  /**
+   * 多查询融合检索（查询改写的落点）。
+   *
+   * 每个变体各自跑词法 + 向量，再用 RRF 把**所有**结果列融合成一条。
+   * 为什么变体之间要融合而不是取并集：并集会让"在某个变体里排第一"和
+   * "在所有变体里都排中游"等价，RRF 正好惩罚后者、奖励前者。
+   *
+   * ⚠️ 重排只用原始问题做一次（用变体去打分没有意义，我们要回答的是原问题）。
+   */
+  async searchMulti(params: {
+    texts: string[]
+    excludeSessionId: string
+    limit?: number
+  }): Promise<MemoryHit[]> {
     const limit = params.limit ?? this.maxHits
     // 多取一些候选，留出按新鲜度重排的空间
     const poolSize = Math.max(limit * 2, limit + 2)
-    const lexical = this.collectLexical(params.text, params.excludeSessionId, poolSize)
-
-    let vector: MemoryHit[] = []
-    if (this.embedding.enabled) {
-      const queryVector = await this.embedQuery(params.text)
-      if (queryVector) {
-        vector = this.searchByVector(queryVector, params.excludeSessionId, poolSize)
-      }
+    const texts = params.texts.map((t) => t.trim()).filter(Boolean)
+    if (texts.length === 0) {
+      this.lastHits = 0
+      return []
     }
 
-    let merged: MemoryHit[]
-    if (vector.length === 0) {
-      merged = lexical
-    } else {
-      // RRF 只看名次，免疫 BM25 与余弦的量纲差异
-      merged = fuseRanks([lexical, vector], (hit) => hit.chunkId).map((entry) => entry.item)
+    const lists: MemoryHit[][] = []
+    // 变体之间并行：embedding 是网络请求，串行会线性拖长延迟
+    const perText = await Promise.all(
+      texts.map(async (text) => {
+        const lexical = this.collectLexical(text, params.excludeSessionId, poolSize)
+        let vector: MemoryHit[] = []
+        if (this.embedding.enabled) {
+          const queryVector = await this.embedQuery(text)
+          if (queryVector) {
+            vector = this.searchByVector(queryVector, params.excludeSessionId, poolSize)
+          }
+        }
+        return { lexical, vector }
+      })
+    )
+    for (const entry of perText) {
+      if (entry.lexical.length > 0) lists.push(entry.lexical)
+      if (entry.vector.length > 0) lists.push(entry.vector)
     }
+    if (lists.length === 0) {
+      this.lastHits = 0
+      return []
+    }
+
+    // RRF 只看名次，免疫 BM25 与余弦的量纲差异
+    const merged = lists.length === 1
+      ? lists[0]
+      : fuseRanks(lists, (hit) => hit.chunkId).map((entry) => entry.item)
 
     // 去掉「查询回声」：把用户自己刚问过的同一句话再喂回去没有任何信息量
-    const meaningful = merged.filter((hit) => !isEcho(hit.body, params.text))
+    const primary = texts[0]
+    const meaningful = merged.filter((hit) => !isEcho(hit.body, primary))
     if (meaningful.length === 0) {
       this.lastHits = 0
       return []
@@ -371,7 +406,7 @@ export class MemoryStore {
      * （真正相关的那条可能排在第 8，截到 4 就再也进不来）。
      * 重排失败返回 null，这里自动退回融合顺序，聊天不受影响。
      */
-    const reranked = await this.rerankHits(params.text, ranked)
+    const reranked = await this.rerankHits(primary, ranked)
     const selected = (reranked ?? ranked).slice(0, limit)
     // 记录命中：被召回过的记忆会因此"刷新新鲜度"，下次更容易被想起
     this.recordHits(selected.map((hit) => hit.chunkId), now)

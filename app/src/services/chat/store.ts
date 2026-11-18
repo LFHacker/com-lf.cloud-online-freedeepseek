@@ -542,6 +542,18 @@ const removeSessionData = async (id: string): Promise<boolean> => {
     if (epoch !== historyEpoch) {
       return false
     }
+    /**
+     * 云端为主：**先删云端，再删本地**。
+     *
+     * 反过来的话，云端删失败、本地已删，下次同步又会把它拉回来，
+     * 用户会看到"删了又出现"。云端不可达时这里返回 false，
+     * 本地也不删 —— 宁可删不掉，也不要制造幽灵会话。
+     */
+    const { deleteRemoteSession } = await import('../sync/index.js')
+    const remoteDeleted = await deleteRemoteSession(id).catch(() => false)
+    if (!remoteDeleted) {
+      return false
+    }
     await db.deleteSession(id)
     if (epoch !== historyEpoch) {
       return true

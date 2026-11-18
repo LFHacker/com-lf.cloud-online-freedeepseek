@@ -12,7 +12,7 @@
  */
 import { apiOrigin } from '../api/client.js'
 import { useSettings } from '../settings.js'
-import { loadFile, loadSession, loadSessionSummaries, saveSession } from '../chat/db.js'
+import { deleteSession, loadFile, loadSession, loadSessionSummaries, saveSession } from '../chat/db.js'
 import type { Session } from '../chat/types.js'
 
 const sessionToken = (): string => useSettings.getState().apiKey ?? ''
@@ -24,17 +24,23 @@ const jsonHeaders = (): Record<string, string> => ({
 
 export type RemoteSessionMeta = { id: string; title: string; createdAt: number; updatedAt: number }
 
-/** 拉云端会话清单（不含正文） */
-export const listRemoteSessions = async (): Promise<RemoteSessionMeta[]> => {
+/** 拉云端会话清单（不含正文）+ 墓碑（已删除的会话 id） */
+export const listRemoteSessions = async (): Promise<{
+  sessions: RemoteSessionMeta[]
+  deleted: Array<{ id: string; deletedAt: number }>
+}> => {
   try {
     const response = await fetch(`${apiOrigin()}/sync/sessions`, { headers: jsonHeaders() })
     if (!response.ok) {
-      return []
+      return { sessions: [], deleted: [] }
     }
-    const payload = (await response.json()) as { sessions?: RemoteSessionMeta[] }
-    return payload.sessions ?? []
+    const payload = (await response.json()) as {
+      sessions?: RemoteSessionMeta[]
+      deleted?: Array<{ id: string; deletedAt: number }>
+    }
+    return { sessions: payload.sessions ?? [], deleted: payload.deleted ?? [] }
   } catch {
-    return []
+    return { sessions: [], deleted: [] }
   }
 }
 
@@ -77,10 +83,24 @@ export const pushSessions = async (sessions: Session[]): Promise<number> => {
  */
 export const pullSessions = async (
   onProgress?: (done: number, total: number) => void
-): Promise<{ downloaded: number; skipped: number }> => {
-  const remote = await listRemoteSessions()
+): Promise<{ downloaded: number; skipped: number; removed: number }> => {
+  const { sessions: remote, deleted } = await listRemoteSessions()
+
+  /**
+   * 先按墓碑删本地。
+   *
+   * 这是"云端为主"的关键一步：别的设备删掉的会话，
+   * 本机下次同步必须跟着消失，否则会一直显示已经不存在的东西。
+   */
+  for (const tomb of deleted) {
+    const local = await loadSession(tomb.id).catch(() => undefined)
+    if (local) {
+      await deleteSession(tomb.id).catch(() => undefined)
+    }
+  }
+
   if (remote.length === 0) {
-    return { downloaded: 0, skipped: 0 }
+    return { downloaded: 0, skipped: 0, removed: deleted.length }
   }
   const local = new Map<string, number>()
   for (const summary of await loadSessionSummaries()) {
@@ -117,7 +137,7 @@ export const pullSessions = async (
     }
     onProgress?.(index + 1, remote.length)
   }
-  return { downloaded, skipped }
+  return { downloaded, skipped, removed: deleted.length }
 }
 
 /** 上传一个附件（图片）。已存在则由服务端幂等覆盖 */
@@ -182,6 +202,24 @@ export const pushSession = async (sessionId: string): Promise<boolean> => {
     }
     const written = await pushSessions([session])
     return written > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 删除一条会话（云端为主模型）。
+ *
+ * 顺序：**先删云端，成功后再删本地**。反过来的话，
+ * 云端删失败、本地已删，下次同步又会把它拉回来，用户会看到"删了又出现"。
+ */
+export const deleteRemoteSession = async (sessionId: string): Promise<boolean> => {
+  try {
+    const response = await fetch(
+      `${apiOrigin()}/sync/session?id=${encodeURIComponent(sessionId)}`,
+      { method: 'DELETE', headers: jsonHeaders() }
+    )
+    return response.ok
   } catch {
     return false
   }

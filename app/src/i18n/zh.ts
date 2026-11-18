@@ -242,10 +242,8 @@ export const zh = {
   cloudSyncBusy: '同步中…',
   cloudSyncSessions: '正在推送会话 {done}/{total}',
   cloudSyncFiles: '正在推送附件 {done}/{total}',
-  cloudSyncDone: '已推送 {sessions} 条会话、{files} 个附件（{skipped} 条已是最新）',
-  cloudSyncPartial: '推送完成：会话 {sessions} 条、附件 {files} 个，失败 {failed} 项',
-  cloudSyncMissingFiles:
-    '推送完成：会话 {sessions} 条、附件 {files} 个。另有 {missing} 个附件在本机没有原件（本机原件共 {localFiles} 个），无法上传 —— 重试也没用',
+  cloudSyncDone: '已推送 {sessions} 条会话、{files} 个附件（{skipped} 条会话已是最新，本机原件 {localFiles} 个）',
+  cloudSyncPartial: '推送完成：会话 {sessions} 条、附件 {files} 个，失败 {failed} 项（本机原件 {localFiles} 个）',
   cloudSyncFailed: '同步失败：{message}',
   deleteAllSessions: '删除所有对话',
   deleteAllSessionsModalTitle: '删除后，所有对话都将被清空且无法找回',

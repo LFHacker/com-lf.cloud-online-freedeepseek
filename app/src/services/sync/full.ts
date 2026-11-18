@@ -13,7 +13,7 @@
 import { loadSession, loadSessionFileIds, loadSessionSummaries } from '../chat/db.js'
 import { fetchSessionIndex, listRemoteFiles, pushSessions, uploadAttachment } from './index.js'
 import { loadFile } from '../chat/db.js'
-import { countStoredFiles } from '../chat/db.js'
+import { listStoredFileIds } from '../chat/db.js'
 import type { Session } from '../chat/types.js'
 
 export type FullSyncProgress = {
@@ -110,22 +110,29 @@ export const pushEverything = async (
     })
   }
 
-  // ---- 4) 附件：只传云端还没有的（引用 id 从摘要里直接取，不必读正文）----
-  const fileIds = await loadSessionFileIds().catch(() => new Set<string>())
-  result.localFiles = await countStoredFiles().catch(() => 0)
+  // ---- 4) 附件：**本机有的原件都推上去**，只跳过云端已有的 ----
+  /**
+   * ⚠️ 这里绝不能用"会话引用了哪些 id"来推导上传清单：
+   * 官方导出的附件大量挂在**助手消息**上，而会话摘要/列表里能拿到的只有用户消息的附件。
+   * 曾经这么做过 → 810 个本机原件一个都没被上传（用户看到"附件 0 个"）。
+   */
+  const localIds = await listStoredFileIds().catch(() => [] as string[])
+  result.localFiles = localIds.length
   const remoteFiles = await listRemoteFiles()
-  const missing = [...fileIds].filter((id) => !remoteFiles || !remoteFiles.has(id))
-  result.filesSkipped = fileIds.size - missing.length
+  const toUpload = localIds.filter((id) => !remoteFiles || !remoteFiles.has(id))
+  result.filesSkipped = localIds.length - toUpload.length
+  // 仅供参考：会话引用里、本机没有原件的那些（文档类，只有文件信息）
+  const referenced = await loadSessionFileIds().catch(() => new Set<string>())
+  const localSet = new Set(localIds)
+  result.filesMissing = [...referenced].filter((id) => !localSet.has(id)).length
 
   let uploaded = 0
-  for (const id of missing) {
+  for (const id of toUpload) {
     const blob = await loadFile(id).catch(() => undefined)
     if (!blob) {
-      /**
-       * 本机没有原件：多数是导入的包里本来就没带图（或导入时图片没落盘）。
-       * 单独计数 —— 它和"上传失败"完全是两回事，混在一起用户没法判断该怎么办。
-       */
-      result.filesMissing += 1
+      // 索引里有 id 却读不到 blob：磁盘/存储异常，算失败（和"本来就没有"是两回事）
+      result.filesFailed += 1
+      result.error ??= '有附件的本地原件读不出来'
     } else if (await uploadAttachment(id, blob)) {
       result.filesUploaded += 1
     } else {
@@ -133,7 +140,7 @@ export const pushEverything = async (
       result.error ??= '有附件上传失败（网络或服务端拒绝）'
     }
     uploaded += 1
-    onProgress?.({ phase: 'files', done: uploaded, total: missing.length })
+    onProgress?.({ phase: 'files', done: uploaded, total: toUpload.length })
   }
 
   onProgress?.({ phase: 'done', done: 1, total: 1 })

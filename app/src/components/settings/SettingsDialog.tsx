@@ -938,17 +938,13 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
       files: result.filesUploaded,
       skipped: result.sessionsSkipped,
       failed,
-      missing: result.filesMissing,
       localFiles: result.localFiles,
     }
     if (nothingHappened && result.error) {
       return { key: 'cloudSyncFailed', params: { message: result.error }, error: true }
     }
-    if (failed > 0) {
-      return { key: 'cloudSyncPartial', params, error: true }
-    }
-    return result.filesMissing > 0
-      ? { key: 'cloudSyncMissingFiles', params }
+    return failed > 0
+      ? { key: 'cloudSyncPartial', params, error: true }
       : { key: 'cloudSyncDone', params }
   })()
 

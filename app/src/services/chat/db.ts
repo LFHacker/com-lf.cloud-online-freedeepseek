@@ -76,11 +76,17 @@ let dbPromise: Promise<IDBPDatabase<ChatDB>> | null = null
 
 const storedSummary = (session: Session): StoredSessionSummary => ({
   ...toSessionSummary(session),
+  /**
+   * 附件引用要统计**所有消息**，不能只统计用户消息：
+   * 导出的历史里助手消息也会带附件（生成图、工具产物），漏掉它们会导致
+   * ① 上传清单少一大半（810 个原件传不上去）② 删会话时误删仍被别的会话引用的原件。
+   */
   fileIds: [
     ...new Set(
-      session.messages.flatMap((message) =>
-        message.role === 'user' ? message.files.map((file) => file.id) : []
-      )
+      session.messages.flatMap((message) => {
+        const files = (message as { files?: Array<{ id?: string }> }).files
+        return Array.isArray(files) ? files.map((file) => file?.id).filter((id): id is string => typeof id === 'string') : []
+      })
     ),
   ],
 })
@@ -305,6 +311,17 @@ export const loadFile = async (id: string): Promise<Blob | undefined> =>
 
 /** 本机实际存了多少个附件原件（用来回答"附件为什么传不上去"） */
 export const countStoredFiles = async (): Promise<number> => (await getDB()).count('files')
+
+/**
+ * 本机所有附件原件的 id。
+ *
+ * ⚠️ 为什么不用"会话引用了哪些 id"来推导：官方导出的附件很多挂在**助手消息**上
+ * （生成图、工具产物），而摘要里的 fileIds 只统计用户消息 —— 用它做上传清单，
+ * 810 个已存在的原件会一个都不被上传（真实事故）。
+ * 上传的语义本来就该是"本机有的原件都推上去"，不需要经过会话。
+ */
+export const listStoredFileIds = async (): Promise<string[]> =>
+  (await getDB()).getAllKeys('files') as Promise<string[]>
 
 /** 清空导入暂存：开始导入前清除上次中断（如关闭页面）遗留的数据，导入失败后清除本次写入。 */
 export const clearStaging = async (): Promise<void> => {

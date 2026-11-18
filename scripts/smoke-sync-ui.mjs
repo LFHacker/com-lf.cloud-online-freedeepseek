@@ -564,6 +564,45 @@ try {
   )
   await shoot('04-sync-survives-remount')
   await page('Fetch.disable')
+  await sleep(600)
+
+  // ── 阶段 2-5：本机原件必须真的被上传（不允许再依赖"会话引用"推导）──
+  /**
+   * 真实事故：上传清单是从"会话摘要里用户消息的附件"推出来的，
+   * 而官方导出的附件很多挂在**助手消息**上 → 810 个本机原件一个都没被上传。
+   * 这里直接往 IndexedDB 的 files 表塞一个原件，然后触发同步，
+   * 断言它出现在云端、且字节一致（不经过任何会话）。
+   */
+  const PROBE_FILE = 'smoke_local_file_0001'
+  const PROBE_BODY = 'hello-from-local-db'
+  const injected = await evaluate(`new Promise((resolve) => {
+    const req = indexedDB.open('chat-demo')
+    req.onsuccess = () => {
+      const db = req.result
+      const tx = db.transaction('files', 'readwrite')
+      tx.objectStore('files').put({ id: ${JSON.stringify(PROBE_FILE)}, blob: new Blob([${JSON.stringify(PROBE_BODY)}]) })
+      tx.oncomplete = () => { db.close(); resolve('ok') }
+      tx.onerror = () => resolve('error')
+    }
+    req.onerror = () => resolve('open-failed')
+  })`)
+  check('往本机存储里放入一个原件', injected === 'ok', String(injected))
+
+  const startedAgain = await evaluate(clickByText('开始同步'))
+  check('再次触发同步', startedAgain === true)
+
+  const uploaded = await waitFor(async () => {
+    const list = await gw('/sync/files')
+    return (list.json.files ?? []).some((item) => item.id === PROBE_FILE)
+  }, 20_000, '本机原件出现在云端')
+  check('本机原件被上传到云端（不依赖会话引用）', uploaded)
+
+  const fetched = await fetch(`http://127.0.0.1:${GATEWAY_PORT}/sync/files/${PROBE_FILE}`, {
+    headers: { 'x-api-key': TOKEN },
+  })
+  const fetchedBody = await fetched.text()
+  check('上传的字节与本地一致', fetched.status === 200 && fetchedBody === PROBE_BODY, `${fetched.status} ${fetchedBody.slice(0, 40)}`)
+  await shoot('05-upload-probe')
 } catch (error) {
   console.log('  ⚠️ 测试中断：', error instanceof Error ? error.message : error)
   await dumpDiagnostics()

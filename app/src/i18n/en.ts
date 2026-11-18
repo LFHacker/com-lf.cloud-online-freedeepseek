@@ -249,10 +249,8 @@ export const en = {
   cloudSyncBusy: 'Syncing…',
   cloudSyncSessions: 'Pushing chats {done}/{total}',
   cloudSyncFiles: 'Pushing attachments {done}/{total}',
-  cloudSyncDone: 'Pushed {sessions} chats and {files} attachments ({skipped} already up to date)',
-  cloudSyncPartial: 'Finished: {sessions} chats, {files} attachments, {failed} failed',
-  cloudSyncMissingFiles:
-    'Finished: {sessions} chats, {files} attachments. {missing} referenced attachments have no local file (this device holds {localFiles} files), so they cannot be uploaded — retrying will not help',
+  cloudSyncDone: 'Pushed {sessions} chats and {files} attachments ({skipped} chats already up to date, {localFiles} files on this device)',
+  cloudSyncPartial: 'Finished: {sessions} chats, {files} attachments, {failed} failed ({localFiles} files on this device)',
   cloudSyncFailed: 'Sync failed: {message}',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',

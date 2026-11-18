@@ -1352,6 +1352,20 @@ UI 冒烟截图在 `delivery/smoke/`（被 .gitignore 忽略，仅本机可见�
 
 ### 七、部署注意（服务端）
 
+**实际部署记录（2026-11-18 17:17，已上线）**
+
+```text
+/opt/ds-gateway/src/{index.ts,auth/store.ts} 覆盖 → systemctl restart ds-gateway
+网关 1.1.4 → 1.2.0；/health 与公网 :8443/health 均确认 1.2.0
+迁移结果：user_sessions 出现 pinned 列；file_refs / store_meta 建表成功
+部署前：会话 0 / 墓碑 0 / 无引用表   → 所以首次"全量重建引用"是空跑
+部署后自检 11 项全过（写/列表/pinned/取正文/引用记账/可信标记/删除/墓碑/引用清理/清场归零）
+备份：/root/ds-gateway-backup/src-20261118-171541.tgz + auth.db 三件套
+```
+
+> 部署用的是**逐文件 scp**，不是整目录覆盖：`/opt/ds-gateway` 不是 git 仓库，
+> 直接整目录推会把服务器上的运维脚本一起冲掉。先按 sha256 比对，只传真正变了的两个文件。
+
 1. 启动时自动迁移：`user_sessions` 加 `pinned` 列、建 `file_refs` / `store_meta` 表、
    **首次全量重建附件引用**（1000+ 会话，约 1~3 秒，只跑一次，进度在启动日志里）
 2. 回收建议挂 cron（默认 dry-run，先看清单）：
@@ -1360,4 +1374,6 @@ UI 冒烟截图在 `delivery/smoke/`（被 .gitignore 忽略，仅本机可见�
    node /opt/ds-gateway/scripts/gc-files.ts --apply    # 真删（建议 --grace-days 30）
    ```
 3. 旧版 App 仍可用：`POST /sync/sessions` 兼容不带 `pinned` / `fileIds` 的老请求
+4. 部署辅助脚本（拷到服务器 `/root/` 跑，独立不依赖仓库）：
+   `gateway/scripts/sync-precheck.mjs`（读库核对迁移）、`gateway/scripts/sync-selftest.mjs`（真写一次再清场）
 

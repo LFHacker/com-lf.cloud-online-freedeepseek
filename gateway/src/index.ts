@@ -36,7 +36,11 @@ import { AssistantTextCollector, extractUserMessages, injectRecall } from './mem
 import { ensureProfile, readProfileConfig } from './memory/profile.ts'
 import { estimateCost, isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
-const VERSION = '1.1.4'
+/**
+ * 网关版本。1.2.0 起：会话同步进入「云端为主」阶段 2（分页游标 + pinned + 墓碑优先）
+ * 与阶段 3（附件引用计数 + 回收）。/health 里能看到它，用来确认线上跑的是哪份代码。
+ */
+const VERSION = '1.2.0'
 const PORT = Number(process.env.PORT ?? 8787)
 /** 默认只监听环回：前面由 Caddy 做 TLS 与反代 */
 const HOST = process.env.HOST ?? '127.0.0.1'

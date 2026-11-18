@@ -1145,11 +1145,11 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     json(res, 200, {
       ok: true,
       currency: peak.currency,
-      unit: 'USD / 1M tokens',
+      unit: '元 / 1M tokens',
       peak: isPeakNow(now),
       peakTable: peak,
       offPeakTable: offPeakTable(peak),
-      peakWindows: 'UTC 周一至周五 01:00–04:00、06:00–10:00',
+      peakWindows: '北京时间 周一至周五 9:00–12:00、14:00–18:00',
       note: '估算值，以平台实际扣费为准',
     })
     return

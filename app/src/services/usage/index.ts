@@ -66,15 +66,19 @@ const sessionToken = (): string => useSettings.getState().apiKey ?? ''
 /** 官方 Key（网关只转发，不留存） */
 const upstreamKey = (): string => cachedUpstreamKey() ?? ''
 
-/** 峰时判断与网关保持一致：UTC 周一至周五 01–04、06–10 */
+/**
+ * 峰时判断：**北京时间**周一至周五 9:00–12:00、14:00–18:00（官方口径）。
+ * 用 UTC 时间戳 +8 小时换算，不依赖设备时区设置。
+ */
 const isPeak = (now = new Date()): boolean => {
-  const day = now.getUTCDay()
+  const beijing = new Date(now.getTime() + 8 * 3_600_000)
+  const day = beijing.getUTCDay()
   if (day === 0 || day === 6) {
     return false
   }
-  const minutes = now.getUTCHours() * 60 + now.getUTCMinutes()
+  const minutes = beijing.getUTCHours() * 60 + beijing.getUTCMinutes()
   const within = (start: number, end: number) => minutes >= start * 60 && minutes < end * 60
-  return within(1, 4) || within(6, 10)
+  return within(9, 12) || within(14, 18)
 }
 
 export const loadPricing = async (force = false): Promise<Pricing | null> => {
@@ -209,7 +213,7 @@ export const formatTokens = (value: number): string => {
 }
 
 /** 费用：金额很小，保留足够位数才有意义（$0.0004） */
-export const formatCost = (value: number, currency = 'USD'): string => {
+export const formatCost = (value: number, currency = 'CNY'): string => {
   if (!Number.isFinite(value) || value <= 0) {
     return currency === 'USD' ? '$0' : '¥0'
   }

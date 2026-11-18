@@ -1,25 +1,28 @@
 /**
  * 费用计算。
  *
- * 价格来自 DeepSeek 官方定价页（2026-11-18 抓取，模型 DeepSeek-V4.1-Flash-1017）：
+ * 价格来自 DeepSeek 官方定价页**中文版**（2026-11-18 抓取，模型 DeepSeek-V4.1-Flash-1017）：
  *
- *   1M 输入 token（缓存命中）  谷时 $0.003   峰时 $0.006
- *   1M 输入 token（缓存未命中）谷时 $0.15    峰时 $0.30
- *   1M 输出 token              谷时 $0.60    峰时 $1.20
+ *   1M 输入 token（缓存命中）  空闲 0.02 元   高峰 0.04 元
+ *   1M 输入 token（缓存未命中）空闲 1 元      高峰 2 元
+ *   1M 输出 token              空闲 4 元      高峰 8 元
  *
- * 峰时 = UTC 周一至周五 01:00–04:00 与 06:00–10:00（中国法定节假日除外；
- * 节假日无法从代码判断，所以这里不处理，误差只影响那几个小时的估算）。
+ * ⚠️ 第一版用的是英文页的**美元**价，还把峰时按 UTC 算（01–04、06–10），
+ * 两者都错：平台按人民币计费，峰时是**北京时间**周一至周五 9:00–12:00、14:00–18:00。
+ * 币种和时段都错，算出来的数当然和平台对不上。
+ *
+ * 中国法定节假日无法从代码判断，所以不处理 —— 只影响那几个小时的估算。
  *
  * ⚠️ 这里算的是**估算值**：金额以平台实际扣费为准。
  * 价格随时会变，所以单价支持用环境变量覆盖，改价不用改代码。
  */
 
 export type PriceTable = {
-  /** 美元 / 百万 token */
+  /** 元 / 百万 token */
   cacheHit: number
   cacheMiss: number
   output: number
-  currency: 'USD'
+  currency: 'CNY'
 }
 
 export type UsageNumbers = {
@@ -37,7 +40,7 @@ export type CostEstimate = {
   total: number
   /** 本次是否按峰时价计算 */
   peak: boolean
-  currency: 'USD'
+  currency: 'CNY'
 }
 
 const num = (value: string | undefined, fallback: number): number => {
@@ -45,12 +48,12 @@ const num = (value: string | undefined, fallback: number): number => {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
-/** 峰时单价（默认为峰时；谷时是其一半） */
+/** 峰时单价（元 / 百万 token）；空闲价 = 峰时 / 2 */
 export const readPriceTable = (env: NodeJS.ProcessEnv): PriceTable => ({
-  cacheHit: num(env.PRICE_CACHE_HIT_PEAK, 0.006),
-  cacheMiss: num(env.PRICE_CACHE_MISS_PEAK, 0.3),
-  output: num(env.PRICE_OUTPUT_PEAK, 1.2),
-  currency: 'USD',
+  cacheHit: num(env.PRICE_CACHE_HIT_PEAK, 0.04),
+  cacheMiss: num(env.PRICE_CACHE_MISS_PEAK, 2),
+  output: num(env.PRICE_OUTPUT_PEAK, 8),
+  currency: 'CNY',
 })
 
 /** 谷时单价 = 峰时 / 2（官方口径） */
@@ -62,17 +65,21 @@ export const offPeakTable = (peak: PriceTable): PriceTable => ({
 })
 
 /**
- * 现在是否峰时。
- * UTC 周一至周五（getUTCDay 1..5）的 01:00–04:00 与 06:00–10:00。
+ * 现在是否高峰时段。
+ *
+ * 官方口径：**北京时间（UTC+8）周一至周五 9:00–12:00、14:00–18:00**。
+ * 其余时间（含周末全天）为空闲时段，价格减半。
  */
 export const isPeakNow = (now = new Date()): boolean => {
-  const day = now.getUTCDay()
+  // 换算到北京时间：用 UTC 时间戳 +8 小时，避免依赖运行机器的时区
+  const beijing = new Date(now.getTime() + 8 * 3_600_000)
+  const day = beijing.getUTCDay()
   if (day === 0 || day === 6) {
     return false
   }
-  const minutes = now.getUTCHours() * 60 + now.getUTCMinutes()
+  const minutes = beijing.getUTCHours() * 60 + beijing.getUTCMinutes()
   const inRange = (start: number, end: number) => minutes >= start * 60 && minutes < end * 60
-  return inRange(1, 4) || inRange(6, 10)
+  return inRange(9, 12) || inRange(14, 18)
 }
 
 /** 按当前时段算一次调用的费用（美元） */
@@ -92,7 +99,7 @@ export const estimateCost = (
     output,
     total: inputCacheHit + inputCacheMiss + output,
     peak: isPeakNow(now),
-    currency: 'USD',
+    currency: 'CNY',
   }
 }
 

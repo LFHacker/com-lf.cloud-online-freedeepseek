@@ -78,7 +78,7 @@ export const SessionUsageBar = ({ session }: { session: Session }) => {
         ·
       </span>
       <span className={styles.item}>
-        {t('statsInput')} <b>{formatTokens(totals.cacheHit + totals.cacheMiss)}</b> token
+        {t('statsTotalInput')} <b>{formatTokens(totals.cacheHit + totals.cacheMiss)}</b> token
         {rate === null ? null : (
           <>
             （{t('statsCacheOf')} <b>{rate.toFixed(0)}%</b> {t('statsCacheHit')}）
@@ -89,7 +89,7 @@ export const SessionUsageBar = ({ session }: { session: Session }) => {
         ·
       </span>
       <span className={styles.item}>
-        {t('statsOutput')} <b>{formatTokens(totals.output)}</b> token
+        {t('statsTotalOutput')} <b>{formatTokens(totals.output)}</b> token
       </span>
       {cost ? (
         <>
@@ -97,7 +97,7 @@ export const SessionUsageBar = ({ session }: { session: Session }) => {
             ·
           </span>
           <span className={styles.item} title={cost.peak ? t('statsPeak') : t('statsOffPeak')}>
-            {t('statsCostAbout')} <b>{formatCost(cost.total, cost.currency)}</b>（
+            {t('statsTotalCost')} <b>{formatCost(cost.total, cost.currency)}</b>（
             {t('statsEstimate')}）
           </span>
         </>

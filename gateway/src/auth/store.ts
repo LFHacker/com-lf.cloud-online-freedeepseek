@@ -106,6 +106,27 @@ create index if not exists idx_auth_sessions_exp on auth_sessions(expires_at);
 
 /** 改名记录：用于限频（24h 内最多 3 次） */
 /**
+ * 登录审计。
+ *
+ * 为什么必须有：现在只有 console 日志，重启即丢。
+ * 一旦出现"异地登录""被撞库"，用户问"谁在什么时候试过我的账号"，
+ * 没有这张表就只能回答"我不知道"。
+ *
+ * 只记必要字段，不记密码、不记令牌。
+ */
+create table if not exists auth_audit (
+  id      text primary key,
+  email   text not null,
+  user_id text,
+  ip      text,
+  action  text not null,
+  ok      integer not null,
+  detail  text,
+  at      integer not null
+);
+create index if not exists idx_auth_audit_time on auth_audit(at desc);
+
+/**
  * 会话云端同步。
  *
  * 只存**整条会话的 JSON**（payload），不拆字段：
@@ -735,6 +756,83 @@ export class AuthStore {
 
   revokeAll(userId: string): void {
     this.db.prepare('delete from auth_sessions where user_id = ?').run(userId)
+  }
+
+  // ── 登录审计 ──────────────────────────────────────────
+
+  recordAudit(params: {
+    email: string
+    userId?: string | null
+    ip?: string
+    action: string
+    ok: boolean
+    detail?: string
+    now?: number
+  }): void {
+    const now = params.now ?? Date.now()
+    const id = createHash('sha256')
+      .update([params.email, params.action, String(now), String(Math.random())].join('|'))
+      .digest('hex')
+      .slice(0, 24)
+    this.db
+      .prepare(
+        'insert into auth_audit (id, email, user_id, ip, action, ok, detail, at) values (?, ?, ?, ?, ?, ?, ?, ?)'
+      )
+      .run(
+        id,
+        params.email.toLowerCase(),
+        params.userId ?? null,
+        params.ip ?? '',
+        params.action,
+        params.ok ? 1 : 0,
+        params.detail ?? '',
+        now
+      )
+  }
+
+  /** 审计查询（最新的在前），供管理页/排查用 */
+  listAudit(limit = 100, email?: string): Array<{
+    email: string
+    action: string
+    ok: boolean
+    ip: string
+    at: number
+  }> {
+    const sql = email
+      ? 'select email, action, ok, ip, at from auth_audit where email = ? order by at desc limit ?'
+      : 'select email, action, ok, ip, at from auth_audit order by at desc limit ?'
+    const rows = (email
+      ? this.db.prepare(sql).all(email.toLowerCase(), limit)
+      : this.db.prepare(sql).all(limit)) as Array<{
+      email: string
+      action: string
+      ok: number
+      ip: string
+      at: number
+    }>
+    return rows.map((row) => ({
+      email: row.email,
+      action: row.action,
+      ok: row.ok === 1,
+      ip: row.ip,
+      at: row.at,
+    }))
+  }
+
+  /** 今天（北京时间）已消耗的 token 总数，用于每日配额 */
+  todayTokenUsage(userId: string): number {
+    // 北京时间零点 = UTC 时间往前推 8 小时后的当天零点
+    const now = Date.now()
+    const beijingMidnight = new Date(now + 8 * 3_600_000)
+    beijingMidnight.setUTCHours(0, 0, 0, 0)
+    const since = beijingMidnight.getTime() - 8 * 3_600_000
+    const row = this.db
+      .prepare(
+        `select coalesce(sum(prompt_hit + prompt_miss + output_tokens), 0) n
+           from usage_events where user_id = ? and created_at >= ?`
+      )
+      .get(userId, since) as { n: number }
+    return Number(row.n)
   }
 
   // ── 会话云端同步 ──────────────────────────────────────

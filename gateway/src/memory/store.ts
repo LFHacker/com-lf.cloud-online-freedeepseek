@@ -131,6 +131,13 @@ export class MemoryStore {
   private readonly rerankModel: string
   private readonly rerankTimeoutMs: number
   private readonly rerankPoolSize: number
+  /**
+   * 邻块扩展：命中的切片前后各带一块进来。
+   *
+   * 只提"检索指标"是没用的 —— 用户要的是模型能看懂那段话。
+   * 一个切片是 500 字内的片段，命中它但缺前后文时，模型看到的是半句话。
+   */
+  private readonly neighborExpand: boolean
   private lastHits = 0
   /** 后台向量化任务，测试与关停时用 */
   private readonly pending = new Set<Promise<void>>()
@@ -155,6 +162,11 @@ export class MemoryStore {
     this.rerankTimeoutMs = Number(process.env.MEMORY_RERANK_TIMEOUT_MS ?? 2500)
     // 14 是实测的平衡点：@4 92.5% 与 pool=20 持平，但 p95 延迟从 1162ms 降到 727ms
     this.rerankPoolSize = Number(process.env.MEMORY_RERANK_POOL ?? 14)
+    /**
+     * 默认关：回答级评测（40 条）显示 1.45 → 1.50，在噪声内，而上下文多 50%。
+     * 想试试就设 MEMORY_NEIGHBORS=1。
+     */
+    this.neighborExpand = (process.env.MEMORY_NEIGHBORS ?? '0') !== '0'
     this.freshnessBoost =
       options.freshnessBoost ?? Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25)
   }
@@ -500,6 +512,75 @@ export class MemoryStore {
       hits.push(extra)
     }
     return hits
+  }
+
+  /** 按 id 取切片原文（评测与调试用） */
+  chunkBody(chunkId: string): string | null {
+    const row = this.db.prepare('select body from chunks where id = ?').get(chunkId) as
+      | { body: string }
+      | undefined
+    return row?.body ?? null
+  }
+
+  /**
+   * 取同一会话里紧邻的一块（dir=-1 前一块，dir=1 后一块）。
+   *
+   * 没有显式顺序列，用 (created_at, id) 定序：同一毫秒内写入的切片靠 id 稳定排序，
+   * 否则相邻两块可能顺序颠倒，拼出来是倒装的句子。
+   */
+  private neighborOf(hit: MemoryHit, dir: -1 | 1): MemoryHit | null {
+    const sql =
+      dir === 1
+        ? `select id, session_id, body, created_at from chunks
+            where session_id = ? and (created_at > ? or (created_at = ? and id > ?))
+            order by created_at asc, id asc limit 1`
+        : `select id, session_id, body, created_at from chunks
+            where session_id = ? and (created_at < ? or (created_at = ? and id < ?))
+            order by created_at desc, id desc limit 1`
+    const row = this.db.prepare(sql).get(hit.sessionId, hit.createdAt, hit.createdAt, hit.chunkId) as
+      | { id: string; session_id: string; body: string; created_at: number }
+      | undefined
+    if (!row) {
+      return null
+    }
+    return {
+      chunkId: row.id,
+      sessionId: row.session_id,
+      createdAt: row.created_at,
+      body: row.body,
+      score: hit.score,
+    }
+  }
+
+  /**
+   * 把命中切片展开成「前块 + 本体 + 后块」的连续段落。
+   *
+   * 顺序很重要：模型按顺序读，相邻内容必须贴在一起，
+   * 否则它会把两段不相干的话当成一段。
+   */
+  expandNeighbors(hits: readonly MemoryHit[]): MemoryHit[] {
+    if (!this.neighborExpand || hits.length === 0) {
+      return [...hits]
+    }
+    const seen = new Set<string>()
+    const out: MemoryHit[] = []
+    for (const hit of hits) {
+      const prev = this.neighborOf(hit, -1)
+      if (prev && !seen.has(prev.chunkId)) {
+        seen.add(prev.chunkId)
+        out.push(prev)
+      }
+      if (!seen.has(hit.chunkId)) {
+        seen.add(hit.chunkId)
+        out.push(hit)
+      }
+      const next = this.neighborOf(hit, 1)
+      if (next && !seen.has(next.chunkId)) {
+        seen.add(next.chunkId)
+        out.push(next)
+      }
+    }
+    return out
   }
 
   /** 后台向量化：失败只记日志，不影响已经完成的写入 */

@@ -303,6 +303,9 @@ export const loadFileOrFetch = async (id: string): Promise<Blob | undefined> => 
 export const loadFile = async (id: string): Promise<Blob | undefined> =>
   (await (await getDB()).get('files', id))?.blob
 
+/** 本机实际存了多少个附件原件（用来回答"附件为什么传不上去"） */
+export const countStoredFiles = async (): Promise<number> => (await getDB()).count('files')
+
 /** 清空导入暂存：开始导入前清除上次中断（如关闭页面）遗留的数据，导入失败后清除本次写入。 */
 export const clearStaging = async (): Promise<void> => {
   const tx = (await getDB()).transaction(['sessionsStaging', 'filesStaging'], 'readwrite')

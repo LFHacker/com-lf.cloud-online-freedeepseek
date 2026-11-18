@@ -88,7 +88,7 @@ export const importArchive = async (
   onCommit?: () => void,
   /** 取消检查：每个条目之间调用一次，返回 true 就中止 */
   shouldCancel?: () => boolean
-): Promise<{ imagesFailed: number }> => {
+): Promise<{ imagesFailed: number; imagesStored: number }> => {
   reportStep('archive:start', { name: file.name, size: file.size })
   if (!(await isZipFile(file))) {
     reportStep('archive:not-zip')
@@ -239,5 +239,6 @@ export const importArchive = async (
   reportStep('archive:done', { sessions: imported.size, images: images.size, imagesFailed })
   await db.updateStagingFileTypes(stored)
   onCommit?.()
-  return { imagesFailed }
+  // 存进去的图片数量：这是"包里到底有没有图 / 有没有对上记录"的唯一直接证据
+  return { imagesFailed, imagesStored: stored.size }
 }

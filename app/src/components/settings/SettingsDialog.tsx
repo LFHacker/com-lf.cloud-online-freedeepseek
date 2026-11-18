@@ -724,8 +724,13 @@ const useHistoryImport = () => {
         })
       } else {
         setStatus({
-          key: result.count === 1 ? 'historyImportedOne' : 'historyImported',
-          params: { count: result.count },
+          key:
+            result.imagesStored > 0
+              ? 'historyImportedWithImages'
+              : result.count === 1
+                ? 'historyImportedOne'
+                : 'historyImported',
+          params: { count: result.count, images: result.imagesStored },
         })
       }
     } catch (error) {
@@ -872,6 +877,27 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
   const t = useTranslate()
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState<Status>(null)
+  /**
+   * 本机实际存了多少个附件原件。
+   * 这一行是给"附件传不上去"准备的诊断：如果它是 0，说明导入的包里就没有图片，
+   * 再点多少次同步也没用；如果它有几百个却一个都没传上去，那才是别的问题。
+   */
+  const [localFiles, setLocalFiles] = useState<number | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    void import('../../services/chat/db.js')
+      .then((db) => db.countStoredFiles())
+      .then((count) => {
+        if (alive) {
+          setLocalFiles(count)
+        }
+      })
+      .catch(() => undefined)
+    return () => {
+      alive = false
+    }
+  }, [busy])
 
   const run = async () => {
     if (cloudSyncRunning) {
@@ -898,19 +924,28 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
       const failed = result.sessionsFailed + result.filesFailed
       const nothingHappened =
         result.sessionsPushed === 0 && result.filesUploaded === 0 && result.sessionsSkipped === 0
+      /**
+       * 三种结局要分开说，否则用户没法判断下一步该做什么：
+       *  · 有失败项 → 网络/服务端问题，重试有意义
+       *  · 没有失败、但有"本机缺原件" → 数据本身不完整（导入包没带图片），重试没用
+       *  · 都正常 → 完成
+       */
+      const params = {
+        sessions: result.sessionsPushed,
+        files: result.filesUploaded,
+        skipped: result.sessionsSkipped,
+        failed,
+        missing: result.filesMissing,
+        localFiles: result.localFiles,
+      }
       setStatus(
         nothingHappened && result.error
           ? { key: 'cloudSyncFailed', params: { message: result.error }, error: true }
-          : {
-              key: failed > 0 ? 'cloudSyncPartial' : 'cloudSyncDone',
-              params: {
-                sessions: result.sessionsPushed,
-                files: result.filesUploaded,
-                skipped: result.sessionsSkipped,
-                failed,
-              },
-              error: failed > 0,
-            }
+          : failed > 0
+            ? { key: 'cloudSyncPartial', params, error: true }
+            : result.filesMissing > 0
+              ? { key: 'cloudSyncMissingFiles', params }
+              : { key: 'cloudSyncDone', params }
       )
     } catch (error) {
       setStatus(errorStatus('cloudSyncFailed', error))
@@ -923,7 +958,11 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
   return (
     <SettingCell
       label={t('cloudSyncLabel')}
-      description={t('cloudSyncDescription')}
+      description={
+        localFiles === null
+          ? t('cloudSyncDescription')
+          : `${t('cloudSyncDescription')} ${t('cloudSyncLocalFiles', { count: localFiles })}`
+      }
       status={status}
       action={
         <Button

@@ -13,6 +13,7 @@
 import { loadSession, loadSessionFileIds, loadSessionSummaries } from '../chat/db.js'
 import { fetchSessionIndex, listRemoteFiles, pushSessions, uploadAttachment } from './index.js'
 import { loadFile } from '../chat/db.js'
+import { countStoredFiles } from '../chat/db.js'
 import type { Session } from '../chat/types.js'
 
 export type FullSyncProgress = {
@@ -29,7 +30,18 @@ export type FullSyncResult = {
   sessionsFailed: number
   filesUploaded: number
   filesSkipped: number
+  /** 上传尝试过但失败（网络/服务端拒绝） */
   filesFailed: number
+  /**
+   * 会话里引用了、但**本机根本没有原件**的附件数。
+   *
+   * 这和"上传失败"是两件事：导入的包如果没带图片、或导入时图片没写进 IndexedDB，
+   * 本机就没有可传的东西 —— 再点一万次同步也没用。
+   * 不分开计数的话，用户只会看到"失败 N 项"，无法判断是网络问题还是数据本身缺。
+   */
+  filesMissing: number
+  /** 本机实际存了多少个原件（诊断用） */
+  localFiles: number
   /** 第一条失败原因（给界面显示，不刷屏） */
   error?: string
 }
@@ -49,6 +61,8 @@ export const pushEverything = async (
     filesUploaded: 0,
     filesSkipped: 0,
     filesFailed: 0,
+    filesMissing: 0,
+    localFiles: 0,
   }
 
   /**
@@ -98,6 +112,7 @@ export const pushEverything = async (
 
   // ---- 4) 附件：只传云端还没有的（引用 id 从摘要里直接取，不必读正文）----
   const fileIds = await loadSessionFileIds().catch(() => new Set<string>())
+  result.localFiles = await countStoredFiles().catch(() => 0)
   const remoteFiles = await listRemoteFiles()
   const missing = [...fileIds].filter((id) => !remoteFiles || !remoteFiles.has(id))
   result.filesSkipped = fileIds.size - missing.length
@@ -106,13 +121,16 @@ export const pushEverything = async (
   for (const id of missing) {
     const blob = await loadFile(id).catch(() => undefined)
     if (!blob) {
-      // 本地没有原件（导入包里的图片在导出时可能缺失，或已被清理）
-      result.filesFailed += 1
+      /**
+       * 本机没有原件：多数是导入的包里本来就没带图（或导入时图片没落盘）。
+       * 单独计数 —— 它和"上传失败"完全是两回事，混在一起用户没法判断该怎么办。
+       */
+      result.filesMissing += 1
     } else if (await uploadAttachment(id, blob)) {
       result.filesUploaded += 1
     } else {
       result.filesFailed += 1
-      result.error ??= '有附件上传失败'
+      result.error ??= '有附件上传失败（网络或服务端拒绝）'
     }
     uploaded += 1
     onProgress?.({ phase: 'files', done: uploaded, total: missing.length })

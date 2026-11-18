@@ -233,6 +233,7 @@ export const en = {
   historyImportedPartial: 'Imported {count} chats; {failed} images could not be saved because the source file was released by the system',
   historyImportedOne: 'Imported 1 chat',
   historyImported: 'Imported {count} chats',
+  historyImportedWithImages: 'Imported {count} chats ({images} images)',
   historyImportFailed:
     'File import failed. The file format may be invalid, or the ZIP file may use an older chat export format. Please export your chat history from DeepSeek again and retry the import.',
   historyExportFailed: 'Export failed: {message}',
@@ -244,11 +245,14 @@ export const en = {
   cloudSyncDescription:
     'Push chats and attachments from this device to the cloud. Items already up to date are skipped. Failures are shown with a reason and can be retried.',
   cloudSyncAction: 'Start sync',
+  cloudSyncLocalFiles: '({count} files on this device)',
   cloudSyncBusy: 'Syncing…',
   cloudSyncSessions: 'Pushing chats {done}/{total}',
   cloudSyncFiles: 'Pushing attachments {done}/{total}',
   cloudSyncDone: 'Pushed {sessions} chats and {files} attachments ({skipped} already up to date)',
   cloudSyncPartial: 'Finished: {sessions} chats, {files} attachments, {failed} failed',
+  cloudSyncMissingFiles:
+    'Finished: {sessions} chats, {files} attachments. {missing} referenced attachments have no local file (this device holds {localFiles} files), so they cannot be uploaded — retrying will not help',
   cloudSyncFailed: 'Sync failed: {message}',
   deleteAllSessions: 'Delete all chats',
   deleteAllSessionsModalTitle: 'Once deleted, all chats will be cleared and cannot be recovered.',

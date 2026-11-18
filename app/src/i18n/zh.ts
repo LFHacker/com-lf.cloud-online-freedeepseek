@@ -226,6 +226,7 @@ export const zh = {
   historyImportedPartial: '已导入 {count} 个对话；有 {failed} 张图片因来源文件被系统回收未能保存',
   historyImportedOne: '已导入 1 个对话',
   historyImported: '已导入 {count} 个对话',
+  historyImportedWithImages: '已导入 {count} 个对话（其中图片 {images} 张）',
   historyImportFailed:
     '文件导入失败，可能是文件格式错误或使用了旧版的对话导出 ZIP 文件，请前往 DeepSeek 重新导出历史对话文件后再次导入。',
   historyExportFailed: '导出失败：{message}',
@@ -237,11 +238,14 @@ export const zh = {
   cloudSyncDescription:
     '把本机的会话与附件补推到云端；云端已经是最新的会自动跳过。推送失败时会显示原因，可反复重试。',
   cloudSyncAction: '开始同步',
+  cloudSyncLocalFiles: '（本机原件 {count} 个）',
   cloudSyncBusy: '同步中…',
   cloudSyncSessions: '正在推送会话 {done}/{total}',
   cloudSyncFiles: '正在推送附件 {done}/{total}',
   cloudSyncDone: '已推送 {sessions} 条会话、{files} 个附件（{skipped} 条已是最新）',
   cloudSyncPartial: '推送完成：会话 {sessions} 条、附件 {files} 个，失败 {failed} 项',
+  cloudSyncMissingFiles:
+    '推送完成：会话 {sessions} 条、附件 {files} 个。另有 {missing} 个附件在本机没有原件（本机原件共 {localFiles} 个），无法上传 —— 重试也没用',
   cloudSyncFailed: '同步失败：{message}',
   deleteAllSessions: '删除所有对话',
   deleteAllSessionsModalTitle: '删除后，所有对话都将被清空且无法找回',

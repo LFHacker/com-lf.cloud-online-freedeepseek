@@ -1,4 +1,5 @@
 import { translate, type TranslationMessage } from '../../i18n/index.js'
+import { cachedUpstreamKey } from '../secure/upstreamKey.js'
 import { useSettings } from '../settings.js'
 import { readMessageEvent } from './parseEvent.js'
 import { readServerSentEvents } from './sse.js'
@@ -73,10 +74,36 @@ const readErrorResponse = async (
   return new ApiError(kind, message, response.status)
 }
 
+/**
+ * 网关在响应头里额外给了两条本轮元信息：
+ *   x-ds-memory-recall       本次注入了多少条记忆
+ *   x-ds-context-kept-tokens 裁剪后保留了多少上下文 token
+ * 响应头只能在拿到 Response 的那一刻读，所以在这里顺手存一份给界面用。
+ */
+export type TurnMeta = { memoryHits: number; contextTokens: number; at: number }
+
+let lastTurnMeta: TurnMeta | null = null
+
+/** 最近一次请求的元信息（界面渲染「本轮」统计用；刷新页面会丢，属预期） */
+export const readLastTurnMeta = (): TurnMeta | null => lastTurnMeta
+
+const captureTurnMeta = (response: Response): void => {
+  const recall = Number(response.headers.get('x-ds-memory-recall') ?? '')
+  const kept = Number(response.headers.get('x-ds-context-kept-tokens') ?? '')
+  if (!Number.isFinite(recall) && !Number.isFinite(kept)) {
+    return
+  }
+  lastTurnMeta = {
+    memoryHits: Number.isFinite(recall) ? recall : 0,
+    contextTokens: Number.isFinite(kept) ? kept : 0,
+    at: Date.now(),
+  }
+}
 export const request = async (url: string, init: RequestInit): Promise<Response> => {
   let response: Response
   try {
     response = await fetch(url, init)
+    captureTurnMeta(response)
   } catch (error) {
     if (init.signal?.aborted) {
       throw error
@@ -89,12 +116,17 @@ export const request = async (url: string, init: RequestInit): Promise<Response>
   return response
 }
 
-const anthropicHeaders = (apiKey: string, beta: boolean): Record<string, string> => ({
-  // DeepSeek 兼容接口的鉴权方式，也可使用 Authorization: Bearer。
-  'x-api-key': apiKey,
-  // Files API 和通过 file_id 引用图片时必传；纯文本聊天无需携带。
-  ...(beta ? { 'anthropic-beta': FILES_BETA } : {}),
-})
+const anthropicHeaders = (apiKey: string, beta: boolean): Record<string, string> => {
+  const upstream = cachedUpstreamKey()
+  return {
+    // 自建网关：x-api-key 是**我们的会话令牌**（认「你是谁」）
+    'x-api-key': apiKey,
+    // 官方 Key 由用户本地输入、随请求带给网关转发；网关不留存，只记指纹
+    ...(upstream ? { 'x-deepseek-key': upstream } : {}),
+    // Files API 和通过 file_id 引用图片时必传；纯文本聊天无需携带。
+    ...(beta ? { 'anthropic-beta': FILES_BETA } : {}),
+  }
+}
 
 /** 自建网关用于区分会话与记忆模式的两个头；直连官方时它们会被忽略 */
 export type SessionMeta = {

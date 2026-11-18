@@ -20,6 +20,28 @@ import {
   type EmbeddingClient,
 } from './embed.ts'
 
+/**
+ * 这段话是不是在**纠正自己的事实**？
+ *
+ * 判据刻意保守：宁可漏判（档案晚点更新），也不要每句"我是…"都触发重建 ——
+ * 重建会打散 system 前缀缓存，每轮重建等于把缓存收益全丢掉。
+ *
+ * 覆盖三类实际出现过的说法：
+ *   · 明确纠正：说错了 / 记错了 / 不对，是 X / 改成 X
+ *   · 带年级的自我介绍：我是 2024 级 / 我 2024 级的
+ *   · 身份自述：我叫 X / 我是 X 专业的
+ */
+const looksLikeSelfCorrection = (text: string): boolean => {
+  if (text.length > 200) {
+    return false
+  }
+  return (
+    /说错|记错|纠正|更正|改口|不对[，,]|不是.{0,8}是/u.test(text) ||
+    /我[^。]{0,6}\d{4}[^。]{0,4}级/u.test(text) ||
+    /我(叫|是)[^。]{1,20}(专业|学院|学校|大学)/u.test(text)
+  )
+}
+
 export type MemoryScope = 'global' | 'local'
 
 export type MemoryHit = {
@@ -27,6 +49,8 @@ export type MemoryHit = {
   sessionId: string
   createdAt: number
   body: string
+  /** 紧随其后的助手回答：只用于注入，不参与检索打分（索引仍只建在 body 上） */
+  context?: string | null
   /** bm25 分数，越负越相关 */
   score: number
 }
@@ -126,6 +150,22 @@ export class MemoryStore {
   private readonly minVectorScore: number
   private readonly decayHalfLifeDays: number
   private readonly freshnessBoost: number
+  /** 重排（cross-encoder）：把融合后的候选再排一次，显著提升第一名准确率 */
+  private readonly rerankEnabled: boolean
+  private readonly rerankModel: string
+  private readonly rerankTimeoutMs: number
+  private readonly rerankPoolSize: number
+  /**
+   * 邻块扩展：命中的切片前后各带一块进来。
+   *
+   * 只提"检索指标"是没用的 —— 用户要的是模型能看懂那段话。
+   * 一个切片是 500 字内的片段，命中它但缺前后文时，模型看到的是半句话。
+   */
+  private readonly neighborExpand: boolean
+  /** 注入时给多少条命中带上下文（实测全带会把注入块撑到 2600 字，反而降分） */
+  private readonly contextHits: number
+  /** 每条上下文最多多少字 */
+  private readonly contextChars: number
   private lastHits = 0
   /** 后台向量化任务，测试与关停时用 */
   private readonly pending = new Set<Promise<void>>()
@@ -144,6 +184,19 @@ export class MemoryStore {
     this.decayHalfLifeDays =
       options.decayHalfLifeDays ?? Number(process.env.MEMORY_DECAY_HALF_LIFE_DAYS ?? 90)
     // 0.25 表示最多 ±25%。宁可欠一点，也不要让权重压过相关性
+    this.rerankEnabled =
+      (process.env.MEMORY_RERANK ?? '1') !== '0' && Boolean(process.env.MEMORY_EMBED_API_KEY)
+    this.rerankModel = process.env.MEMORY_RERANK_MODEL ?? 'BAAI/bge-reranker-v2-m3'
+    this.rerankTimeoutMs = Number(process.env.MEMORY_RERANK_TIMEOUT_MS ?? 2500)
+    // 14 是实测的平衡点：@4 92.5% 与 pool=20 持平，但 p95 延迟从 1162ms 降到 727ms
+    this.rerankPoolSize = Number(process.env.MEMORY_RERANK_POOL ?? 14)
+    /**
+     * 默认关：回答级评测（40 条）显示 1.45 → 1.50，在噪声内，而上下文多 50%。
+     * 想试试就设 MEMORY_NEIGHBORS=1。
+     */
+    this.neighborExpand = (process.env.MEMORY_NEIGHBORS ?? '0') !== '0'
+    this.contextHits = Number(process.env.MEMORY_CONTEXT_HITS ?? 2)
+    this.contextChars = Number(process.env.MEMORY_CONTEXT_CHARS ?? 300)
     this.freshnessBoost =
       options.freshnessBoost ?? Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25)
   }
@@ -224,6 +277,17 @@ export class MemoryStore {
       return { stored: true, chunks: 0 }
     }
 
+    /**
+     * 用户在**纠正自己的事实**（"我说错了，是 2024 级"）时，必须让长期档案失效。
+     *
+     * 实测踩过：在 A 对话里把年级从 2022 改成 2024，档案 24 小时才重建，
+     * 于是 B 对话里模型仍然说 2022 —— 用户看到的字面是"记忆是错的"，
+     * 这类错误对信任的破坏比"少记一条"严重得多。
+     */
+    if (looksLikeSelfCorrection(body)) {
+      this.markProfileStale()
+    }
+
     const chunks = splitIntoChunks(body)
     const insertChunk = this.db.prepare(
       'insert into chunks (id, session_id, message_id, body, created_at) values (?, ?, ?, ?, ?)'
@@ -250,30 +314,118 @@ export class MemoryStore {
    * 排除自己的会话：本会话的历史本来就在上下文里，再召回来只会重复占 token。
    * 启用 embedding 时走「词法 + 向量」RRF 融合；否则纯词法。
    */
+  /**
+   * 重排：用 cross-encoder 把「查询 + 候选原文」一起打分。
+   *
+   * 为什么值得多花 ~270ms：向量检索擅长"大致相关"，但排序常把语义相近但
+   * 并非答案的片段排前面。实测（40 条真实历史题）第一名准确率 47.5% → 72.5%，
+   * 前四 77.5% → 92.5%。
+   *
+   * 失败必须**静默退回**融合顺序：记忆是增强功能，不能因为它让聊天报错。
+   */
+  private async rerankHits(query: string, hits: MemoryHit[]): Promise<MemoryHit[] | null> {
+    if (!this.rerankEnabled || hits.length < 2) {
+      return null
+    }
+    const config = this.embedding?.config
+    if (!config) {
+      return null
+    }
+    const pool = hits.slice(0, Math.min(hits.length, this.rerankPoolSize))
+    try {
+      const response = await fetch(`${config.baseUrl}/rerank`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
+        body: JSON.stringify({
+          model: this.rerankModel,
+          query,
+          documents: pool.map((hit) => hit.body),
+          top_n: pool.length,
+          return_documents: false,
+        }),
+        signal: AbortSignal.timeout(this.rerankTimeoutMs),
+      })
+      if (!response.ok) {
+        console.warn(`[memory] 重排接口返回 ${response.status}，本次退回融合顺序`)
+        return null
+      }
+      const payload = (await response.json()) as { results?: Array<{ index: number }> }
+      const results = payload.results ?? []
+      if (results.length === 0) {
+        return null
+      }
+      const reordered = results
+        .map((item) => pool[item.index])
+        .filter((hit): hit is MemoryHit => Boolean(hit))
+      // 池子外的候选原样接在后面，避免丢内容
+      return [...reordered, ...hits.slice(pool.length)]
+    } catch (error) {
+      console.warn(
+        `[memory] 重排失败，本次退回融合顺序：${error instanceof Error ? error.message : String(error)}`
+      )
+      return null
+    }
+  }
+
   async search(params: { text: string; excludeSessionId: string; limit?: number }): Promise<MemoryHit[]> {
+    return this.searchMulti({ texts: [params.text], excludeSessionId: params.excludeSessionId, limit: params.limit })
+  }
+
+  /**
+   * 多查询融合检索（查询改写的落点）。
+   *
+   * 每个变体各自跑词法 + 向量，再用 RRF 把**所有**结果列融合成一条。
+   * 为什么变体之间要融合而不是取并集：并集会让"在某个变体里排第一"和
+   * "在所有变体里都排中游"等价，RRF 正好惩罚后者、奖励前者。
+   *
+   * ⚠️ 重排只用原始问题做一次（用变体去打分没有意义，我们要回答的是原问题）。
+   */
+  async searchMulti(params: {
+    texts: string[]
+    excludeSessionId: string
+    limit?: number
+  }): Promise<MemoryHit[]> {
     const limit = params.limit ?? this.maxHits
     // 多取一些候选，留出按新鲜度重排的空间
     const poolSize = Math.max(limit * 2, limit + 2)
-    const lexical = this.collectLexical(params.text, params.excludeSessionId, poolSize)
-
-    let vector: MemoryHit[] = []
-    if (this.embedding.enabled) {
-      const queryVector = await this.embedQuery(params.text)
-      if (queryVector) {
-        vector = this.searchByVector(queryVector, params.excludeSessionId, poolSize)
-      }
+    const texts = params.texts.map((t) => t.trim()).filter(Boolean)
+    if (texts.length === 0) {
+      this.lastHits = 0
+      return []
     }
 
-    let merged: MemoryHit[]
-    if (vector.length === 0) {
-      merged = lexical
-    } else {
-      // RRF 只看名次，免疫 BM25 与余弦的量纲差异
-      merged = fuseRanks([lexical, vector], (hit) => hit.chunkId).map((entry) => entry.item)
+    const lists: MemoryHit[][] = []
+    // 变体之间并行：embedding 是网络请求，串行会线性拖长延迟
+    const perText = await Promise.all(
+      texts.map(async (text) => {
+        const lexical = this.collectLexical(text, params.excludeSessionId, poolSize)
+        let vector: MemoryHit[] = []
+        if (this.embedding.enabled) {
+          const queryVector = await this.embedQuery(text)
+          if (queryVector) {
+            vector = this.searchByVector(queryVector, params.excludeSessionId, poolSize)
+          }
+        }
+        return { lexical, vector }
+      })
+    )
+    for (const entry of perText) {
+      if (entry.lexical.length > 0) lists.push(entry.lexical)
+      if (entry.vector.length > 0) lists.push(entry.vector)
     }
+    if (lists.length === 0) {
+      this.lastHits = 0
+      return []
+    }
+
+    // RRF 只看名次，免疫 BM25 与余弦的量纲差异
+    const merged = lists.length === 1
+      ? lists[0]
+      : fuseRanks(lists, (hit) => hit.chunkId).map((entry) => entry.item)
 
     // 去掉「查询回声」：把用户自己刚问过的同一句话再喂回去没有任何信息量
-    const meaningful = merged.filter((hit) => !isEcho(hit.body, params.text))
+    const primary = texts[0]
+    const meaningful = merged.filter((hit) => !isEcho(hit.body, primary))
     if (meaningful.length === 0) {
       this.lastHits = 0
       return []
@@ -300,7 +452,15 @@ export class MemoryStore {
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.hit)
 
-    const selected = ranked.slice(0, limit)
+    /**
+     * 最后一道：cross-encoder 重排。
+     *
+     * 只对「候选池」重排，再截到 limit —— 先截断再重排是没意义的
+     * （真正相关的那条可能排在第 8，截到 4 就再也进不来）。
+     * 重排失败返回 null，这里自动退回融合顺序，聊天不受影响。
+     */
+    const reranked = await this.rerankHits(primary, ranked)
+    const selected = (reranked ?? ranked).slice(0, limit)
     // 记录命中：被召回过的记忆会因此"刷新新鲜度"，下次更容易被想起
     this.recordHits(selected.map((hit) => hit.chunkId), now)
     this.lastHits = selected.length
@@ -392,7 +552,187 @@ export class MemoryStore {
       seen.add(extra.chunkId)
       hits.push(extra)
     }
-    return hits.slice(0, limit)
+    return hits
+  }
+
+  /**
+   * 把助手这一轮的回答，挂到本会话**最近一条用户消息**的切片上。
+   *
+   * 为什么在写入时就挂：记忆只索引用户说的话（防自我强化幻觉），
+   * 但只给问题不给答案，模型看到「Flutter 找不到 Chrome」这种报错就没法回答，
+   * 只能复述。挂上回答既保留原有索引口径，又让注入资料成对。
+   *
+   * 幂等：已经有 context 的切片不覆盖（重复调用不会把旧回答换掉）。
+   */
+  attachLastAssistantReply(sessionId: string, reply: string, maxChars = 600): number {
+    const text = reply.trim()
+    if (!text) {
+      return 0
+    }
+    const lastUser = this.db
+      .prepare(
+        `select id, created_at from messages
+          where session_id = ? and role = 'user'
+          order by created_at desc, id desc limit 1`
+      )
+      .get(sessionId) as { id: string; created_at: number } | undefined
+    if (!lastUser) {
+      return 0
+    }
+    const result = this.db
+      .prepare(
+        `update chunks set context = ?
+          where message_id = ?
+            and (context is null or context = '')`
+      )
+      .run(text.slice(0, maxChars), lastUser.id)
+    return Number(result.changes)
+  }
+
+  /** 读长期档案（稳定层） */
+  getProfile(): { body: string; sourceChunks: number; updatedAt: number } | null {
+    const row = this.db
+      .prepare("select body, source_chunks, updated_at from memory_profile where id = 'stable'")
+      .get() as { body: string; source_chunks: number; updated_at: number } | undefined
+    return row ? { body: row.body, sourceChunks: row.source_chunks, updatedAt: row.updated_at } : null
+  }
+
+  /**
+   * 把长期档案标记为过期（updatedAt = 0）。
+   * 下一次请求会重建，重建时以最新说法为准。
+   *
+   * ⚠️ 只改 updated_at、不清空 body：万一重建失败（网络/额度），
+   * 还能退回旧档案说话 —— 空档案等于模型完全失忆，比"说旧值"更糟。
+   */
+  markProfileStale(): void {
+    this.db.prepare("update memory_profile set updated_at = 0 where id = 'stable'").run()
+  }
+
+  /** 写长期档案（整行替换） */
+  saveProfile(body: string, sourceChunks: number, now: number): void {
+    this.db
+      .prepare(
+        "insert into memory_profile (id, body, source_chunks, updated_at) values ('stable', ?, ?, ?) " +
+          'on conflict(id) do update set body = excluded.body, source_chunks = excluded.source_chunks, updated_at = excluded.updated_at'
+      )
+      .run(body, sourceChunks, now)
+  }
+
+  /**
+   * 取一批代表性切片给档案生成用。
+   * 优先"被召回过"的（说明真的有用），再按时间补最近的，覆盖近期变化。
+   */
+  sampleForProfile(limit: number): string[] {
+    const used = this.db
+      .prepare(
+        `select c.body from chunk_usage u join chunks c on c.id = u.chunk_id
+          order by u.hits desc, u.last_hit_at desc limit ?`
+      )
+      .all(Math.ceil(limit / 2)) as Array<{ body: string }>
+    const recent = this.db
+      .prepare('select body from chunks order by created_at desc limit ?')
+      .all(limit - used.length) as Array<{ body: string }>
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const row of [...used, ...recent]) {
+      const text = row.body.trim()
+      if (!text || seen.has(text)) continue
+      seen.add(text)
+      out.push(text.slice(0, 300))
+    }
+    return out
+  }
+
+  /**
+   * 取最近几条**用户原话**（不经过任何摘要）。
+   *
+   * 为什么需要它：长期档案是"摘要"，天生滞后 —— 生成时要参考几十条旧切片，
+   * 用户刚更正的事实很容易被旧值盖过。实测：用户说"我不是2024级，是2025级"，
+   * 32 秒后档案重建，新会话里模型仍然答 2024。
+   * 原话没有这个问题：它就是用户刚才说的那句话本身。
+   */
+  recentUserMessages(limit: number): Array<{ body: string; createdAt: number }> {
+    return this.db
+      .prepare(
+        `select body, created_at from messages
+          where role = 'user'
+          order by created_at desc, id desc
+          limit ?`
+      )
+      .all(limit)
+      .map((row) => {
+        const record = row as { body: string; created_at: number }
+        return { body: record.body, createdAt: Number(record.created_at) }
+      })
+  }
+
+  /** 按 id 取切片原文（评测与调试用） */
+  chunkBody(chunkId: string): string | null {
+    const row = this.db.prepare('select body from chunks where id = ?').get(chunkId) as
+      | { body: string }
+      | undefined
+    return row?.body ?? null
+  }
+
+  /**
+   * 取同一会话里紧邻的一块（dir=-1 前一块，dir=1 后一块）。
+   *
+   * 没有显式顺序列，用 (created_at, id) 定序：同一毫秒内写入的切片靠 id 稳定排序，
+   * 否则相邻两块可能顺序颠倒，拼出来是倒装的句子。
+   */
+  private neighborOf(hit: MemoryHit, dir: -1 | 1): MemoryHit | null {
+    const sql =
+      dir === 1
+        ? `select id, session_id, body, created_at from chunks
+            where session_id = ? and (created_at > ? or (created_at = ? and id > ?))
+            order by created_at asc, id asc limit 1`
+        : `select id, session_id, body, created_at from chunks
+            where session_id = ? and (created_at < ? or (created_at = ? and id < ?))
+            order by created_at desc, id desc limit 1`
+    const row = this.db.prepare(sql).get(hit.sessionId, hit.createdAt, hit.createdAt, hit.chunkId) as
+      | { id: string; session_id: string; body: string; created_at: number }
+      | undefined
+    if (!row) {
+      return null
+    }
+    return {
+      chunkId: row.id,
+      sessionId: row.session_id,
+      createdAt: row.created_at,
+      body: row.body,
+      score: hit.score,
+    }
+  }
+
+  /**
+   * 把命中切片展开成「前块 + 本体 + 后块」的连续段落。
+   *
+   * 顺序很重要：模型按顺序读，相邻内容必须贴在一起，
+   * 否则它会把两段不相干的话当成一段。
+   */
+  expandNeighbors(hits: readonly MemoryHit[]): MemoryHit[] {
+    if (!this.neighborExpand || hits.length === 0) {
+      return [...hits]
+    }
+    const seen = new Set<string>()
+    const out: MemoryHit[] = []
+    for (const hit of hits) {
+      const prev = this.neighborOf(hit, -1)
+      if (prev && !seen.has(prev.chunkId)) {
+        seen.add(prev.chunkId)
+        out.push(prev)
+      }
+      if (!seen.has(hit.chunkId)) {
+        seen.add(hit.chunkId)
+        out.push(hit)
+      }
+      const next = this.neighborOf(hit, 1)
+      if (next && !seen.has(next.chunkId)) {
+        seen.add(next.chunkId)
+        out.push(next)
+      }
+    }
+    return out
   }
 
   /** 后台向量化：失败只记日志，不影响已经完成的写入 */
@@ -659,7 +999,16 @@ export class MemoryStore {
   ): MemoryHit[] {
     const hits: MemoryHit[] = []
     let used = 0
+    // 上下文批量取，避免每命中一条就查一次库
+    const contextOf = this.db.prepare('select context from chunks where id = ?')
     for (const row of rows) {
+      const context = (contextOf.get(row.chunk_id) as { context: string | null } | undefined)?.context
+      /**
+       * ⚠️ 预算只算正文，**不算上下文**。
+       * 把上下文也算进来会让"能塞几条"变少（实测召回@4 从 82% 掉到 70%），
+       * 而上下文的作用是让模型读懂**已经命中的**那几条，不该挤掉别的命中。
+       * 注入总长度的上限由 buildRecallBlock 统一控制。
+       */
       if (used + row.body.length > this.maxChars) {
         continue
       }
@@ -669,6 +1018,7 @@ export class MemoryStore {
         sessionId: row.session_id,
         createdAt: Number(row.created_at),
         body: row.body,
+        context: context ?? null,
         score: row.s,
       })
     }
@@ -687,13 +1037,53 @@ export class MemoryStore {
     if (hits.length === 0) {
       return ''
     }
-    const lines = hits.map(
-      (hit) => `[${formatDay(hit.createdAt)} · 会话 ${hit.sessionId.slice(0, 8)}] ${hit.body}`
-    )
+    /**
+     * 命中是把「用户当时说的话」和「助手当时的回答」一起给模型。
+     * 带上回答的原因：用户问「Flutter 找不到 Chrome 怎么办」时，
+     * 他这句话里只有报错，解法在回答里——只给问题，模型只能复述报错。
+     */
+    const blockBudget = Number(process.env.MEMORY_BLOCK_CHARS ?? 1800)
+    const lines: string[] = []
+    let usedChars = 0
+    hits.forEach((hit, index) => {
+      const head = `[${formatDay(hit.createdAt)} · 会话 ${hit.sessionId.slice(0, 8)}]`
+      /**
+       * 只给**最相关的前几条**带上下文，且每条截断。
+       * 实测全带会把注入块从 690 字撑到 2600 字，回答级分数反而从 1.45 掉到 1.25 ——
+       * 相关信息被淹没在无关的回答里了。
+       */
+      const context = index < this.contextHits ? hit.context?.trim() : null
+      if (!context) {
+        const line = `${head} ${hit.body}`
+        if (usedChars + line.length > blockBudget) {
+          return
+        }
+        usedChars += line.length
+        lines.push(line)
+        return
+      }
+      const trimmed = context.length > this.contextChars ? `${context.slice(0, this.contextChars)}…` : context
+      const line = `${head} 用户说：${hit.body}\n（当时助手的回答：${trimmed}）`
+      // 总长上限：宁可少给一条，也不要把整个上下文预算吃光
+      if (usedChars + line.length > blockBudget) {
+        return
+      }
+      usedChars += line.length
+      lines.push(line)
+    })
     return [
       '<回忆>',
       '以下是你在「其他对话」中与用户聊过的内容，按时间从近到远。',
       '只有确实与本轮问题相关时才引用；不相关就完全忽略，不要硬套。',
+      /**
+       * 冲突裁决：长期档案里存的是"用户最新更正过的事实"，
+       * 回忆里存的是历史原话（可能已被用户推翻，例如旧年级）。
+       * 不给这条规则，模型会同时看到 2022 和 2024，然后随机挑一个说。
+       */
+      '冲突时的优先级：<最近你说过> > <长期记忆> > 回忆。',
+      '  · <最近你说过> 是用户的原话（未摘要），**最新、最可信**',
+      '  · <长期记忆> 是摘要，可能滞后于原话',
+      '  · 回忆是更早的对话片段，可能已被用户推翻',
       '这些是原文摘录，不要补充其中没有的信息，也不要编造。',
       '',
       ...lines,

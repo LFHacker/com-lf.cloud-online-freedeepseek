@@ -1,0 +1,118 @@
+import { useEffect, useMemo, useState } from 'react'
+import type { Session } from '../../services/chat/types.js'
+import { useTranslate } from '../../i18n/index.js'
+import {
+  costOf,
+  formatCost,
+  formatTokens,
+  hitRate,
+  loadPricing,
+  usageOf,
+  type Pricing,
+} from '../../services/usage/index.js'
+import styles from './SessionUsageBar.module.css'
+
+/**
+ * 标题栏下方的「本对话累计」，**只有一行**。
+ *
+ * 为什么放在顶部而不是输入框上方：
+ *   这一行回答的是"这个对话到现在一共多少"，属于**会话的元信息**，
+ *   和标题是同一类东西；放在输入框上方会常驻占据正文高度，手机上一眼看去很挤。
+ *
+ * 为什么压成一行：原来三行（轮次 / 输入 / 输出 / 费用各占一行）在移动端吃掉半个屏幕，
+ * 而这是"偶尔扫一眼"的信息。现在用 `·` 分隔、允许折行，窄屏最多两行。
+ *
+ * 数据来源：消息里存的 usage（持久），所以刷新、切会话回来都还在。
+ * 单轮用量仍留在各自回答下方，两者回答的是不同问题。
+ */
+export const SessionUsageBar = ({ session }: { session: Session }) => {
+  const t = useTranslate()
+  const [pricing, setPricing] = useState<Pricing | null>(null)
+
+  const totals = useMemo(() => {
+    let cacheHit = 0
+    let cacheMiss = 0
+    let output = 0
+    let turns = 0
+    for (const message of session.messages) {
+      const usage = usageOf((message as { usage?: unknown }).usage)
+      if (!usage) {
+        continue
+      }
+      cacheHit += usage.cacheHit
+      cacheMiss += usage.cacheMiss
+      output += usage.output
+      turns += 1
+    }
+    return { cacheHit, cacheMiss, output, turns }
+  }, [session.messages])
+
+  useEffect(() => {
+    if (totals.turns === 0) {
+      return
+    }
+    let alive = true
+    void loadPricing().then((value) => {
+      if (alive) {
+        setPricing(value)
+      }
+    })
+    return () => {
+      alive = false
+    }
+  }, [totals.turns])
+
+  // 没有用量记录时整条不显示：新会话上方不该出现一行"--"
+  if (totals.turns === 0) {
+    return null
+  }
+
+  const usage = { cacheHit: totals.cacheHit, cacheMiss: totals.cacheMiss, output: totals.output }
+  const rate = hitRate(usage)
+  const cost = costOf(usage, pricing)
+  const sep = (
+    <span className={styles.sep} aria-hidden>
+      ·
+    </span>
+  )
+
+  return (
+    <div className={styles.bar}>
+      <span className={styles.label}>{t('statsSessionTotal')}</span>
+      <span className={styles.item}>
+        {totals.turns} {t('statsTurns')}
+      </span>
+      {sep}
+      <span className={styles.item}>
+        {t('statsTotalInput')} <b>{formatTokens(totals.cacheHit + totals.cacheMiss)}</b>
+      </span>
+      {sep}
+      <span className={styles.item}>
+        {t('statsCache')} <b>{formatTokens(totals.cacheHit)}</b>
+      </span>
+      {sep}
+      <span className={styles.item}>
+        {t('statsTotalOutput')} <b>{formatTokens(totals.output)}</b>
+      </span>
+      {rate === null ? null : (
+        <>
+          {sep}
+          <span className={styles.item}>
+            {t('statsHitRate')} <b>{rate.toFixed(0)}%</b>
+          </span>
+        </>
+      )}
+      {cost ? (
+        <>
+          {sep}
+          <span
+            className={styles.item}
+            title={cost.peak ? t('statsPeak') : t('statsOffPeak')}
+          >
+            {t('statsTotalCost')} <b>{formatCost(cost.total, cost.currency)}</b>
+          </span>
+        </>
+      ) : null}
+    </div>
+  )
+}

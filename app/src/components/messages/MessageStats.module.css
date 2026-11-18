@@ -1,0 +1,63 @@
+/* 一轮回答下方的用量统计：小、灰、不抢注意力 */
+.line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  padding: 0 2px;
+  color: var(--text-secondary, #8a8f99);
+  font-size: 12px;
+  line-height: 1.6;
+  user-select: text;
+}
+
+.item {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.item b {
+  font-weight: 600;
+  color: var(--text-primary, #3c4149);
+}
+
+.estimate {
+  margin-left: 2px;
+  font-style: normal;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+/* 分隔符：比正文更淡，只是视觉停顿，不该抢注意力 */
+.sep {
+  opacity: 0.45;
+}
+/* 会话累计：比单轮更重一点，因为它是"这对话一共花了多少" */
+.session {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--bg-soft, rgba(0, 0, 0, 0.03));
+  color: var(--text-secondary, #8a8f99);
+  font-size: 12px;
+  line-height: 1.7;
+  user-select: text;
+}
+
+.session b {
+  font-weight: 600;
+  color: var(--text-primary, #3c4149);
+}
+/* 记忆状态：绿=已存、灰=未存。不用红色——未存不一定出错（本地会话本就不入库） */
+.memoryYes {
+  color: var(--dsw-alias-text-success, #1a9c6b);
+  white-space: nowrap;
+}
+
+.memoryNo {
+  color: var(--text-secondary, #8a8f99);
+  white-space: nowrap;
+}

@@ -51,6 +51,17 @@ android {
         }
     }
     buildTypes {
+        /**
+         * 开发版也用 release 密钥签名。
+         *
+         * 默认的 debug 签名与发行版不同，手机上从发行版升到开发版就必须先卸载
+         * （本地历史跟着没了）。改用同一把密钥后两条线可以互相覆盖安装。
+         */
+        debug {
+            if (rootProject.file("../keystore.properties").exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
         release {
             if (rootProject.file("../keystore.properties").exists()) {
                 signingConfig signingConfigs.release

@@ -518,3 +518,97 @@
   margin-top: 2px;
 }
 
+
+
+/* ── 账号栏（取代原来的 API Key 输入）───────────────────────── */
+.account {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.accountRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.accountEmail {
+  margin-top: 2px;
+  font-size: 15px;
+  font-weight: 600;
+  color: inherit;
+  word-break: break-all;
+}
+
+.accountMeta {
+  margin-top: 3px;
+  font-size: 12px;
+  opacity: 0.6;
+  word-break: break-all;
+}
+
+.accountAction {
+  flex: none;
+  padding: 8px 14px;
+  border: 1px solid rgba(59, 91, 253, 0.35);
+  border-radius: 9px;
+  background: transparent;
+  color: #3b5bfd;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.accountAction:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.accountSecondary {
+  align-self: flex-start;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+  color: #3b5bfd;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.accountForm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.accountFormActions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.accountInput {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(128, 138, 160, 0.35);
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  outline: none;
+}
+
+.accountInput:focus {
+  border-color: #3b5bfd;
+}
+
+.accountNotice {
+  padding: 8px 12px;
+  border: 1px solid rgba(0, 180, 150, 0.4);
+  border-radius: 9px;
+  color: #00806b;
+  font-size: 13px;
+}

@@ -14,7 +14,8 @@ import { closeSearchPanel } from '../components/search/searchPanelState.js'
 import { SessionView } from '../components/session/SessionView.js'
 import { MobileHeader } from '../components/session/MobileHeader.js'
 import { Welcome } from '../components/session/Welcome.js'
-import { ensureApiKey } from '../components/settings/settingsDialogState.js'
+import { LoginScreen } from '../components/auth/LoginScreen.js'
+import { initAuth, useAuth } from '../services/auth/store.js'
 import { SettingsDialog } from '../components/settings/SettingsDialog.js'
 import { MemoryDialog } from '../components/memory/MemoryDialog.js'
 import { Toast } from '../components/base/Toast.js'
@@ -25,6 +26,9 @@ import { stopReadAloud } from '../services/speech/readAloud.js'
 import { CollapsedSider } from '../components/sider/CollapsedSider.js'
 import { closeMobileSider } from '../components/sider/mobileSiderState.js'
 import { installDiagnosticsHooks } from '../services/diagnostics.js'
+import { restoreOutbox } from '../services/sync/outbox.js'
+import { startSyncEngine } from '../services/sync/engine.js'
+import { SyncStatusBar } from '../components/sync/SyncStatusBar.js'
 import { MobileSider, Sider } from '../components/sider/Sider.js'
 import styles from './App.module.css'
 
@@ -74,12 +78,19 @@ export const App = () => {
 
   useEffect(() => {
     void initChat()
-    // 首次打开先在设置里输入 API Key
-    ensureApiKey()
+    // 启动时校验登录态：没有令牌 / 令牌失效 → 显示登录页
+    void initAuth()
+    // 上次没发出去的消息要能接着发（队列在 IndexedDB 里，重启不丢）
+    void restoreOutbox()
+    // 联网 / 回到前台时自动补一次同步
+    return startSyncEngine()
   }, [])
+
+  const authStatus = useAuth((state) => state.status)
 
   return (
     <>
+      {authStatus !== 'signedIn' ? <LoginScreen /> : null}
       <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : siderCollapsed ? null : <Sider />}
         <main className={styles.main}>
@@ -96,6 +107,7 @@ export const App = () => {
               </Button>
             </div>
           ) : null}
+          <SyncStatusBar />
           <div className={styles.content}>
             {siderCollapsed ? <CollapsedSider /> : null}
             {!ready || (activeId !== null && !session) ? (

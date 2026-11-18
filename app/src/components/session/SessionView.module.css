@@ -68,3 +68,20 @@
     padding-bottom: env(safe-area-inset-bottom);
   }
 }
+
+/*
+ * 标题栏正中的免责声明。
+ * 用绝对定位而不是 flex 参与排版：标题宽度会随会话名变化，
+ * 让声明真正居中（而不是被标题挤到一边）。
+ */
+.headerCaveat {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}

@@ -8,6 +8,7 @@ import {
   IconFollowsystemOutline16,
   IconLightOutline16,
   IconLinkOutline16,
+  IconRefreshOutline16,
   IconSettingsOutline16,
   IconUploadOutline14,
 } from '../base/icons.js'
@@ -18,8 +19,8 @@ import {
   importHistory,
   type ImportStage,
 } from '../../services/chat/backup.js'
-import { useIsMobile } from '../../app/viewport.js'
 import { useChatStore } from '../../services/chat/store.js'
+import { startCloudSync, useCloudSync } from '../../services/sync/cloudSync.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
   DEFAULT_API_ORIGIN,
@@ -44,7 +45,8 @@ import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { Select } from '../base/Select.js'
 import { showToast } from '../base/toastState.js'
-import { ApiKeyConfirm, ApiKeyField, useApiKeyEditor } from './ApiKeyField.js'
+import { AccountField } from './AccountField.js'
+import { UpstreamKeyField } from './UpstreamKeyField.js'
 import { closeSettings, useSettingsDialog, type SettingsSection } from './settingsDialogState.js'
 import styles from './Settings.module.css'
 
@@ -69,11 +71,9 @@ const sections: { value: SettingsSection; label: TranslationKey; icon: ReactNode
 
 const SettingsContent = () => {
   const t = useTranslate()
-  const isMobile = useIsMobile()
   // 打开时按调用方指定的分组选中，之后在弹窗内切换
   const [section, setSection] = useState(() => useSettingsDialog.getState().section)
-  // 切换分组不丢失正在输入的 API Key 与导入状态
-  const apiKeyEditor = useApiKeyEditor()
+  // 切换分组不丢失导入状态
   const historyImport = useHistoryImport()
   const historyDelete = useHistoryDelete()
   const replacingHistory = useChatStore((state) => state.importingHistory)
@@ -118,7 +118,9 @@ const SettingsContent = () => {
             <AdvancedSettings />
           ) : (
             <>
-              <ApiKeyField editor={apiKeyEditor} />
+              <AccountField />
+              <UpstreamKeyField />
+              <CloudSyncField disabled={historyBusy} />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
               <SettingCell
@@ -136,7 +138,6 @@ const SettingsContent = () => {
                   </Button>
                 }
               />
-              {isMobile ? <ApiKeyConfirm editor={apiKeyEditor} /> : null}
             </>
           )}
           {/* 版本号放在弹窗内部底部：装没装上新版一眼就能确认 */}
@@ -724,8 +725,13 @@ const useHistoryImport = () => {
         })
       } else {
         setStatus({
-          key: result.count === 1 ? 'historyImportedOne' : 'historyImported',
-          params: { count: result.count },
+          key:
+            result.imagesStored > 0
+              ? 'historyImportedWithImages'
+              : result.count === 1
+                ? 'historyImportedOne'
+                : 'historyImported',
+          params: { count: result.count, images: result.imagesStored },
         })
       }
     } catch (error) {
@@ -858,6 +864,115 @@ const ImportHistory = ({
 }
 
 /** 将全部会话及图片导出为 ZIP 文件并下载 */
+/**
+ * 「同步到云端」：把本地会话与附件补推到云端，并把结果显示出来。
+ *
+ * 为什么必须有一个手动入口：
+ *   导入 1000 条历史之后的那次自动推送是 fire-and-forget —— 它失败时界面上**什么都没有**，
+ *   用户只能得出"云端就是没有"这个结论（真实事故）。而重试一次要重发上百 MB，
+ *   所以必须：① 增量（已同步的跳过）② 看得见进度 ③ 能反复点。
+ *
+ * ⚠️ 运行状态**必须放在模块级 store**（`services/sync/cloudSync.ts`），不能放组件里：
+ *   设置弹窗是 `open ? <Modal> : null`，一关就卸载、`useState` 全丢。
+ *   之前就因为这个：关掉设置再回来显示"没在跑"，而旧锁还锁着 → 再点毫无反应。
+ */
+const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
+  const t = useTranslate()
+  const running = useCloudSync((state) => state.running)
+  const progress = useCloudSync((state) => state.progress)
+  const result = useCloudSync((state) => state.result)
+  const error = useCloudSync((state) => state.error)
+  /**
+   * 本机实际存了多少个附件原件。
+   * 这一行是给"附件传不上去"准备的诊断：如果它是 0，说明导入的包里就没有图片，
+   * 再点多少次同步也没用；如果它有几百个却一个都没传上去，那才是别的问题。
+   */
+  const [localFiles, setLocalFiles] = useState<number | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    void import('../../services/chat/db.js')
+      .then((db) => db.countStoredFiles())
+      .then((count) => {
+        if (alive) {
+          setLocalFiles(count)
+        }
+      })
+      .catch(() => undefined)
+    return () => {
+      alive = false
+    }
+  }, [running])
+
+
+  /**
+   * 状态完全由 store 推导：组件重新挂载后看到的是同一份进度，
+   * 不需要（也不能）在组件里重新记一遍。
+   */
+  const status = ((): Status => {
+    if (running) {
+      if (!progress || progress.phase === 'sessions') {
+        return progress && progress.total > 0
+          ? { key: 'cloudSyncSessions', params: { done: progress.done, total: progress.total } }
+          : { key: 'cloudSyncBusy' }
+      }
+      return { key: 'cloudSyncFiles', params: { done: progress.done, total: progress.total } }
+    }
+    if (error) {
+      return { key: 'cloudSyncFailed', params: { message: error }, error: true }
+    }
+    if (!result) {
+      return null
+    }
+    const failed = result.sessionsFailed + result.filesFailed
+    const nothingHappened =
+      result.sessionsPushed === 0 && result.filesUploaded === 0 && result.sessionsSkipped === 0
+    /**
+     * 三种结局要分开说，否则用户没法判断下一步该做什么：
+     *  · 有失败项 → 网络/服务端问题，重试有意义
+     *  · 没有失败、但有"本机缺原件" → 数据本身不完整（导入包没带图片），重试没用
+     *  · 都正常 → 完成
+     */
+    const params = {
+      sessions: result.sessionsPushed,
+      files: result.filesUploaded,
+      skipped: result.sessionsSkipped,
+      failed,
+      localFiles: result.localFiles,
+    }
+    if (nothingHappened && result.error) {
+      return { key: 'cloudSyncFailed', params: { message: result.error }, error: true }
+    }
+    return failed > 0
+      ? { key: 'cloudSyncPartial', params, error: true }
+      : { key: 'cloudSyncDone', params }
+  })()
+
+  return (
+    <SettingCell
+      label={t('cloudSyncLabel')}
+      description={
+        localFiles === null
+          ? t('cloudSyncDescription')
+          : `${t('cloudSyncDescription')} ${t('cloudSyncLocalFiles', { count: localFiles })}`
+      }
+      status={status}
+      action={
+        <Button
+          variant="outlined"
+          size="m"
+          className={styles.cellButton}
+          disabled={disabled || running}
+          onClick={() => void startCloudSync()}
+        >
+          <IconRefreshOutline16 />
+          {t(running ? 'cloudSyncBusy' : 'cloudSyncAction')}
+        </Button>
+      }
+    />
+  )
+}
+
 const ExportHistory = ({ disabled }: { disabled: boolean }) => {
   const t = useTranslate()
   const empty = useChatStore((state) => state.sessions.length === 0)

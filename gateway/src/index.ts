@@ -12,7 +12,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
 import { timingSafeEqual } from 'node:crypto'
-import { appendFile, rename, stat } from 'node:fs/promises'
+import { appendFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { ChatModel } from '../../shared/protocol.js'
 /**
  * ⚠️ 运行时导入必须写 `.ts`：Node 的类型剥离只删类型，**不重写导入说明符**。
@@ -25,10 +26,21 @@ import { createRateLimiter } from './rate-limit.ts'
 /** 客户端诊断日志路径（App 端导入流程上报，见 /client-log 路由） */
 const CLIENT_LOG_PATH = process.env.CLIENT_LOG_PATH ?? '/var/log/ds-gateway/client.log'
 import { MemoryStore, type MemoryScope } from './memory/store.ts'
+import { MemoryRegistry } from './memory/registry.ts'
+import { AuthFailure, AuthStore, keyFingerprint, type User } from './auth/store.ts'
+import { randomBytes } from 'node:crypto'
+import { redactSecrets } from './redact.ts'
+import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
+import { ensureProfile, readProfileConfig } from './memory/profile.ts'
+import { estimateCost, isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
-const VERSION = '1.1.4'
+/**
+ * 网关版本。1.2.x 起：会话同步进入「云端为主」阶段 2（分页游标 + pinned + 墓碑优先）
+ * 与阶段 3（附件引用计数 + 回收）。/health 里能看到它，用来确认线上跑的是哪份代码。
+ */
+const VERSION = '1.2.2'
 const PORT = Number(process.env.PORT ?? 8787)
 /** 默认只监听环回：前面由 Caddy 做 TLS 与反代 */
 const HOST = process.env.HOST ?? '127.0.0.1'
@@ -84,27 +96,249 @@ const limiter = createRateLimiter({
  *  - P2：全局会话的内容进 FTS5 全文索引，跨会话按需召回并注入
  */
 const MEMORY_ENABLED = (process.env.MEMORY_ENABLED ?? '1') !== '0'
-const MEMORY_DB_PATH = process.env.MEMORY_DB_PATH ?? '/var/lib/ds-gateway/memory.db'
+/**
+ * 改造前的单库路径。多用户之后只作为「老库」被吸收到管理员账号目录下，
+ * 新数据一律写到 MEMORY_DATA_DIR/<userId>/memory.db。
+ */
+const LEGACY_MEMORY_DB_PATH = process.env.MEMORY_DB_PATH ?? '/var/lib/ds-gateway/memory.db'
+/** 每用户一个子目录 */
+const MEMORY_DATA_DIR = process.env.MEMORY_DATA_DIR ?? '/var/lib/ds-gateway/users'
+/** 账号与会话 */
+const AUTH_DB_PATH = process.env.AUTH_DB_PATH ?? '/var/lib/ds-gateway/auth.db'
+/** 管理员账号：老网关令牌映射到它，老记忆库也迁到它名下 */
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL ?? 'admin@l-f-cloud.online').trim().toLowerCase()
+/** 不配就随机生成并打印一次（首次部署用） */
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? ''
+/** 是否允许自助注册；关掉就只能由管理员建号 */
+const ALLOW_SIGNUP = (process.env.ALLOW_SIGNUP ?? '1') !== '0'
+/**
+ * 是否允许「没带自己 Key 的请求」回落到实例 Key。
+ * 默认 **关闭**：用户配了自己的 Key 就必须用自己的，
+ * 否则会出现「他以为在花自己的额度，其实在花你的」这种账目错乱。
+ */
+const ALLOW_INSTANCE_KEY = (process.env.ALLOW_INSTANCE_KEY ?? '0') === '1'
+
 /** 本地会话是否也读取全局记忆。默认 0 = 完全隔离（不写也不读），心智模型最简单 */
 const MEMORY_LOCAL_READS_GLOBAL = (process.env.MEMORY_LOCAL_READS_GLOBAL ?? '0') === '1'
 const MEMORY_MAX_HITS = Number(process.env.MEMORY_MAX_HITS ?? 4)
 const MEMORY_MAX_CHARS = Number(process.env.MEMORY_MAX_CHARS ?? 1500)
 
-let memory: MemoryStore | null = null
+let registry: MemoryRegistry | null = null
 if (MEMORY_ENABLED) {
   try {
-    memory = new MemoryStore({
-      dbPath: MEMORY_DB_PATH,
+    registry = new MemoryRegistry({
+      dataDir: MEMORY_DATA_DIR,
       maxHits: MEMORY_MAX_HITS,
       maxChars: MEMORY_MAX_CHARS,
+      legacyPath: LEGACY_MEMORY_DB_PATH,
     })
   } catch (error) {
     // 记忆库起不来**不能让网关挂掉**——聊天是主功能，记忆是增强
     console.error(
       `[gateway] 记忆库初始化失败，将以无记忆模式运行：${error instanceof Error ? error.message : String(error)}`
     )
-    memory = null
+    registry = null
   }
+}
+
+/**
+ * 账号库起不来就**拒绝启动**（与记忆不同）：
+ * 没有账号库 = 无法判断请求属于谁 = 所有人都能看到同一份数据，
+ * 这比「暂时没有记忆」危险得多。
+ */
+const authStore = new AuthStore(AUTH_DB_PATH)
+
+/** 稳定层（长期档案）配置；没有 API key 就等于不启用 */
+const PROFILE = readProfileConfig(process.env)
+
+/**
+ * 用量与缓存统计。
+ *
+ * DeepSeek 返回 prompt_cache_hit_tokens / prompt_cache_miss_tokens，
+ * 不记录就永远不知道缓存到底有没有命中——而这正是"多带原文"能不能成立的前提。
+ */
+/**
+ * 每个会话「最近一轮回答是否写进记忆」。
+ *
+ * 为什么要记：写记忆发生在**流式响应结束之后**，那时响应头早就发出去了，
+ * 没法用头告诉客户端。所以存在内存里，让 App 在回答结束后单独问一次。
+ * 只保留最近一轮，重启即清空（够用：界面要显示的是"刚才这轮"）。
+ */
+const lastRecordBySession = new Map<string, { recorded: boolean; chunks: number; at: number }>()
+
+const usageStats = {
+  requests: 0,
+  promptTokens: 0,
+  cacheHit: 0,
+  cacheMiss: 0,
+  completionTokens: 0,
+}
+
+const recordUsage = (usage: unknown, context?: { userId: string; sessionId: string | null }): void => {
+  if (!usage || typeof usage !== "object") {
+    return
+  }
+  const record = usage as Record<string, unknown>
+  /**
+   * 两套字段都要认：
+   *  · OpenAI 风格（/chat/completions）：prompt_tokens / prompt_cache_hit_tokens
+   *  · Anthropic 风格（/anthropic/v1/messages）：input_tokens / cache_read_input_tokens
+   * 只按其中一套解析，另一条链路就永远是 0（实测踩过）。
+   */
+  const details = record.prompt_tokens_details as Record<string, unknown> | undefined
+  const anthropicStyle = record.input_tokens !== undefined && record.prompt_tokens === undefined
+  const hit = Number(
+    record.prompt_cache_hit_tokens ?? record.cache_read_input_tokens ?? details?.cached_tokens ?? 0
+  )
+  /**
+   * ⚠️ Anthropic 格式里 input_tokens **只是未缓存的部分**，
+   * 总 prompt = input_tokens + cache_read + cache_creation。
+   * 按 OpenAI 的口径去读会把命中率算成 100%（实测踩过）。
+   */
+  const prompt = anthropicStyle
+    ? Number(record.input_tokens) + hit + Number(record.cache_creation_input_tokens ?? 0)
+    : Number(record.prompt_tokens ?? record.input_tokens ?? 0)
+  const miss = anthropicStyle
+    ? Number(record.input_tokens) + Number(record.cache_creation_input_tokens ?? 0)
+    : Number(
+        record.prompt_cache_miss_tokens ??
+          record.cache_creation_input_tokens ??
+          Math.max(0, prompt - hit)
+      )
+  usageStats.requests += 1
+  usageStats.promptTokens += prompt
+  usageStats.cacheHit += hit
+  usageStats.cacheMiss += miss
+  usageStats.completionTokens += Number(record.completion_tokens ?? record.output_tokens ?? 0)
+
+  /**
+   * 写账本：按请求追加，覆盖该 Key 下**所有会话**。
+   * 设置页的「全部会话合计」与和官方后台对照都靠这张表。
+   * 失败只记日志 —— 账本不该影响聊天。
+   */
+  if (context) {
+    try {
+      const outputTokens = Number(record.completion_tokens ?? record.output_tokens ?? 0)
+      const estimate = estimateCost({ cacheHit: hit, cacheMiss: miss, output: outputTokens }, readPriceTable(process.env))
+      authStore.recordUsageEvent({
+        userId: context.userId,
+        sessionId: context.sessionId,
+        model: 'auto',
+        promptHit: hit,
+        promptMiss: miss,
+        output: outputTokens,
+        costCny: estimate.total,
+        peak: estimate.peak,
+      })
+    } catch (error) {
+      console.warn('[gateway] 写用量账本失败:', error instanceof Error ? error.message : error)
+    }
+  }
+  if (hit > 0) {
+    console.log(`[gateway] 缓存命中 ${hit} / 未命中 ${miss}（累计命中率 ${((usageStats.cacheHit / Math.max(1, usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)}%）`)
+  }
+}
+
+/** 邮件通道；没配就退化成"验证码只能打印到日志"（仅开发用） */
+const SMTP: SmtpConfig | null = readSmtpConfig(process.env)
+const MAIL_ENABLED = SMTP !== null
+if (!MAIL_ENABLED) {
+  console.warn('[gateway] 未配置 SMTP_*，邮箱验证码将无法发送（注册/找回不可用）')
+}
+
+/** 验证码有效期与重发冷却 */
+const CODE_TTL_MS = Number(process.env.CODE_TTL_MS ?? 10 * 60_000)
+const CODE_COOLDOWN_MS = Number(process.env.CODE_COOLDOWN_MS ?? 60_000)
+/** 每邮箱每小时最多发几次（内存计数，重启清零；够挡住手滑与轻度滥用） */
+const CODE_HOURLY_LIMIT = Number(process.env.CODE_HOURLY_LIMIT ?? 5)
+const codeHourly = new Map<string, number[]>()
+
+/**
+ * 每账号限流与每日配额。
+ *
+ * 全局限流只能挡住"一个 IP 刷"，挡不住"一个账号被刷爆影响所有人"。
+ * 这里按 user_id 再压一层：
+ *   · 每分钟请求数上限（默认 30）
+ *   · 每日请求数上限（默认 2000）
+ * 计数放内存（重启清零）：配额是防滥用，不是计费依据。
+ */
+const USER_RATE_MAX = Number(process.env.USER_RATE_MAX ?? 30)
+const USER_DAILY_MAX = Number(process.env.USER_DAILY_MAX ?? 2000)
+type UsageBucket = { minuteStart: number; minuteCount: number; day: string; dayCount: number }
+const usageByUser = new Map<string, UsageBucket>()
+
+const checkUserQuota = (userId: string): { allowed: boolean; reason?: 'minute' | 'daily'; retryAfterSeconds?: number } => {
+  const now = Date.now()
+  const day = new Date(now).toISOString().slice(0, 10)
+  let bucket = usageByUser.get(userId)
+  if (!bucket) {
+    bucket = { minuteStart: now, minuteCount: 0, day, dayCount: 0 }
+    usageByUser.set(userId, bucket)
+  }
+  if (now - bucket.minuteStart >= 60_000) {
+    bucket.minuteStart = now
+    bucket.minuteCount = 0
+  }
+  if (bucket.day !== day) {
+    bucket.day = day
+    bucket.dayCount = 0
+  }
+  if (bucket.minuteCount >= USER_RATE_MAX) {
+    return { allowed: false, reason: 'minute', retryAfterSeconds: Math.ceil((bucket.minuteStart + 60_000 - now) / 1000) }
+  }
+  if (bucket.dayCount >= USER_DAILY_MAX) {
+    return { allowed: false, reason: 'daily' }
+  }
+  bucket.minuteCount += 1
+  bucket.dayCount += 1
+  return { allowed: true }
+}
+
+const allowCodeSend = (email: string): boolean => {
+  const now = Date.now()
+  const list = (codeHourly.get(email) ?? []).filter((at) => now - at < 3_600_000)
+  if (list.length >= CODE_HOURLY_LIMIT) {
+    codeHourly.set(email, list)
+    return false
+  }
+  list.push(now)
+  codeHourly.set(email, list)
+  return true
+}
+
+/** 首次部署：没有账号就建一个管理员，密码随机并打印一次 */
+const bootstrapAdmin = (): User => {
+  const existing = authStore.findByEmail(ADMIN_EMAIL)
+  if (existing) {
+    // 确保配置的管理员账号确实是管理员：把 ADMIN_EMAIL 指向自己注册的账号后，
+    // 不需要手工改库，重启即生效
+    if (existing.role !== 'admin') {
+      authStore.setRole(existing.id, 'admin')
+      console.log('[gateway] 已把', existing.email, '提升为管理员')
+      return { ...existing, role: 'admin' }
+    }
+    return existing
+  }
+  const password = ADMIN_PASSWORD || randomBytes(18).toString('base64url')
+  const created = authStore.createUser(ADMIN_EMAIL, password, 'admin')
+  if (ADMIN_PASSWORD) {
+    console.log(`[gateway] 已创建管理员账号 ${created.email}（密码取自 ADMIN_PASSWORD）`)
+  } else {
+    console.log(
+      `[gateway] 已创建管理员账号 ${created.email}，初始密码：${password}
+` +
+        `[gateway] ↑ 这个密码只打印这一次，请立即在 App 里登录并修改`
+    )
+  }
+  return created
+}
+
+const adminUser = bootstrapAdmin()
+
+// 多用户改造之前的数据都在单库里，归到管理员账号下（只做一次）
+const adopted = registry?.adoptLegacy(adminUser.id)
+if (adopted?.adopted) {
+  console.log(`[gateway] 已把改造前的单库迁移到管理员账号 ${adminUser.email} 名下`)
 }
 
 /** 会话 id 只允许安全字符，避免被当成路径或 SQL 拼接素材 */
@@ -193,7 +427,14 @@ const setCorsHeaders = (req: IncomingMessage, res: ServerResponse): boolean => {
   }
   res.setHeader('access-control-allow-origin', origin)
   res.setHeader('access-control-allow-credentials', 'true')
-  res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS')
+  /**
+   * ⚠️ 这里踩过一次大的：原来只有 GET/POST/DELETE。附件上传走的是
+   * `PUT /sync/files/:id`，而 **PUT 一定会触发预检**（简单方法只有 GET/HEAD/POST），
+   * 于是浏览器在预检那一步就把请求拒了 —— 服务端**一个字节都没收到**，
+   * 网关日志里连记录都没有。表现是：会话同步一切正常、附件永远 0 个。
+   * 所以这里必须把服务端真正支持的方法全列上。
+   */
+  res.setHeader('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
   /**
    * 预检通过的条件是：浏览器列出的每一个请求头，都必须在这里出现。
    *
@@ -255,6 +496,33 @@ const sameToken = (given: string, expected: string): boolean => {
   return timingSafeEqual(a, b)
 }
 
+/**
+ * 令牌 → 用户。
+ *
+ * 两种令牌并存：
+ *  - 用户令牌（/auth/login 发的）：多用户的正路
+ *  - 旧网关令牌（GATEWAY_TOKEN）：映射到管理员账号，保证改造前已经装在手机上的
+ *    App 不会因为这次升级突然连不上
+ */
+const userFromToken = (token: string): User | null => {
+  if (!token) {
+    return null
+  }
+  if (GATEWAY_TOKEN && sameToken(token, GATEWAY_TOKEN)) {
+    return adminUser
+  }
+  return authStore.resolveToken(token)
+}
+
+const userFromRequest = (req: IncomingMessage): User | null => {
+  const found = readGatewayToken(req)
+  return found ? userFromToken(found.token) : null
+}
+
+/** 该用户的记忆库；没登录或没启用记忆就返回 null */
+const memoryFor = (user: User | null): MemoryStore | null =>
+  registry && user ? registry.get(user.id) : null
+
 /** App 对不同接口用不同鉴权头：对话走 x-api-key，/models 与语音走 Bearer。两种都认。 */
 type AuthStyle = 'x-api-key' | 'bearer' | 'basic'
 
@@ -289,7 +557,7 @@ const readGatewayToken = (req: IncomingMessage): { token: string; style: AuthSty
   return null
 }
 
-const upstreamHeaders = (req: IncomingMessage, style: AuthStyle): Record<string, string> => {
+const upstreamHeaders = (req: IncomingMessage, style: AuthStyle, apiKey: string): Record<string, string> => {
   const headers: Record<string, string> = {}
   for (const name of FORWARD_REQUEST_HEADERS) {
     const value = req.headers[name]
@@ -299,9 +567,9 @@ const upstreamHeaders = (req: IncomingMessage, style: AuthStyle): Record<string,
   }
   // 关键一步：用真 Key 替换掉客户端的网关令牌，鉴权风格跟随客户端
   if (style === 'x-api-key') {
-    headers['x-api-key'] = API_KEY
+    headers['x-api-key'] = apiKey
   } else {
-    headers.authorization = `Bearer ${API_KEY}`
+    headers.authorization = `Bearer ${apiKey}`
   }
   return headers
 }
@@ -381,15 +649,55 @@ const manageContext = (text: string, budget: number): ManagedBody => {
 }
 
 const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string) => {
-  const auth = readGatewayToken(req)
-  if (!auth) {
-    json(res, 401, { ok: false, error: 'unauthorized', message: '缺少网关令牌' })
+  const user = userFromRequest(req)
+  if (!user) {
+    json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或无效的访问令牌' })
     return
   }
-  if (!sameToken(auth.token, GATEWAY_TOKEN)) {
-    json(res, 401, { ok: false, error: 'unauthorized', message: '网关令牌不正确' })
+  // 每账号限流 / 每日配额：放在最前面，配额满了连上游都不碰
+  const quota = checkUserQuota(user.id)
+  if (!quota.allowed) {
+    if (quota.retryAfterSeconds) {
+      res.setHeader('Retry-After', String(quota.retryAfterSeconds))
+    }
+    json(res, 429, {
+      ok: false,
+      error: 'user_quota',
+      message:
+        quota.reason === 'daily'
+          ? '今日请求数已达上限，明天再来'
+          : `请求过于频繁，请 ${quota.retryAfterSeconds ?? 60} 秒后再试`,
+    })
     return
   }
+  const inbound = readGatewayToken(req)
+  /**
+   * 官方 Key 来自**客户端请求头**，不是服务器配置。
+   * 它只在本次请求的内存里存在：转发完随请求对象回收，
+   * 不写库、不写日志、不进响应。
+   */
+  const clientKey = (readHeader(req, 'x-deepseek-key') ?? '').trim()
+  const upstreamKey = clientKey.length >= 20 ? clientKey : ALLOW_INSTANCE_KEY ? API_KEY : ''
+  if (!upstreamKey) {
+    json(res, 409, {
+      ok: false,
+      error: 'no_upstream_key',
+      message: '还没有填写 DeepSeek 官方 Key，请在设置里填入后重试',
+    })
+    return
+  }
+  // 指纹只在变化时写一次，用于判断「这个账号配过 Key 没有」
+  const fingerprint = keyFingerprint(upstreamKey)
+  const known = authStore.getUpstreamKey(user.id)
+  if (!known || known.fingerprint !== fingerprint) {
+    try {
+      authStore.setUpstreamKey(user.id, upstreamKey)
+    } catch (error) {
+      console.warn('[gateway] 记录 Key 指纹失败（不影响本次请求）:', error instanceof Error ? error.message : error)
+    }
+  }
+  // 本次请求使用**这个用户自己的**记忆库
+  const memory = memoryFor(user)
 
   // 客户端断开时中止上游请求，别让 DeepSeek 那边继续空跑计费。
   // ⚠️ 必须监听 res 而不是 req：req 的 'close' 在请求体正常读完时也会触发。
@@ -494,6 +802,11 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
           now: Date.now(),
           occurrence,
         })
+        lastRecordBySession.set(sessionId, {
+          recorded: recorded.stored,
+          chunks: recorded.chunks,
+          at: Date.now(),
+        })
         if (recorded.stored) {
           stats.memoryWrites += 1
         }
@@ -528,6 +841,54 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
     if (prefix) {
       body = injectRecall(managed.body, prefix)
     }
+
+    /**
+     * 稳定层：长期档案拼进 system。
+     *
+     * 它一天最多重建一次，所以是"逐字节稳定"的前缀 → 吃 1/10 缓存价。
+     * 动态召回必须留在尾部（见 injectRecall 的注释）：把会变的东西放进前缀，
+     * 等于每轮让整段缓存作废。实测稳定前缀 6009 token 时，
+     * 第二次调用命中 5760、只有 249 全价。
+     */
+    if (PROFILE && memory) {
+      try {
+        const profile = await ensureProfile(memory, PROFILE)
+        if (profile.body) {
+          /**
+           * ⚠️ 档案**不放 system**，改成和回忆一起进尾部。
+           *
+           * 原因：档案里是会变的事实（年级、专业、在做什么）。
+           * 放 system 想省缓存，就只能靠"别刷新"保住前缀 —— 那必然记错。
+           * 放尾部则前缀（system + 历史）保持稳定，缓存照旧命中；
+           * 尾部这几百 token 按未命中价算，可以忽略。
+           *
+           * 顺序：档案在前（结论），回忆在后（证据）。
+           */
+          /**
+           * 三段内容，按可信度从高到低排：
+           *  ① 最近你说过的原话（未经摘要，一定最新）
+           *  ② 长期档案（摘要，可能滞后）
+           *  ③ 跨会话回忆（证据，可能已过时）
+           * 用户明确要求"记忆的更新应该是即时的"，所以原话必须原样带上。
+           */
+          const recent = memory
+            .recentUserMessages(PROFILE.recentMessages)
+            .reverse()
+            .map((item) => `- [${new Date(item.createdAt).toISOString().slice(0, 16).replace('T', ' ')}] ${item.body.slice(0, 200)}`)
+            .join('\n')
+          const blocks = [
+            recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
+            ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'),
+            prefix,
+          ].filter(Boolean)
+          body = injectRecall(body, blocks.join('\n\n'))
+        }
+      } catch (error) {
+        console.warn(
+          `[gateway] 长期档案注入失败：${error instanceof Error ? error.message : String(error)}`
+        )
+      }
+    }
   } else {
     body = Readable.toWeb(req) as unknown as FetchBody
   }
@@ -553,6 +914,18 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
       })
       if (recorded.stored) {
         stats.memoryWrites += 1
+        /**
+         * 把这一轮的回答挂到上一条用户消息的切片上。
+         * 记忆只索引用户说的话，但只给问题不给答案，模型就只能复述报错。
+         * 失败不影响聊天：context 只是锦上添花。
+         */
+        try {
+          memory.attachLastAssistantReply(sessionId, text)
+        } catch (error) {
+          console.error(
+            `[gateway] 挂接助手回答失败：${error instanceof Error ? error.message : String(error)}`
+          )
+        }
       }
     } catch (error) {
       console.error(
@@ -565,7 +938,7 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
   try {
     upstream = await fetch(`${UPSTREAM}${pathname}`, {
       method,
-      headers: upstreamHeaders(req, auth.style),
+      headers: upstreamHeaders(req, inbound?.style ?? `x-api-key`, upstreamKey),
       body,
       duplex: 'half',
       signal: controller.signal,
@@ -606,6 +979,28 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
   if (!upstream.body) {
     res.end()
     return
+  }
+
+  /**
+   * 记录用量与缓存命中。
+   * 非流式响应可以整段解析；流式的 usage 只在 SSE 末尾出现，交给下面的 tap 处理。
+   */
+  const contentType = upstream.headers.get('content-type') ?? ''
+  if (contentType.includes('application/json')) {
+    try {
+      const cloned = upstream.clone()
+      void cloned
+        .json()
+        .then((payload: unknown) => {
+          const usage = (payload as { usage?: unknown } | null)?.usage
+          recordUsage(usage, { userId: user.id, sessionId })
+        })
+        .catch(() => {
+          // 解析失败不影响转发
+        })
+    } catch {
+      // clone 失败（已被消费）时静默跳过
+    }
   }
   // 逐帧转发：不缓冲、不聚合，SSE 才能边生成边显示
   const stream = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0])
@@ -668,27 +1063,41 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   // 由 App 把每一步 POST 上来，落成 jsonl，事后直接在服务器上读。
   // 鉴权与聊天接口共用网关令牌；日志按行追加，超过 2 MB 自动轮转。
   if (req.method === 'POST' && url.pathname === '/client-log') {
-    // 令牌也可以走查询参数：客户端用 text/plain 发简单请求可以**绕过 CORS 预检**，
-    // 导入卡死时预检失败会连日志都发不出来（这正是我们最需要日志的时刻）。
-    const queryToken = url.searchParams.get('t') ?? ''
-    const auth = readGatewayToken(req)
-    const token = queryToken || auth?.token || ''
-    if (!sameToken(token, GATEWAY_TOKEN)) {
-      json(res, 401, { ok: false, error: 'unauthorized' })
-      return
-    }
+    /**
+     * ⚠️ 令牌**不能**放查询串：Caddy 的访问日志会记录完整 URL，
+     * 实测泄漏了 97 条带令牌的记录。现在改成两种都不进日志的方式：
+     *   ① 请求头 x-api-key（会触发 CORS 预检，但顺序正常时没问题）
+     *   ② 请求体首行 `x-ds-token: <令牌>`（text/plain 简单请求，无预检）
+     */
     const body = await readBodyCapped(req, 16 * 1024)
     if (!body.ok) {
       json(res, 413, { ok: false, error: 'too_large' })
       return
     }
-    const text = body.buffer.toString('utf8')
+    const rawText = body.buffer.toString('utf8')
+    /**
+     * 令牌来源（两者都不进访问日志）：
+     *  ① 请求头 x-api-key
+     *  ② 请求体首行 `x-ds-token: <令牌>` —— 给「用 text/plain 发简单请求、无预检」的场景
+     */
+    const headerToken = readGatewayToken(req)?.token ?? ''
+    const firstLine = rawText.split('\n', 1)[0] ?? ''
+    const bodyToken = /^x-ds-token:\s*\S+$/.test(firstLine.trim())
+      ? firstLine.trim().replace(/^x-ds-token:\s*/, '')
+      : ''
+    const text = bodyToken ? rawText.slice(firstLine.length + 1) : rawText
+    const token = headerToken || bodyToken
+    if (!token || !userFromToken(token)) {
+      json(res, 401, { ok: false, error: 'unauthorized' })
+      return
+    }
     const line = JSON.stringify({
       at: new Date().toISOString(),
       ip: (typeof req.headers['x-forwarded-for'] === 'string'
             ? req.headers['x-forwarded-for'].split(',')[0].trim()
             : '') || req.socket.remoteAddress || '',
-      entry: text.length > 4000 ? `${text.slice(0, 4000)}…` : text,
+      // 用户可能把官方 Key 贴进任何地方；落盘前一律脱敏
+      entry: redactSecrets(text.length > 4000 ? `${text.slice(0, 4000)}…` : text),
     })
     try {
       await appendFile(CLIENT_LOG_PATH, `${line}\n`)
@@ -704,6 +1113,480 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
+  /**
+   * 账户余额：用**用户自己的 Key** 去问上游，网关不保存任何 Key。
+   * 这个接口只是"带鉴权的转发"，余额数据不落库。
+   */
+  if (req.method === 'GET' && url.pathname === '/usage/balance') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const key = (readHeader(req, 'x-deepseek-key') ?? '').trim()
+    if (key.length < 20) {
+      json(res, 409, { ok: false, error: 'no_upstream_key', message: '还没有填写 DeepSeek API Key' })
+      return
+    }
+    try {
+      const upstreamBalance = await fetch(`${UPSTREAM}/user/balance`, {
+        headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+      })
+      const payload = (await upstreamBalance.json()) as Record<string, unknown>
+      if (!upstreamBalance.ok) {
+        json(res, 502, { ok: false, error: 'balance_failed', message: '查询余额失败，请检查 Key 是否有效' })
+        return
+      }
+      json(res, 200, { ok: true, ...payload })
+    } catch (error) {
+      console.warn('[gateway] 余额查询失败:', error instanceof Error ? error.message : error)
+      json(res, 502, { ok: false, error: 'balance_failed', message: '查询余额失败，请稍后重试' })
+    }
+    return
+  }
+
+  /**
+   * 查询本会话最近一轮回答有没有写进记忆。
+   * App 在回答结束后调一次，用于显示「已存入记忆 / 未存入」。
+   */
+  if (req.method === 'GET' && url.pathname === '/memory/last-turn') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const session = (url.searchParams.get('session') ?? '').trim()
+    if (!session || !SESSION_ID_RE.test(session)) {
+      json(res, 400, { ok: false, error: 'bad_session', message: '缺少有效的会话 id' })
+      return
+    }
+    const record = lastRecordBySession.get(session)
+    json(res, 200, {
+      ok: true,
+      /** null = 这一轮还没走到写记忆那一步（例如还在流式中） */
+      recorded: record ? record.recorded : null,
+      chunks: record?.chunks ?? 0,
+      at: record?.at ?? 0,
+      /** 本会话是否属于"会记忆"的范围（local 范围只记本会话，不跨会话召回） */
+      memoryEnabled: Boolean(user),
+    })
+    return
+  }
+
+  /**
+   * 附件（图片）云端同步。
+   *
+   * 为什么单独存文件而不是塞进会话 JSON：
+   *  · 191 MB 的图片 base64 进 JSON 会膨胀 33%，而且每次同步整条会话都要重传
+   *  · 图片是不可变内容（id 即内容哈希），天然可以按 id 增量同步
+   *
+   * 目录：users/<userId>/files/<fileId>（没有扩展名，类型由 App 侧记录）
+   */
+  if (url.pathname === '/sync/files' && req.method === 'GET') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    try {
+      const dir = join(MEMORY_DATA_DIR, user.id, 'files')
+      const names = await readdir(dir).catch(() => [] as string[])
+      /** 引用计数：客户端据此知道哪些附件是孤儿（阶段 3） */
+      const refs = authStore.fileRefCounts(user.id)
+      const files: Array<{ id: string; size: number; updatedAt: number; refs: number }> = []
+      for (const name of names) {
+        if (name.endsWith('.tmp')) continue
+        const info = await stat(join(dir, name)).catch(() => null)
+        if (info && info.isFile()) {
+          files.push({
+            id: name,
+            size: info.size,
+            updatedAt: Math.round(info.mtimeMs),
+            refs: refs.get(name) ?? 0,
+          })
+        }
+      }
+      json(res, 200, { ok: true, files })
+    } catch (error) {
+      console.warn('[gateway] 附件列表失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'list_failed', message: '读取附件列表失败' })
+    }
+    return
+  }
+
+  if (url.pathname.startsWith('/sync/files/') && req.method === 'PUT') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = decodeURIComponent(url.pathname.slice('/sync/files/'.length))
+    // id 来自客户端，必须挡住路径穿越
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+      json(res, 400, { ok: false, error: 'bad_id', message: '附件 id 不合法' })
+      return
+    }
+    const read = await readBodyCapped(req, 20 * 1024 * 1024)
+    if (!read.ok) {
+      json(res, 413, { ok: false, error: 'too_large', message: '单个附件最大 20MB' })
+      return
+    }
+    try {
+      const dir = join(MEMORY_DATA_DIR, user.id, 'files')
+      await mkdir(dir, { recursive: true })
+      // 先写临时文件再改名：中途断开不会留下半个文件被当成"已同步"
+      const target = join(dir, id)
+      await writeFile(`${target}.tmp`, read.buffer)
+      await rename(`${target}.tmp`, target)
+      json(res, 200, { ok: true, id, size: read.buffer.length })
+    } catch (error) {
+      console.warn('[gateway] 附件写入失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'write_failed', message: '附件写入失败' })
+    }
+    return
+  }
+
+  if (url.pathname.startsWith('/sync/files/') && req.method === 'GET') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = decodeURIComponent(url.pathname.slice('/sync/files/'.length))
+    if (!/^[A-Za-z0-9_-]{8,80}$/.test(id)) {
+      json(res, 400, { ok: false, error: 'bad_id', message: '附件 id 不合法' })
+      return
+    }
+    try {
+      const data = await readFile(join(MEMORY_DATA_DIR, user.id, 'files', id))
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(data.length) })
+      res.end(data)
+    } catch {
+      json(res, 404, { ok: false, error: 'not_found', message: '云端没有这个附件' })
+    }
+    return
+  }
+
+  /**
+   * 附件回收（阶段 3）：删掉「零引用且超过宽限期」的附件。
+   *
+   * 默认 dryRun —— 真删不可逆，默认必须是安全的那一侧，不能指望调用方记得传 dryRun。
+   * 宽限期存在的理由：附件上传与"引用它的会话推上来"之间有真实的时间差，
+   * 刚上传但会话还没同步完的图片，在引用表里就是零引用。
+   */
+  if (req.method === 'POST' && url.pathname === '/sync/files/gc') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const read = await readBodyCapped(req, 64 * 1024)
+    let body: Record<string, unknown> = {}
+    if (read.ok && read.buffer.length > 0) {
+      try {
+        body = JSON.parse(read.buffer.toString('utf8')) as Record<string, unknown>
+      } catch {
+        body = {}
+      }
+    }
+    const dryRun = body.dryRun !== false
+    const graceDays = Math.min(Math.max(Number(body.graceDays ?? 7) || 0, 0), 3650)
+    const refs = authStore.fileRefCounts(user.id)
+    const sessionCount = authStore.countSessions(user.id)
+    /**
+     * 安全护栏：引用表没建起来时，一个文件都不许删。
+     *
+     * 注意判断的是"重建跑过没有"，不是"引用表空不空" ——
+     * 用户删掉最后一条引用附件的会话之后，引用表本来就该是空的，
+     * 那恰恰是需要回收的时刻。只有重建没跑过（迁移失败）时，
+     * 所有文件才会看起来都是零引用，真删一次就清空用户的全部图片。
+     */
+    if (!authStore.refsTrusted()) {
+      json(res, 409, {
+        ok: false,
+        error: 'refs_not_ready',
+        message: '附件引用表尚未建立，已拒绝回收；请先调用 /sync/files/refs/rebuild',
+      })
+      return
+    }
+    try {
+      const dir = join(MEMORY_DATA_DIR, user.id, 'files')
+      const names = await readdir(dir).catch(() => [] as string[])
+      const now = Date.now()
+      const cutoff = now - graceDays * 86_400_000
+      const candidates: Array<{ id: string; size: number; ageDays: number }> = []
+      for (const name of names) {
+        // 只认合法附件 id：.tmp 之类的半截文件不是附件，不该走这条路径
+        if (!/^[A-Za-z0-9_-]{8,80}$/.test(name)) continue
+        if ((refs.get(name) ?? 0) > 0) continue
+        const info = await stat(join(dir, name)).catch(() => null)
+        if (!info?.isFile() || Math.round(info.mtimeMs) > cutoff) continue
+        candidates.push({
+          id: name,
+          size: info.size,
+          ageDays: Math.floor((now - info.mtimeMs) / 86_400_000),
+        })
+      }
+      if (!dryRun) {
+        for (const item of candidates) {
+          await unlink(join(dir, item.id)).catch(() => undefined)
+        }
+      }
+      json(res, 200, {
+        ok: true,
+        dryRun,
+        graceDays,
+        sessions: sessionCount,
+        referencedFiles: refs.size,
+        candidates,
+        removed: dryRun ? 0 : candidates.length,
+      })
+    } catch (error) {
+      console.warn('[gateway] 附件回收失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'gc_failed', message: '附件回收失败' })
+    }
+    return
+  }
+
+  /** 全量重建该账号的附件引用（从会话 payload 重算），修好"计数偏小 → 误删"的前提 */
+  if (req.method === 'POST' && url.pathname === '/sync/files/refs/rebuild') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    try {
+      json(res, 200, { ok: true, ...authStore.rebuildRefs(user.id) })
+    } catch (error) {
+      console.warn('[gateway] 引用重建失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'rebuild_failed', message: '引用重建失败' })
+    }
+    return
+  }
+
+  /**
+   * 会话云端同步：把手机上的会话推到服务器。
+   *
+   * body: { sessions: [{ id, title, createdAt, updatedAt, payload }] }
+   * 返回写入/跳过条数；服务端按 updatedAt 取较新者，旧数据不会覆盖新数据。
+   *
+   * 为什么整条会话存成 JSON：会话结构还会变（分支、附件、引用），
+   * 拆成列每改一次都要迁移，而服务端并不需要理解内容。
+   */
+  if (req.method === 'POST' && url.pathname === '/sync/sessions') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    /**
+     * 会话正文可能很大（一条长对话几百 KB），所以这里用 8MB 上限，
+     * 并自己解析 —— 不能复用 auth 路由里那个 16KB 的 readJsonBody。
+     */
+    const read = await readBodyCapped(req, 8 * 1024 * 1024)
+    if (!read.ok) {
+      json(res, 413, { ok: false, error: 'too_large', message: '单次同步体积过大' })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      body = JSON.parse(read.buffer.toString('utf8')) as Record<string, unknown>
+    } catch {
+      json(res, 400, { ok: false, error: 'bad_json', message: '请求体不是合法 JSON' })
+      return
+    }
+    const list = Array.isArray(body.sessions)
+      ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
+      : []
+    if (list.length === 0) {
+      json(res, 200, { ok: true, written: 0, skipped: 0 })
+      return
+    }
+    // 单次上限：防止有人一次推 10 万条把库撑爆（正常批量是 50 条/次）
+    if (list.length > 500) {
+      json(res, 413, { ok: false, error: 'too_many', message: '一次最多同步 500 条会话' })
+      return
+    }
+    try {
+      const result = authStore.upsertSessions(
+        user.id,
+        list
+          .filter((item) => typeof item.id === 'string' && typeof item.payload === 'string')
+          .map((item) => ({
+            id: String(item.id),
+            title: typeof item.title === 'string' ? item.title : '',
+            createdAt: Number(item.createdAt ?? Date.now()),
+            updatedAt: Number(item.updatedAt ?? Date.now()),
+            pinned: item.pinned === true,
+            /**
+             * 客户端本地算好的附件引用。服务端还会自己从 payload 抽一遍作为兜底，
+             * 但优先用客户端这份：它已经有摘要里的 fileIds，不必再解析几百 KB 的 JSON。
+             */
+            fileIds: Array.isArray(item.fileIds)
+              ? (item.fileIds as unknown[])
+                  .filter((id): id is string => typeof id === 'string')
+                  .slice(0, 200)
+              : undefined,
+            payload: String(item.payload),
+          }))
+      )
+      json(res, 200, { ok: true, ...result })
+    } catch (error) {
+      console.warn('[gateway] 会话同步失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'sync_failed', message: '同步失败，请稍后重试' })
+    }
+    return
+  }
+
+  /**
+   * 会话清单（不含正文）：App 列表**以它为准**（阶段 2-1），本地只是缓存。
+   *
+   * 分页用复合游标（时间 + id）：同一毫秒可能有多条会话，
+   * 只用时间做游标跨页时会漏掉并列的那几条，而客户端翻完最后一页就当拿到全量。
+   */
+  if (req.method === 'GET' && url.pathname === '/sync/sessions') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const since = Number(url.searchParams.get('since') ?? 0) || 0
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 0) || 500, 1), 500)
+    const before = Number(url.searchParams.get('before') ?? 0) || 0
+    const beforeId = url.searchParams.get('beforeId') ?? ''
+    const deletedBefore = Number(url.searchParams.get('deletedBefore') ?? 0) || 0
+    const deletedBeforeId = url.searchParams.get('deletedBeforeId') ?? ''
+    // 多取一条用来判断"还有没有下一页"，比再发一次 count 查询便宜
+    const pagePlusOne = authStore.listSessions(user.id, {
+      since,
+      before,
+      beforeId,
+      limit: limit + 1,
+    })
+    const hasMore = pagePlusOne.length > limit
+    const sessions = pagePlusOne.slice(0, limit)
+    const deletedPlusOne = authStore.listTombstones(user.id, {
+      since,
+      before: deletedBefore,
+      beforeId: deletedBeforeId,
+      limit: limit + 1,
+    })
+    const deletedHasMore = deletedPlusOne.length > limit
+    const deleted = deletedPlusOne.slice(0, limit)
+    const last = sessions.at(-1)
+    const lastDeleted = deleted.at(-1)
+    json(res, 200, {
+      ok: true,
+      sessions,
+      /** 墓碑：这些会话已被删除，客户端要删掉本地副本 */
+      deleted,
+      hasMore,
+      nextBefore: hasMore && last ? last.updatedAt : 0,
+      nextBeforeId: hasMore && last ? last.id : '',
+      deletedHasMore,
+      nextDeletedBefore: deletedHasMore && lastDeleted ? lastDeleted.deletedAt : 0,
+      nextDeletedBeforeId: deletedHasMore && lastDeleted ? lastDeleted.id : '',
+      /** 客户端用它做增量同步的 since（避免用本机时钟，那台手机可能不准） */
+      serverTime: Date.now(),
+    })
+    return
+  }
+
+  /** 删除会话（软删除 + 墓碑，保证能在其它设备上传播） */
+  if (req.method === 'DELETE' && url.pathname === '/sync/session') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = (url.searchParams.get('id') ?? '').trim()
+    if (!id) {
+      json(res, 400, { ok: false, error: 'bad_session', message: '缺少会话 id' })
+      return
+    }
+    try {
+      authStore.deleteSession(user.id, id)
+      json(res, 200, { ok: true })
+    } catch (error) {
+      console.warn('[gateway] 删除会话失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'delete_failed', message: '删除失败，请稍后重试' })
+    }
+    return
+  }
+
+  /** 单条会话全文 */
+  if (req.method === 'GET' && url.pathname === '/sync/session') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const id = (url.searchParams.get('id') ?? '').trim()
+    if (!id) {
+      json(res, 400, { ok: false, error: 'bad_session', message: '缺少会话 id' })
+      return
+    }
+    const found = authStore.readSession(user.id, id)
+    if (!found) {
+      json(res, 404, { ok: false, error: 'not_found', message: '云端没有这条会话' })
+      return
+    }
+    json(res, 200, { ok: true, updatedAt: found.updatedAt, payload: found.payload })
+    return
+  }
+
+  /**
+   * 该账号（= 它绑定的那个 Key）下**所有会话**的用量合计。
+   *
+   * 数据来自服务端账本（usage_events），所以重装、换设备都不会丢，
+   * 覆盖范围是"这个 Key 经本网关发出的全部请求"。
+   * 与官方后台的差别：官方按 Key 汇总、含任何客户端的调用；这里只含经本网关的。
+   */
+  if (req.method === 'GET' && url.pathname === '/usage/total') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const range = (url.searchParams.get('range') ?? 'all').toLowerCase()
+    const now = Date.now()
+    const since =
+      range === 'today'
+        ? new Date(new Date(now).getTime() + 8 * 3_600_000).setUTCHours(0, 0, 0, 0) - 8 * 3_600_000
+        : range === '7d'
+          ? now - 7 * 86_400_000
+          : range === '30d'
+            ? now - 30 * 86_400_000
+            : 0
+    const totals = authStore.usageTotals(user.id, since)
+    json(res, 200, {
+      ok: true,
+      range,
+      since,
+      currency: 'CNY',
+      totals,
+      note: '统计范围：本 Key 经本网关发出的全部请求；官方后台含任何客户端的调用',
+    })
+    return
+  }
+
+  /** 价格表 + 当前是否峰时（前端据此算费用，价格不写死在 App 里） */
+  if (req.method === 'GET' && url.pathname === '/usage/pricing') {
+    const peak = readPriceTable(process.env)
+    const now = new Date()
+    json(res, 200, {
+      ok: true,
+      currency: peak.currency,
+      unit: '元 / 1M tokens',
+      peak: isPeakNow(now),
+      peakTable: peak,
+      offPeakTable: offPeakTable(peak),
+      peakWindows: '北京时间 周一至周五 9:00–12:00、14:00–18:00',
+      note: '估算值，以平台实际扣费为准',
+    })
+    return
+  }
   if (req.method === 'GET' && url.pathname === '/health') {
     json(res, 200, {
       ok: true,
@@ -711,28 +1594,51 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       node: process.version,
       upstream: UPSTREAM,
       defaultModel: DEFAULT_MODEL,
-      hasApiKey: API_KEY.length > 0,
+      /** 实例 Key 仅作可选兜底；用户自带 Key 时永不使用 */
+      instanceKey: ALLOW_INSTANCE_KEY ? (API_KEY.length > 0 ? 'allowed' : 'missing') : 'disabled',
       hasGatewayToken: GATEWAY_TOKEN.length > 0,
       contextBudgetTokens: CONTEXT_BUDGET_TOKENS,
       allowedOrigins: ALLOWED_ORIGINS.length > 0 ? ALLOWED_ORIGINS : 'any (echo)',
-      memory: memory
+      auth: {
+        users: authStore.countUsers(),
+        signupAllowed: ALLOW_SIGNUP,
+        legacyTokenWorks: GATEWAY_TOKEN.length > 0,
+        admin: adminUser.email,
+      },
+      memory: registry
         ? {
             enabled: true,
-            dbPath: MEMORY_DB_PATH,
+            /** 每用户一个库；这里报的是管理员那份作为概览 */
+            dataDir: MEMORY_DATA_DIR,
+            dbPath: registry.pathFor(adminUser.id),
             localReadsGlobal: MEMORY_LOCAL_READS_GLOBAL,
             maxHits: MEMORY_MAX_HITS,
             /** 向量检索是否已启用（配了 embedding 接口才为 true） */
-            vectors: memory.vectorEnabled,
+            vectors: memoryFor(adminUser)?.vectorEnabled ?? false,
             /** P4：记忆新鲜度半衰期与权重修正幅度 */
             decayHalfLifeDays: Number(process.env.MEMORY_DECAY_HALF_LIFE_DAYS ?? 90),
             freshnessBoost: Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25),
-            ...memory.stats(),
+            ...(memoryFor(adminUser)?.stats() ?? { sessions: 0, messages: 0, chunks: 0 }),
           }
         : { enabled: false },
       rateLimit: {
         windowMs: RATE_LIMIT_WINDOW_MS,
         maxPerWindow: RATE_LIMIT_MAX,
         trackedSources: limiter.size(),
+      },
+      /**
+       * 上游用量与缓存命中。
+       * 用来验证「多带原文靠缓存摊薄成本」是否真的成立——
+       * 实测稳定前缀 926 token 时，重复请求命中 768、只有 158 全价。
+       */
+      usage: {
+        ...usageStats,
+        cacheHitRate:
+          usageStats.cacheHit + usageStats.cacheMiss > 0
+            ? Number(
+                ((usageStats.cacheHit / (usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)
+              )
+            : 0,
       },
       stats,
       uptimeSeconds: Math.round(process.uptime()),
@@ -751,6 +1657,408 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       message: `请求过于频繁，请 ${gate.retryAfterSeconds} 秒后重试`,
       retryAfterSeconds: gate.retryAfterSeconds,
     })
+    return
+  }
+
+  // ---- 账号：注册 / 登录 / 登出 / 当前用户 / 改密码 ----
+  if (url.pathname.startsWith('/auth/')) {
+    const fail = (status: number, error: string, message: string) => {
+      json(res, status, { ok: false, error, message })
+    }
+    const readJsonBody = async (): Promise<Record<string, unknown> | null> => {
+      const body = await readBodyCapped(req, 16 * 1024)
+      if (!body.ok) {
+        fail(413, 'body_too_large', '请求体过大')
+        return null
+      }
+      try {
+        const parsed = JSON.parse(body.buffer.toString('utf8')) as unknown
+        return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null
+      } catch {
+        fail(400, 'bad_json', '请求体不是合法 JSON')
+        return null
+      }
+    }
+    const str = (value: unknown): string => (typeof value === 'string' ? value : '')
+    const device = (): string | undefined => {
+      const ua = req.headers['user-agent']
+      return typeof ua === 'string' ? ua : undefined
+    }
+    /** AuthFailure → 合适的 HTTP 状态与错误码 */
+    const authError = (error: unknown) => {
+      if (!(error instanceof AuthFailure)) {
+        console.error('[gateway] 账号接口异常:', error)
+        fail(500, 'internal_error', '服务器内部错误')
+        return
+      }
+      const map: Record<string, [number, string]> = {
+        invalidEmail: [400, '邮箱格式不正确'],
+        badCode: [400, '验证码不正确或已过期'],
+        codeExpired: [400, '验证码已过期，请重新获取'],
+        codeTooManyAttempts: [429, '这条验证码试错次数过多，请重新获取'],
+        tooManyCodes: [429, '发送太频繁，请稍后再试'],
+        mail_failed: [502, '验证码邮件发送失败，请稍后重试'],
+        badUsername: [400, '用户名需 2–20 个字符，只能包含字母/数字/下划线/连字符'],
+        usernameTaken: [409, '这个用户名已被占用'],
+        usernameReserved: [400, '这个用户名被系统保留，请换一个'],
+        usernameTooSoon: [429, '改名太频繁：24 小时内最多 3 次'],
+        weakPassword: [400, '密码至少 8 位'],
+        emailTaken: [409, '该邮箱已注册'],
+        badCredentials: [401, '邮箱或密码不正确'],
+        disabled: [403, '账号已被停用'],
+        invalidToken: [401, '登录状态已失效，请重新登录'],
+      }
+      const [status, message] = map[error.key] ?? [400, '请求无法处理']
+      fail(status, error.key, message)
+    }
+    /**
+     * 对外用户信息：**不含内部 id**。
+     * 内部 id 是记忆库目录名与外键，暴露出去只会给探测提供线索；
+     * 客户端需要"用户标识"时用 publicId（随机、无序）。
+     */
+    const payloadUser = (user: User) => ({
+      publicId: user.publicId,
+      username: user.username,
+      email: user.email,
+      role: user.role,
+      status: user.status,
+      createdAt: user.createdAt,
+    })
+
+    /** 发验证码。用途决定邮件文案，也决定"邮箱是否已注册"要不要报错 */
+    if (req.method === 'POST' && url.pathname === '/auth/send-code') {
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const email = str(body.email).trim()
+      const purpose = str(body.purpose) === 'reset' ? 'reset' : 'register'
+      if (purpose === 'register' && authStore.findByEmail(email)) {
+        fail(409, 'emailTaken', '该邮箱已注册，直接登录或找回密码')
+        return
+      }
+      // ⚠️ 重置密码时无论邮箱是否存在都回 ok，避免被用来探测哪些邮箱注册过
+      const exists = Boolean(authStore.findByEmail(email))
+      if (purpose === 'reset' && !exists) {
+        json(res, 200, { ok: true, cooldownSeconds: Math.ceil(CODE_COOLDOWN_MS / 1000) })
+        return
+      }
+      if (!allowCodeSend(email.toLowerCase())) {
+        fail(429, 'tooManyCodes', '这个邮箱发送太频繁，请稍后再试')
+        return
+      }
+      let code = ''
+      try {
+        code = authStore.issueEmailCode(email, purpose, {
+          cooldownMs: CODE_COOLDOWN_MS,
+          ttlMs: CODE_TTL_MS,
+        })
+      } catch (error) {
+        authError(error)
+        return
+      }
+      if (!SMTP) {
+        console.log(`[gateway] 未配置邮件通道，验证码（${purpose}）: ${email} -> ${code}`)
+        json(res, 200, {
+          ok: true,
+          cooldownSeconds: Math.ceil(CODE_COOLDOWN_MS / 1000),
+          delivered: false,
+        })
+        return
+      }
+      try {
+        await sendMail(SMTP, {
+          to: email,
+          subject:
+            purpose === 'register' ? '【自由的deepseek】注册验证码' : '【自由的deepseek】重置密码验证码',
+          text: [
+            purpose === 'register' ? '你正在注册 自由的deepseek。' : '你正在重置 自由的deepseek 的密码。',
+            '',
+            `验证码：${code}`,
+            '',
+            `有效期为 ${Math.round(CODE_TTL_MS / 60_000)} 分钟。`,
+            '如果这不是你本人的操作，请忽略这封邮件，你的账号不会发生任何变化。',
+          ].join('\n'),
+        })
+      } catch (error) {
+        console.warn('[gateway] 验证码邮件发送失败:', error instanceof Error ? error.message : error)
+        fail(502, 'mail_failed', '验证码邮件发送失败，请稍后重试')
+        return
+      }
+      console.log(`[gateway] 已发送 ${purpose} 验证码到 ${email}`)
+      json(res, 200, { ok: true, cooldownSeconds: Math.ceil(CODE_COOLDOWN_MS / 1000), delivered: true })
+      return
+    }
+
+    /** 重置密码：申请 → 校验码 → 改密并吊销所有会话 */
+    if (req.method === 'POST' && url.pathname === '/auth/reset') {
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const email = str(body.email).trim()
+      const code = str(body.code).trim()
+      const newPassword = str(body.newPassword)
+      const user = authStore.findByEmail(email)
+      if (!user) {
+        // 与"码不对"同一个错误，不泄露邮箱是否存在
+        fail(400, 'badCode', '验证码不正确或已过期')
+        return
+      }
+      try {
+        authStore.verifyEmailCode(email, 'reset', code)
+        authStore.setPassword(user.id, newPassword)
+        authStore.consumeEmailCode(email, 'reset')
+        authStore.clearLoginFailures(email)
+      } catch (error) {
+        authError(error)
+        return
+      }
+      // 改密码会吊销全部会话；给当前设备发一个新的，避免用户"改完就被踢"
+      const session = authStore.createSession(user.id, device())
+      console.log(`[gateway] ${user.email} 通过邮箱验证码重置了密码`)
+      json(res, 200, {
+        ok: true,
+        token: session.token,
+        expiresAt: session.expiresAt,
+        user: payloadUser(user),
+      })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/register') {
+      if (!ALLOW_SIGNUP) {
+        fail(403, 'signup_disabled', '本实例未开放注册，请联系管理员')
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const email = str(body.email).trim()
+      const code = str(body.code).trim()
+      if (!code) {
+        fail(400, 'badCode', '请输入邮箱收到的验证码')
+        return
+      }
+      try {
+        // 先验码再建号：验证码错误时不要留下半个账号
+        authStore.verifyEmailCode(email, 'register', code)
+        const user = authStore.createUser(email, str(body.password), 'user', str(body.username) || undefined)
+        authStore.consumeEmailCode(email, 'register')
+        const session = authStore.createSession(user.id, device())
+        console.log(`[gateway] 新注册（邮箱已验证）：${user.email}`)
+        json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
+      } catch (error) {
+        authError(error)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/login') {
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const email = str(body.email)
+      // 退避期内即使密码正确也拒绝 —— 否则撞库方仍能靠"是否返回 401"区分密码对错
+      const retryAfter = authStore.loginRetryAfter(email)
+      if (retryAfter > 0) {
+        res.setHeader('Retry-After', String(retryAfter))
+        fail(429, 'loginBackoff', `失败次数过多，请 ${retryAfter} 秒后再试`)
+        return
+      }
+      try {
+        const user = authStore.verifyPassword(email, str(body.password))
+        authStore.clearLoginFailures(email)
+        const session = authStore.createSession(user.id, device())
+        json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
+      } catch (error) {
+        if (error instanceof AuthFailure && error.key === 'badCredentials') {
+          const guard = authStore.noteLoginFailure(email)
+          if (guard.retryAfterSeconds > 0) {
+            res.setHeader('Retry-After', String(guard.retryAfterSeconds))
+            fail(429, 'loginBackoff', `失败次数过多，请 ${guard.retryAfterSeconds} 秒后再试`)
+            return
+          }
+        }
+        authError(error)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/logout') {
+      const found = readGatewayToken(req)
+      if (found) {
+        authStore.revokeToken(found.token)
+      }
+      json(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/auth/me') {
+      const user = userFromRequest(req)
+      if (!user) {
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+        return
+      }
+      const store = memoryFor(user)
+      const bound = authStore.getUpstreamKey(user.id)
+      json(res, 200, {
+        ok: true,
+        user: payloadUser(user),
+        /** 只回掩码与指纹；原始 Key 只在设备上 */
+        upstreamKey: bound
+          ? { bound: true, masked: bound.masked, fingerprint: bound.fingerprint, validatedAt: bound.validatedAt }
+          : { bound: false },
+        /** 旧网关令牌登录时是 true：提示前端可以引导去设置密码 */
+        legacyToken: ((inbound: string) => Boolean(inbound) && sameToken(inbound, GATEWAY_TOKEN))(
+          readGatewayToken(req)?.token ?? ''
+        ),
+        memory: store ? store.stats() : null,
+    /** 上游用量与缓存命中（用来验证"多带原文靠缓存摊薄成本"是否成立） */
+    usage: {
+      ...usageStats,
+      cacheHitRate:
+        usageStats.cacheHit + usageStats.cacheMiss > 0
+          ? Number(
+              ((usageStats.cacheHit / (usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)
+            )
+          : 0,
+    },
+      })
+      return
+    }
+
+    if (req.method === 'POST' && url.pathname === '/auth/password') {
+      const user = userFromRequest(req)
+      if (!user) {
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      try {
+        // 用旧网关令牌进来的没有密码，允许直接设置；否则必须先验证旧密码
+        const legacyLogin = sameToken(readGatewayToken(req)?.token ?? '', GATEWAY_TOKEN)
+        if (!legacyLogin) {
+          authStore.verifyPassword(user.email, str(body.oldPassword))
+        }
+        authStore.setPassword(user.id, str(body.newPassword))
+        // 改密码会踢掉所有会话，这里给当前设备重新发一个，避免自己被登出
+        const session = authStore.createSession(user.id, device())
+        json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt })
+      } catch (error) {
+        authError(error)
+      }
+      return
+    }
+
+    /**
+     * 绑定官方 Key。
+     *
+     * 处理完这个请求之后，**服务端只剩一个不可逆指纹**：
+     * 原始 Key 立刻离开内存，不写库、不进日志、不回响应。
+     */
+    if (req.method === 'POST' && url.pathname === '/auth/upstream-key') {
+      const user = userFromRequest(req)
+      if (!user) {
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      const key = str(body.key).trim()
+      if (key.length < 20 || !/^sk-/.test(key)) {
+        fail(400, 'invalid_key', '看起来不是有效的 DeepSeek Key（应以 sk- 开头）')
+        return
+      }
+      // 用它真调一次上游：能列出模型才算有效
+      let valid = false
+      try {
+        const probe = await fetch(`${UPSTREAM}/models`, {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(12_000),
+        })
+        valid = probe.ok
+        await probe.text()
+      } catch (error) {
+        console.warn('[gateway] 校验官方 Key 时网络失败:', error instanceof Error ? error.message : error)
+        fail(502, 'upstream_unreachable', '暂时联系不上 DeepSeek，请稍后重试')
+        return
+      }
+      if (!valid) {
+        fail(400, 'invalid_key', 'DeepSeek 拒绝了这把 Key（可能已失效或输错）')
+        return
+      }
+      const info = authStore.setUpstreamKey(user.id, key)
+      const shared = authStore.fingerprintOwners(info.fingerprint)
+      if (shared > 1) {
+        console.warn(`[gateway] 指纹 ${info.fingerprint} 被 ${shared} 个账号使用，可能存在共用/泄露`)
+      }
+      console.log(`[gateway] ${user.email} 绑定了官方 Key（指纹 ${info.fingerprint}）`)
+      json(res, 200, {
+        ok: true,
+        upstreamKey: { bound: true, masked: info.masked, fingerprint: info.fingerprint, validatedAt: info.validatedAt },
+        /** 同一把 Key 被多个账号用着，前端可提示 */
+        sharedAccounts: shared,
+      })
+      return
+    }
+
+    if (req.method === 'GET' && url.pathname === '/auth/upstream-key') {
+      const user = userFromRequest(req)
+      if (!user) {
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+        return
+      }
+      const info = authStore.getUpstreamKey(user.id)
+      json(res, 200, {
+        ok: true,
+        upstreamKey: info
+          ? { bound: true, masked: info.masked, fingerprint: info.fingerprint, validatedAt: info.validatedAt }
+          : { bound: false },
+      })
+      return
+    }
+
+    if (req.method === 'DELETE' && url.pathname === '/auth/upstream-key') {
+      const user = userFromRequest(req)
+      if (!user) {
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+        return
+      }
+      authStore.clearUpstreamKey(user.id)
+      console.log(`[gateway] ${user.email} 删除了官方 Key 指纹`)
+      json(res, 200, { ok: true })
+      return
+    }
+
+    /** 修改显示名（限频 3 次/24 小时） */
+    if (req.method === 'PATCH' && url.pathname === '/auth/profile') {
+      const user = userFromRequest(req)
+      if (!user) {
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      try {
+        const updated = authStore.setUsername(user.id, str(body.username))
+        json(res, 200, { ok: true, user: payloadUser(updated) })
+      } catch (error) {
+        authError(error)
+      }
+      return
+    }
+
+    fail(404, 'not_found', '没有这个账号接口')
     return
   }
 
@@ -777,11 +2085,17 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       return
     }
 
-    const auth = readGatewayToken(req)
-    if (!auth || !sameToken(auth.token, GATEWAY_TOKEN)) {
-      json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或错误的网关令牌' })
+    const admin = userFromRequest(req)
+    if (!admin) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '缺少或无效的访问令牌' })
       return
     }
+    // 管理页面能列出并删除切片，只给管理员
+    if (admin.role !== 'admin') {
+      json(res, 403, { ok: false, error: 'forbidden', message: '需要管理员账号' })
+      return
+    }
+    const memory = memoryFor(admin)
     if (!memory) {
       json(res, 503, { ok: false, error: 'memory_disabled', message: '记忆库未启用' })
       return
@@ -853,12 +2167,23 @@ const server = createServer((req, res) => {
     } else {
       res.destroy()
     }
-    console.error('[gateway] 未捕获异常:', error)
+    const message = error instanceof Error ? error.message : String(error)
+    /**
+     * 客户端中途断开（手机切网、被系统杀进程、用户退出）是常态，
+     * 但它会让**整批请求静默作废** —— 所以必须带上方法与路径记下来。
+     * 没有路径的话日志里只有一句 "aborted"，根本查不出是哪一步丢的
+     * （真实事故：导入 1000 条会话后云端 0 条，日志里全是没有上下文的 aborted）。
+     */
+    if (message === 'aborted' || message === 'ECONNRESET') {
+      console.warn(`[gateway] 请求中断 ${req.method} ${req.url}: ${message}`)
+    } else {
+      console.error(`[gateway] 未捕获异常 ${req.method} ${req.url}:`, error)
+    }
   })
 })
 
-if (!API_KEY || !GATEWAY_TOKEN) {
-  console.error('[gateway] 拒绝启动：必须同时配置 DEEPSEEK_API_KEY 与 GATEWAY_TOKEN')
+if (!GATEWAY_TOKEN) {
+  console.error('[gateway] 拒绝启动：必须配置 GATEWAY_TOKEN（管理员令牌）')
   process.exit(1)
 }
 

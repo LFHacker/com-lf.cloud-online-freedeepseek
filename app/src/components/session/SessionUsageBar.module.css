@@ -1,0 +1,46 @@
+/*
+ * 标题栏下方的「本对话累计」：一行、低对比、不抢正文。
+ * 刻意不用卡片背景：它不是一块功能区，是会话的元信息（和标题同级）。
+ */
+.bar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 4px;
+  /* 与消息列同宽同位置：这一行属于"会话"，应该和正文左边缘对齐 */
+  box-sizing: border-box;
+  width: calc(var(--message-list-max-width) - 2 * var(--message-list-padding-horizontal));
+  max-width: calc(100% - 40px);
+  margin: 0 auto;
+  padding: 0 0 8px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+  user-select: text;
+}
+
+.label {
+  font-weight: 600;
+  color: var(--dsw-alias-label-secondary);
+  white-space: nowrap;
+}
+
+.item {
+  white-space: nowrap;
+}
+
+.item b {
+  font-weight: 600;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.sep {
+  opacity: 0.45;
+}
+
+@media not all and (min-width: 768px) {
+  .bar {
+    padding: 0 0 6px;
+  }
+}

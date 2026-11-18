@@ -231,3 +231,50 @@ export class AssistantTextCollector {
     return this.text.trim()
   }
 }
+
+/**
+ * 把长期档案拼进 **system**。
+ *
+ * 与 injectRecall 相反：动态检索必须放尾部（每轮都变），
+ * 而稳定档案放 system 才能吃前缀缓存。实测稳定前缀 6009 token 时，
+ * 第二次调用命中 5760、只有 249 全价。
+ *
+ * ⚠️ 前提是这份档案**逐字节稳定**：一天最多重建一次，抖动就会让缓存全部作废。
+ */
+export const injectStable = (jsonText: string, block: string): string => {
+  if (!block) {
+    return jsonText
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonText)
+  } catch {
+    return jsonText
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return jsonText
+  }
+  const record = parsed as Record<string, unknown>
+  if (!Array.isArray(record.messages)) {
+    return jsonText
+  }
+  const messages = [...(record.messages as Array<Record<string, unknown>>)]
+  const systemIndex = messages.findIndex((message) => message.role === "system")
+  const appended = `${block}\n\n`
+  if (systemIndex >= 0) {
+    const current = messages[systemIndex]
+    if (typeof current.content === "string") {
+      // 已拼过就不重复拼（幂等，避免同一请求被处理两次时翻倍）
+      if (current.content.startsWith(block.slice(0, 40))) {
+        return jsonText
+      }
+      messages[systemIndex] = { ...current, content: appended + current.content }
+    } else {
+      return jsonText
+    }
+  } else {
+    // 没有 system 就插到最前面：前缀一样稳定
+    messages.unshift({ role: "system", content: block })
+  }
+  return JSON.stringify({ ...record, messages })
+}

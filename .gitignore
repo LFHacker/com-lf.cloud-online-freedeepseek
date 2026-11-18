@@ -18,18 +18,17 @@ android-app/android/app/build/
 android-app/android/build/
 android-app/android/.gradle/
 android-app/android/local.properties
+android-app/gradle-dist/
 *.apk
 *.aab
 *.ap_
 *.idsig
 
 # ── 密钥与签名（绝不入库）───────────────────────────────────────
-# 临时 GitHub 令牌（用完即删，绝不入库）
+# 任何名字像令牌的文件都不许入库（令牌文件的扩展名不固定）
 .gh-token*
-# 任何名字像令牌的文件都不许入库
 *.token
 *_token*
-
 android-app/keystore.properties
 android-app/keystore/
 *.jks
@@ -58,6 +57,3 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
-
-# 本地 Gradle 分发包（构建缓存，131 MB）
-android-app/gradle-dist/

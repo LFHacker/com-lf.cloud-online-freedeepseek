@@ -24,7 +24,12 @@ export type UserRole = 'admin' | 'user'
 export type UserStatus = 'active' | 'disabled'
 
 export type User = {
+  /** 内部 id：只用于服务端（记忆库目录、外键），**不下发给客户端** */
   id: string
+  /** 对外 id：随机分配、无序，替代内部 id 暴露给客户端 */
+  publicId: string
+  /** 显示名；可改，可重名策略由业务决定（这里要求唯一，防冒充） */
+  username: string | null
   email: string
   role: UserRole
   status: UserStatus
@@ -42,6 +47,10 @@ export type AuthError =
   | 'codeExpired'
   | 'codeTooManyAttempts'
   | 'tooManyCodes'
+  | 'badUsername'
+  | 'usernameTaken'
+  | 'usernameReserved'
+  | 'usernameTooSoon'
 
 /** 认证失败：key 给前端做文案，不包含任何可用于探测的信息 */
 export class AuthFailure extends Error {
@@ -69,6 +78,9 @@ const TOUCH_INTERVAL_MS = 60 * 60 * 1000
 const SCHEMA = `
 create table if not exists users (
   id            text primary key,
+  public_id     text,                        -- 对外 id，随机无序；老库迁移时补
+  username      text,                        -- 显示名，可空；唯一（不区分大小写）
+  username_changed_at integer not null default 0,
   email         text not null unique,        -- 统一小写存储
   password_hash text not null,               -- base64
   password_salt text not null,               -- base64
@@ -91,6 +103,12 @@ create table if not exists auth_sessions (
 );
 create index if not exists idx_auth_sessions_user on auth_sessions(user_id);
 create index if not exists idx_auth_sessions_exp on auth_sessions(expires_at);
+
+/** 改名记录：用于限频（24h 内最多 3 次） */
+create table if not exists username_changes (
+  user_id text not null,
+  at      integer not null
+);
 
 /**
  * 邮箱验证码。只存 sha256(code)；主键 (email,purpose) 保证重发即覆盖，旧码立即失效。
@@ -171,8 +189,62 @@ const isWeakPassword = (password: string, email?: string): boolean => {
   return false
 }
 
+/**
+ * 对外用户 id 的字母表：去掉 0/O/1/I 这些容易看错的字符。
+ * 10 位 ≈ 32^10 ≈ 1.1e15 种，碰撞概率可忽略，但仍然会查库确认。
+ */
+const PUBLIC_ID_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'
+const PUBLIC_ID_LENGTH = 10
+
+const randomPublicId = (): string => {
+  let out = ''
+  for (let i = 0; i < PUBLIC_ID_LENGTH; i += 1) {
+    out += PUBLIC_ID_ALPHABET[randomInt(0, PUBLIC_ID_ALPHABET.length)]
+  }
+  return out
+}
+
+/**
+ * 保留名：防止冒充官方或系统身份（admin / root / support / deepseek …）。
+ * 比对前统一小写，避免 Admin、ADMIN 绕过。
+ */
+const RESERVED_USERNAMES = new Set([
+  'admin', 'administrator', 'root', 'system', 'sys', 'support', 'service', 'staff',
+  'official', 'owner', 'master', 'superuser', 'moderator', 'mod', 'security', 'ops',
+  'api', 'bot', 'guest', 'test', 'demo', 'null', 'undefined', 'anonymous', 'me', 'self',
+  'deepseek', 'freedeepseek', 'dsfree', 'lfhacker',
+])
+
+/**
+ * 用户名规则：2–20 个字符，允许字母/数字/下划线/连字符/中日韩字符。
+ * 不允许首尾是 _ 或 -（看起来像系统保留格式），也不允许纯数字（容易和 id 混淆）。
+ */
+const normalizeUsername = (raw: string): string => raw.trim()
+
+const validateUsername = (raw: string): string => {
+  const name = normalizeUsername(raw)
+  if (name.length < 2 || name.length > 20) {
+    throw new AuthFailure('badUsername')
+  }
+  if (!/^[\p{L}\p{N}_-]+$/u.test(name)) {
+    throw new AuthFailure('badUsername')
+  }
+  if (/^[_-]|[_-]$/.test(name)) {
+    throw new AuthFailure('badUsername')
+  }
+  if (/^\d+$/.test(name)) {
+    throw new AuthFailure('badUsername')
+  }
+  if (RESERVED_USERNAMES.has(name.toLowerCase())) {
+    throw new AuthFailure('usernameReserved')
+  }
+  return name
+}
+
 const toUser = (row: Record<string, unknown>): User => ({
   id: String(row.id),
+  publicId: String(row.public_id ?? ''),
+  username: row.username === null || row.username === undefined ? null : String(row.username),
   email: String(row.email),
   role: row.role === 'admin' ? 'admin' : 'user',
   status: row.status === 'disabled' ? 'disabled' : 'active',
@@ -212,8 +284,48 @@ export class AuthStore {
     this.db.exec('pragma synchronous = NORMAL;')
     this.db.exec('pragma busy_timeout = 3000;')
     this.db.exec(SCHEMA)
+    this.migrate()
     // 过期会话不必等到被访问才清
     this.db.prepare('delete from auth_sessions where expires_at < ?').run(Date.now())
+  }
+
+  /**
+   * 幂等迁移：老库没有 public_id / username 列时补上，并给存量用户分配 public_id。
+   * 用 pragma table_info 判断，而不是靠 try/catch —— ALTER 失败的原因很多，
+   * 把"列已存在"和"真出错"混在一起会掩盖问题。
+   */
+  private migrate(): void {
+    const columns = new Set(
+      (this.db.prepare('pragma table_info(users)').all() as Array<{ name: string }>).map((c) => c.name)
+    )
+    if (!columns.has('public_id')) {
+      this.db.exec('alter table users add column public_id text')
+    }
+    if (!columns.has('username')) {
+      this.db.exec('alter table users add column username text')
+    }
+    if (!columns.has('username_changed_at')) {
+      this.db.exec('alter table users add column username_changed_at integer not null default 0')
+    }
+    // 存量用户补 public_id
+    const pending = this.db
+      .prepare('select id from users where public_id is null or public_id = ?')
+      .all('') as Array<{ id: string }>
+    for (const row of pending) {
+      let candidate = randomPublicId()
+      let tries = 0
+      while (this.db.prepare('select 1 from users where public_id = ?').get(candidate)) {
+        candidate = randomPublicId()
+        if ((tries += 1) > 20) {
+          throw new Error('无法生成唯一的 public_id')
+        }
+      }
+      this.db.prepare('update users set public_id = ? where id = ?').run(candidate, row.id)
+    }
+    this.db.exec('create unique index if not exists idx_users_public_id on users(public_id)')
+    this.db.exec(
+      'create unique index if not exists idx_users_username on users(lower(username)) where username is not null'
+    )
   }
 
   close(): void {
@@ -242,8 +354,17 @@ export class AuthStore {
     return row ? toUser(row) : null
   }
 
-  createUser(email: string, password: string, role: UserRole = 'user'): User {
+  createUser(
+    email: string,
+    password: string,
+    role: UserRole = 'user',
+    rawUsername?: string
+  ): User {
     const normalized = normalizeEmail(email)
+    const username = rawUsername && rawUsername.trim() ? validateUsername(rawUsername) : null
+    if (username && this.findByUsername(username)) {
+      throw new AuthFailure('usernameTaken')
+    }
     if (!EMAIL_RE.test(normalized)) {
       throw new AuthFailure('invalidEmail')
     }
@@ -257,13 +378,24 @@ export class AuthStore {
     const hash = hashPassword(password, salt)
     const id = newUserId()
     const now = Date.now()
+    // public_id 随机且查库确认唯一（碰撞概率极低，但错了很难查，所以宁可多查一次）
+    let publicId = randomPublicId()
+    let tries = 0
+    while (this.db.prepare('select 1 from users where public_id = ?').get(publicId)) {
+      publicId = randomPublicId()
+      if ((tries += 1) > 20) {
+        throw new Error('无法生成唯一的 public_id')
+      }
+    }
     this.db
       .prepare(
-        `insert into users (id, email, password_hash, password_salt, scrypt_n, scrypt_r, scrypt_p, role, status, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+        `insert into users (id, public_id, username, email, password_hash, password_salt, scrypt_n, scrypt_r, scrypt_p, role, status, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
       )
       .run(
         id,
+        publicId,
+        username,
         normalized,
         hash.toString('base64'),
         salt.toString('base64'),
@@ -274,7 +406,60 @@ export class AuthStore {
         now,
         now
       )
-    return { id, email: normalized, role, status: 'active', createdAt: now }
+    return { id, publicId, username, email: normalized, role, status: 'active', createdAt: now }
+  }
+
+  /** 按显示名查（不区分大小写） */
+  findByUsername(name: string): User | null {
+    const row = this.db
+      .prepare('select * from users where lower(username) = lower(?)')
+      .get(normalizeUsername(name)) as Record<string, unknown> | undefined
+    return row ? toUser(row) : null
+  }
+
+  /** 改角色（提权/降权）。只允许服务端引导流程调用，没有对外接口。 */
+  setRole(userId: string, role: UserRole): void {
+    this.db.prepare('update users set role = ?, updated_at = ? where id = ?').run(role, Date.now(), userId)
+  }
+
+  findByPublicId(publicId: string): User | null {
+    const row = this.db.prepare('select * from users where public_id = ?').get(publicId) as
+      | Record<string, unknown>
+      | undefined
+    return row ? toUser(row) : null
+  }
+
+  /**
+   * 改显示名。限频：24 小时内最多 3 次 —— 否则可以被用来反复抢注/骚扰。
+   */
+  setUsername(userId: string, rawUsername: string): User {
+    const username = validateUsername(rawUsername)
+    const owner = this.findById(userId)
+    if (!owner) {
+      throw new AuthFailure('invalidToken')
+    }
+    const existing = this.findByUsername(username)
+    if (existing && existing.id !== userId) {
+      throw new AuthFailure('usernameTaken')
+    }
+    const row = this.db
+      .prepare('select username_changed_at from users where id = ?')
+      .get(userId) as { username_changed_at: number } | undefined
+    const lastChange = row?.username_changed_at ?? 0
+    const DAY = 86_400_000
+    if (lastChange > 0) {
+      const recent = this.db
+        .prepare('select count(*) n from username_changes where user_id = ? and at > ?')
+        .get(userId, Date.now() - DAY) as { n: number }
+      if (recent.n >= 3) {
+        throw new AuthFailure('usernameTooSoon')
+      }
+    }
+    this.db
+      .prepare('update users set username = ?, username_changed_at = ?, updated_at = ? where id = ?')
+      .run(username, Date.now(), Date.now(), userId)
+    this.db.prepare('insert into username_changes (user_id, at) values (?, ?)').run(userId, Date.now())
+    return { ...owner, username }
   }
 
   /** 改密码：同时踢掉该用户所有会话（改密码意味着旧令牌应当失效） */

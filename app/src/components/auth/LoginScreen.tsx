@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import {
   clearAuthError,
@@ -30,35 +30,44 @@ export const LoginScreen = () => {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
-  const [cooldown, setCooldown] = useState(0)
+  const [username, setUsername] = useState('')
+  /**
+   * 倒计时按**截止时间戳**算，而不是自己每秒减一。
+   *
+   * 原因：手机放进后台后 WebView 会节流/暂停定时器，减数法会停在那儿不动
+   * （用户实测：切到后台再回来，倒计时卡住）。存截止时间的话，
+   * 回到前台哪怕一个回调都没跑，重算一次差值就正确了。
+   */
+  const [deadline, setDeadline] = useState(0)
+  const [now, setNow] = useState(() => Date.now())
   const [notice, setNotice] = useState<string | null>(null)
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  useEffect(
-    () => () => {
-      if (timer.current) {
-        clearInterval(timer.current)
+  const cooldown = Math.max(0, Math.ceil((deadline - now) / 1000))
+
+  useEffect(() => {
+    if (deadline === 0) {
+      return
+    }
+    const tick = () => setNow(Date.now())
+    // 后台回来时立刻重算一次，不等下一个 interval
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        tick()
       }
-    },
-    []
-  )
+    }
+    const id = setInterval(tick, 500)
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', tick)
+    return () => {
+      clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', tick)
+    }
+  }, [deadline])
 
   const startCooldown = (seconds: number) => {
-    setCooldown(seconds)
-    if (timer.current) {
-      clearInterval(timer.current)
-    }
-    timer.current = setInterval(() => {
-      setCooldown((value) => {
-        if (value <= 1) {
-          if (timer.current) {
-            clearInterval(timer.current)
-          }
-          return 0
-        }
-        return value - 1
-      })
-    }, 1000)
+    setNow(Date.now())
+    setDeadline(Date.now() + seconds * 1000)
   }
 
   const switchMode = (next: Mode) => {
@@ -98,7 +107,7 @@ export const LoginScreen = () => {
       return
     }
     if (mode === 'signUp') {
-      await signUp(email, password, code)
+      await signUp(email, password, code, username.trim())
     } else {
       await resetWithCode(email, code, password)
     }
@@ -164,6 +173,21 @@ export const LoginScreen = () => {
               onChange={(event) => setEmail(event.target.value)}
             />
           </label>
+
+          {mode === 'signUp' ? (
+            <label className={styles.field}>
+              <span className={styles.label}>{t('loginUsername')}</span>
+              <input
+                className={styles.input}
+                type="text"
+                autoComplete="nickname"
+                maxLength={20}
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder={t('loginUsernameHint')}
+              />
+            </label>
+          ) : null}
 
           {needsCode ? (
             <label className={styles.field}>

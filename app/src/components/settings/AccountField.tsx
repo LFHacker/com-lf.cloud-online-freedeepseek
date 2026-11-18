@@ -3,6 +3,8 @@ import { useTranslate } from '../../i18n/index.js'
 import { changePassword } from '../../services/auth/client.js'
 import { replaceToken, signOut, useAuth } from '../../services/auth/store.js'
 import { apiOrigin } from '../../services/api/client.js'
+import { renameSelf } from '../../services/auth/client.js'
+import { useSettings } from '../../services/settings.js'
 import styles from './Settings.module.css'
 
 /**
@@ -20,6 +22,9 @@ export const AccountField = () => {
   const [confirm, setConfirm] = useState('')
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null)
+  const [editingName, setEditingName] = useState(false)
+  const [draftName, setDraftName] = useState('')
+  const [nameBusy, setNameBusy] = useState(false)
 
   const origin = apiOrigin()
 
@@ -71,6 +76,9 @@ export const AccountField = () => {
             <div className={styles.accountMeta}>
               {user?.role === 'admin' ? t('accountRoleAdmin') : t('accountRoleUser')} · {origin}
             </div>
+            <div className={styles.accountMeta}>
+              {t('accountUsername')}：{user?.username ?? '—'} · {t('accountPublicId')}：{user?.publicId ?? '—'}
+            </div>
           </div>
           <button
             type="button"
@@ -80,6 +88,62 @@ export const AccountField = () => {
             {t('accountSignOut')}
           </button>
         </div>
+
+        {editingName ? (
+          <div className={styles.accountForm}>
+            <input
+              className={styles.accountInput}
+              type="text"
+              maxLength={20}
+              placeholder={t('loginUsernameHint')}
+              value={draftName}
+              onChange={(event) => setDraftName(event.target.value)}
+            />
+            <div className={styles.accountFormActions}>
+              <button
+                type="button"
+                className={styles.accountAction}
+                disabled={nameBusy || !draftName.trim()}
+                onClick={() => {
+                  void (async () => {
+                    setNameBusy(true)
+                    setNotice(null)
+                    try {
+                      const token = useSettings.getState().apiKey ?? ''
+                      const updated = await renameSelf(token, draftName.trim())
+                      useAuth.setState({ user: updated })
+                      setEditingName(false)
+                      setNotice({ text: t('accountNameChanged'), error: false })
+                    } catch (error) {
+                      setNotice({
+                        text: error instanceof Error && error.message ? error.message : t('accountNameFailed'),
+                        error: true,
+                      })
+                    } finally {
+                      setNameBusy(false)
+                    }
+                  })()
+                }}
+              >
+                {nameBusy ? t('loginSubmitting') : t('confirm')}
+              </button>
+              <button type="button" className={styles.accountSecondary} onClick={() => setEditingName(false)}>
+                {t('cancel')}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            className={styles.accountSecondary}
+            onClick={() => {
+              setDraftName(user?.username ?? '')
+              setEditingName(true)
+            }}
+          >
+            {t('accountChangeName')}
+          </button>
+        )}
 
         {changing ? (
           <div className={styles.accountForm}>

@@ -8,7 +8,9 @@
 import { ApiError, apiOrigin } from '../api/client.js'
 
 export type AuthUser = {
-  id: string
+  /** 对外 id（随机、无序）；内部 id 不再下发给客户端 */
+  publicId: string
+  username: string | null
   email: string
   role: 'admin' | 'user'
   status: string
@@ -80,8 +82,13 @@ const get = async <T>(path: string, token: string): Promise<T> => {
 export const login = (email: string, password: string): Promise<AuthSession> =>
   post<AuthSession>('/auth/login', { email, password })
 
-export const register = (email: string, password: string, code: string): Promise<AuthSession> =>
-  post<AuthSession>('/auth/register', { email, password, code })
+export const register = (
+  email: string,
+  password: string,
+  code: string,
+  username?: string
+): Promise<AuthSession> =>
+  post<AuthSession>('/auth/register', { email, password, code, ...(username ? { username } : {}) })
 
 export const logout = (token: string): Promise<unknown> => post('/auth/logout', {}, token)
 
@@ -148,3 +155,17 @@ export const sendCode = (email: string, purpose: 'register' | 'reset'): Promise<
 /** 用验证码重置密码；成功后直接返回新会话，不用再登录一次 */
 export const resetPassword = (email: string, code: string, newPassword: string): Promise<AuthSession> =>
   post<AuthSession>('/auth/reset', { email, code, newPassword })
+
+/** 修改显示名（服务端限频 3 次/24 小时） */
+export const renameSelf = async (token: string, username: string): Promise<AuthUser> => {
+  const response = await fetch(`${apiOrigin()}/auth/profile`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': token },
+    body: JSON.stringify({ username }),
+  })
+  if (!response.ok) {
+    await toError(response)
+  }
+  const body = (await response.json()) as { user: AuthUser }
+  return body.user
+}

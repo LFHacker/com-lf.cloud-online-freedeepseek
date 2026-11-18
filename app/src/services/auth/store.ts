@@ -80,10 +80,10 @@ export const signIn = async (email: string, password: string): Promise<boolean> 
   }
 }
 
-export const signUp = async (email: string, password: string, code: string): Promise<boolean> => {
+export const signUp = async (email: string, password: string, code: string, username?: string): Promise<boolean> => {
   useAuth.setState({ busy: true, error: null })
   try {
-    applySession(await api.register(email.trim(), password, code.trim()))
+    applySession(await api.register(email.trim(), password, code.trim(), username?.trim()))
     return true
   } catch (error) {
     useAuth.setState({ busy: false, error: message(error) })

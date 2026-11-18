@@ -212,6 +212,13 @@ const allowCodeSend = (email: string): boolean => {
 const bootstrapAdmin = (): User => {
   const existing = authStore.findByEmail(ADMIN_EMAIL)
   if (existing) {
+    // 确保配置的管理员账号确实是管理员：把 ADMIN_EMAIL 指向自己注册的账号后，
+    // 不需要手工改库，重启即生效
+    if (existing.role !== 'admin') {
+      authStore.setRole(existing.id, 'admin')
+      console.log('[gateway] 已把', existing.email, '提升为管理员')
+      return { ...existing, role: 'admin' }
+    }
     return existing
   }
   const password = ADMIN_PASSWORD || randomBytes(18).toString('base64url')
@@ -1011,6 +1018,10 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         codeTooManyAttempts: [429, '这条验证码试错次数过多，请重新获取'],
         tooManyCodes: [429, '发送太频繁，请稍后再试'],
         mail_failed: [502, '验证码邮件发送失败，请稍后重试'],
+        badUsername: [400, '用户名需 2–20 个字符，只能包含字母/数字/下划线/连字符'],
+        usernameTaken: [409, '这个用户名已被占用'],
+        usernameReserved: [400, '这个用户名被系统保留，请换一个'],
+        usernameTooSoon: [429, '改名太频繁：24 小时内最多 3 次'],
         weakPassword: [400, '密码至少 8 位'],
         emailTaken: [409, '该邮箱已注册'],
         badCredentials: [401, '邮箱或密码不正确'],
@@ -1020,8 +1031,14 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       const [status, message] = map[error.key] ?? [400, '请求无法处理']
       fail(status, error.key, message)
     }
+    /**
+     * 对外用户信息：**不含内部 id**。
+     * 内部 id 是记忆库目录名与外键，暴露出去只会给探测提供线索；
+     * 客户端需要"用户标识"时用 publicId（随机、无序）。
+     */
     const payloadUser = (user: User) => ({
-      id: user.id,
+      publicId: user.publicId,
+      username: user.username,
       email: user.email,
       role: user.role,
       status: user.status,
@@ -1147,7 +1164,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         // 先验码再建号：验证码错误时不要留下半个账号
         authStore.verifyEmailCode(email, 'register', code)
-        const user = authStore.createUser(email, str(body.password))
+        const user = authStore.createUser(email, str(body.password), 'user', str(body.username) || undefined)
         authStore.consumeEmailCode(email, 'register')
         const session = authStore.createSession(user.id, device())
         console.log(`[gateway] 新注册（邮箱已验证）：${user.email}`)
@@ -1328,6 +1345,26 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       authStore.clearUpstreamKey(user.id)
       console.log(`[gateway] ${user.email} 删除了官方 Key 指纹`)
       json(res, 200, { ok: true })
+      return
+    }
+
+    /** 修改显示名（限频 3 次/24 小时） */
+    if (req.method === 'PATCH' && url.pathname === '/auth/profile') {
+      const user = userFromRequest(req)
+      if (!user) {
+        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        return
+      }
+      const body = await readJsonBody()
+      if (!body) {
+        return
+      }
+      try {
+        const updated = authStore.setUsername(user.id, str(body.username))
+        json(res, 200, { ok: true, user: payloadUser(updated) })
+      } catch (error) {
+        authError(error)
+      }
       return
     }
 

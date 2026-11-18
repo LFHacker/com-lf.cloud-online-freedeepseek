@@ -334,6 +334,66 @@ try {
     check('成功登录后清零', store.loginRetryAfter(user.email) === 0)
     store.close()
   }
+  // ── 12. 对外 id 与用户名 ───────────────────────────────
+  {
+    const store = new AuthStore(join(dir, 'auth-identity.db'))
+    const user = store.createUser('id@example.com', 'Identity-Pass-9')
+
+    check('分配了 publicId', /^[2-9A-HJ-NP-Z]{10}$/.test(user.publicId), user.publicId)
+    check('publicId 与内部 id 不同', user.publicId !== user.id)
+    check('未指定用户名时为空', user.username === null)
+
+    const second = store.createUser('id2@example.com', 'Identity-Pass-9')
+    check('两个用户的 publicId 不同', second.publicId !== user.publicId)
+    check('两个 publicId 都不是递增序号',
+      second.publicId !== String(Number(user.publicId) + 1))
+
+    const named = store.createUser('id3@example.com', 'Identity-Pass-9', 'user', '小明_2026')
+    check('可指定中文用户名', named.username === '小明_2026', String(named.username))
+
+    // 保留名
+    for (const reserved of ['admin', 'root', 'support', 'deepseek', 'ADMIN', 'Admin']) {
+      let blocked = false
+      try {
+        store.createUser(`r${Math.random().toString(36).slice(2, 8)}@example.com`, 'Identity-Pass-9', 'user', reserved)
+      } catch (e) {
+        blocked = e instanceof AuthFailure && e.key === 'usernameReserved'
+      }
+      check(`保留名被拒：${reserved}`, blocked)
+    }
+
+    // 非法格式
+    for (const bad of ['a', 'x'.repeat(21), '-abc', 'abc-', '12', 'has space', 'bad!name']) {
+      let blocked = false
+      try {
+        store.createUser(`b${Math.random().toString(36).slice(2, 8)}@example.com`, 'Identity-Pass-9', 'user', bad)
+      } catch (e) {
+        blocked = e instanceof AuthFailure && e.key === 'badUsername'
+      }
+      check(`非法用户名被拒：${bad}`, blocked)
+    }
+
+    // 重名（大小写不敏感）
+    let dup = false
+    try {
+      store.createUser('id4@example.com', 'Identity-Pass-9', 'user', '小明_2026'.toUpperCase())
+    } catch (e) {
+      dup = e instanceof AuthFailure && e.key === 'usernameTaken'
+    }
+    check('重名被拒（大小写不敏感）', dup)
+
+    // 改名 + 限频
+    const renamed = store.setUsername(named.id, '新名字')
+    check('改名成功', renamed.username === '新名字', String(renamed.username))
+    store.setUsername(named.id, '再改一次')
+    store.setUsername(named.id, '第三次')
+    let tooSoon = false
+    try { store.setUsername(named.id, '第四次') } catch (e) {
+      tooSoon = e instanceof AuthFailure && e.key === 'usernameTooSoon'
+    }
+    check('24 小时内第 4 次改名被拒', tooSoon)
+    store.close()
+  }
   console.log(`\n=== PASS=${pass}  FAIL=${fail} ===`)
 if (fail > 0) {
   process.exitCode = 1

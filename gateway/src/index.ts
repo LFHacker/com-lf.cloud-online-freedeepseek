@@ -33,7 +33,7 @@ import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
 import { ensureProfile, readProfileConfig } from './memory/profile.ts'
-import { isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
+import { estimateCost, isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
 const VERSION = '1.1.4'
 const PORT = Number(process.env.PORT ?? 8787)
@@ -169,7 +169,7 @@ const usageStats = {
   completionTokens: 0,
 }
 
-const recordUsage = (usage: unknown): void => {
+const recordUsage = (usage: unknown, context?: { userId: string; sessionId: string | null }): void => {
   if (!usage || typeof usage !== "object") {
     return
   }
@@ -205,6 +205,30 @@ const recordUsage = (usage: unknown): void => {
   usageStats.cacheHit += hit
   usageStats.cacheMiss += miss
   usageStats.completionTokens += Number(record.completion_tokens ?? record.output_tokens ?? 0)
+
+  /**
+   * 写账本：按请求追加，覆盖该 Key 下**所有会话**。
+   * 设置页的「全部会话合计」与和官方后台对照都靠这张表。
+   * 失败只记日志 —— 账本不该影响聊天。
+   */
+  if (context) {
+    try {
+      const outputTokens = Number(record.completion_tokens ?? record.output_tokens ?? 0)
+      const estimate = estimateCost({ cacheHit: hit, cacheMiss: miss, output: outputTokens }, readPriceTable(process.env))
+      authStore.recordUsageEvent({
+        userId: context.userId,
+        sessionId: context.sessionId,
+        model: 'auto',
+        promptHit: hit,
+        promptMiss: miss,
+        output: outputTokens,
+        costCny: estimate.total,
+        peak: estimate.peak,
+      })
+    } catch (error) {
+      console.warn('[gateway] 写用量账本失败:', error instanceof Error ? error.message : error)
+    }
+  }
   if (hit > 0) {
     console.log(`[gateway] 缓存命中 ${hit} / 未命中 ${miss}（累计命中率 ${((usageStats.cacheHit / Math.max(1, usageStats.cacheHit + usageStats.cacheMiss)) * 100).toFixed(1)}%）`)
   }
@@ -957,7 +981,7 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
         .json()
         .then((payload: unknown) => {
           const usage = (payload as { usage?: unknown } | null)?.usage
-          recordUsage(usage)
+          recordUsage(usage, { userId: user.id, sessionId })
         })
         .catch(() => {
           // 解析失败不影响转发
@@ -1134,6 +1158,41 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       at: record?.at ?? 0,
       /** 本会话是否属于"会记忆"的范围（local 范围只记本会话，不跨会话召回） */
       memoryEnabled: Boolean(user),
+    })
+    return
+  }
+
+  /**
+   * 该账号（= 它绑定的那个 Key）下**所有会话**的用量合计。
+   *
+   * 数据来自服务端账本（usage_events），所以重装、换设备都不会丢，
+   * 覆盖范围是"这个 Key 经本网关发出的全部请求"。
+   * 与官方后台的差别：官方按 Key 汇总、含任何客户端的调用；这里只含经本网关的。
+   */
+  if (req.method === 'GET' && url.pathname === '/usage/total') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const range = (url.searchParams.get('range') ?? 'all').toLowerCase()
+    const now = Date.now()
+    const since =
+      range === 'today'
+        ? new Date(new Date(now).getTime() + 8 * 3_600_000).setUTCHours(0, 0, 0, 0) - 8 * 3_600_000
+        : range === '7d'
+          ? now - 7 * 86_400_000
+          : range === '30d'
+            ? now - 30 * 86_400_000
+            : 0
+    const totals = authStore.usageTotals(user.id, since)
+    json(res, 200, {
+      ok: true,
+      range,
+      since,
+      currency: 'CNY',
+      totals,
+      note: '统计范围：本 Key 经本网关发出的全部请求；官方后台含任何客户端的调用',
     })
     return
   }

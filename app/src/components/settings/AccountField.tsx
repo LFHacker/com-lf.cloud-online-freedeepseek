@@ -4,7 +4,7 @@ import { changePassword } from '../../services/auth/client.js'
 import { replaceToken, signOut, useAuth } from '../../services/auth/store.js'
 import { apiOrigin } from '../../services/api/client.js'
 import { renameSelf } from '../../services/auth/client.js'
-import { loadBalance, type BalanceInfo } from '../../services/usage/index.js'
+import { loadBalance, loadUsageTotals, type BalanceInfo, type UsageTotals } from '../../services/usage/index.js'
 import { useSettings } from '../../services/settings.js'
 import styles from './Settings.module.css'
 
@@ -27,6 +27,8 @@ export const AccountField = () => {
   const [draftName, setDraftName] = useState('')
   const [nameBusy, setNameBusy] = useState(false)
   const [balance, setBalance] = useState<BalanceInfo[] | null>(null)
+  /** 全部会话合计（服务端账本，用于与官方后台对照） */
+  const [totals, setTotals] = useState<UsageTotals | null>(null)
 
   // 余额只在打开设置时拉一次；失败就静默不显示，不要为它弹错误
   useEffect(() => {
@@ -34,6 +36,11 @@ export const AccountField = () => {
     void loadBalance().then((result) => {
       if (alive && result) {
         setBalance(result.infos)
+      }
+    })
+    void loadUsageTotals('all').then((result) => {
+      if (alive && result) {
+        setTotals(result)
       }
     })
     return () => {
@@ -91,6 +98,16 @@ export const AccountField = () => {
             <div className={styles.accountMeta}>
               {user?.role === 'admin' ? t('accountRoleAdmin') : t('accountRoleUser')} · {origin}
             </div>
+            {totals ? (
+              <div className={styles.accountMeta}>
+                {t('accountUsageAll')}：{totals.requests} {t('statsRequests')} ·{' '}
+                {t('statsTotalInput')} {(totals.promptHit + totals.promptMiss).toLocaleString()} token
+                （{t('statsCacheOf')}{' '}
+                {Math.round((totals.promptHit / Math.max(1, totals.promptHit + totals.promptMiss)) * 100)}%{' '}
+                {t('statsCacheHit')}） · {t('statsTotalOutput')} {totals.output.toLocaleString()} token ·{' '}
+                {t('statsTotalCost')} ¥{totals.costCny.toFixed(4)}
+              </div>
+            ) : null}
             {balance && balance.length > 0 ? (
               <div className={styles.accountMeta}>
                 {t('accountBalance')}：

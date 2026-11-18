@@ -174,6 +174,8 @@ export const zh = {
   statsTotalInput: '总输入',
   statsTotalOutput: '总输出',
   statsTotalCost: '总费用约',
+  accountUsageAll: '全部会话合计',
+  statsRequests: '次请求',
   loginTitle: '自由的deepseek',
   loginSignIn: '登录',
   loginSignUp: '注册',

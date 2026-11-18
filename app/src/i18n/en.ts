@@ -179,6 +179,8 @@ export const en = {
   statsTotalInput: 'Total input',
   statsTotalOutput: 'Total output',
   statsTotalCost: 'Total cost about',
+  accountUsageAll: 'All conversations',
+  statsRequests: 'requests',
   loginTitle: 'Freedeepseek',
   loginSignIn: 'Sign in',
   loginSignUp: 'Sign up',

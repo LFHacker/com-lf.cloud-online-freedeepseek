@@ -162,6 +162,31 @@ export const sumUsage = (list: UsageNumbers[]): UsageNumbers =>
     { cacheHit: 0, cacheMiss: 0, output: 0 }
   )
 
+export type UsageTotals = {
+  requests: number
+  promptHit: number
+  promptMiss: number
+  output: number
+  costCny: number
+  byDay: Array<{ day: string; requests: number; hit: number; miss: number; output: number; costCny: number }>
+}
+
+/** 该账号下**所有会话**的合计（服务端账本，重装/换设备都不丢） */
+export const loadUsageTotals = async (range: 'today' | '7d' | '30d' | 'all' = 'all'): Promise<UsageTotals | null> => {
+  try {
+    const response = await fetch(`${apiOrigin()}/usage/total?range=${range}`, {
+      headers: { 'x-api-key': sessionToken() },
+    })
+    if (!response.ok) {
+      return null
+    }
+    const payload = (await response.json()) as { totals?: UsageTotals }
+    return payload.totals ?? null
+  } catch {
+    return null
+  }
+}
+
 /** 余额（用用户自己的 Key，网关只转发） */
 export const loadBalance = async (): Promise<{ available: boolean; infos: BalanceInfo[] } | null> => {
   const key = upstreamKey()

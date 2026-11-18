@@ -105,6 +105,29 @@ create index if not exists idx_auth_sessions_user on auth_sessions(user_id);
 create index if not exists idx_auth_sessions_exp on auth_sessions(expires_at);
 
 /** 改名记录：用于限频（24h 内最多 3 次） */
+/**
+ * 用量账本。
+ *
+ * 为什么落在服务端：手机端只在消息里存 usage，重装/换设备就没了，
+ * 也没法回答"这个 Key 下所有会话一共多少"。账本按请求追加，
+ * 天然覆盖全部会话，可供设置页合计与官方后台对照。
+ *
+ * 只记数字，不记内容 —— 账本不是日志，不该成为隐私面。
+ */
+create table if not exists usage_events (
+  id            text primary key,
+  user_id       text not null,
+  session_id    text,
+  model         text,
+  prompt_hit    integer not null default 0,
+  prompt_miss   integer not null default 0,
+  output_tokens integer not null default 0,
+  cost_cny      real not null default 0,
+  peak          integer not null default 0,
+  created_at    integer not null
+);
+create index if not exists idx_usage_user_time on usage_events(user_id, created_at desc);
+
 create table if not exists username_changes (
   user_id text not null,
   at      integer not null
@@ -572,6 +595,106 @@ export class AuthStore {
 
   revokeAll(userId: string): void {
     this.db.prepare('delete from auth_sessions where user_id = ?').run(userId)
+  }
+
+  // ── 用量账本 ──────────────────────────────────────────
+
+  /** 追加一条用量（每次上游调用一条） */
+  recordUsageEvent(params: {
+    userId: string
+    sessionId: string | null
+    model: string
+    promptHit: number
+    promptMiss: number
+    output: number
+    costCny: number
+    peak: boolean
+    now?: number
+  }): void {
+    const now = params.now ?? Date.now()
+    const id = createHash('sha256')
+      .update([params.userId, params.sessionId ?? '', String(now), String(Math.random())].join('|'))
+      .digest('hex')
+      .slice(0, 24)
+    this.db
+      .prepare(
+        `insert into usage_events
+           (id, user_id, session_id, model, prompt_hit, prompt_miss, output_tokens, cost_cny, peak, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        params.userId,
+        params.sessionId,
+        params.model,
+        params.promptHit,
+        params.promptMiss,
+        params.output,
+        params.costCny,
+        params.peak ? 1 : 0,
+        now
+      )
+  }
+
+  /** 汇总：since 之后的合计 + 按天分组 + 按会话分组 */
+  usageTotals(userId: string, since = 0): {
+    requests: number
+    promptHit: number
+    promptMiss: number
+    output: number
+    costCny: number
+    byDay: Array<{ day: string; requests: number; hit: number; miss: number; output: number; costCny: number }>
+    bySession: Array<{ sessionId: string; requests: number; hit: number; miss: number; output: number; costCny: number }>
+  } {
+    const row = this.db
+      .prepare(
+        `select count(*) requests,
+                coalesce(sum(prompt_hit), 0) hit,
+                coalesce(sum(prompt_miss), 0) miss,
+                coalesce(sum(output_tokens), 0) out,
+                coalesce(sum(cost_cny), 0) cost
+           from usage_events where user_id = ? and created_at >= ?`
+      )
+      .get(userId, since) as { requests: number; hit: number; miss: number; out: number; cost: number }
+
+    const byDay = (
+      this.db
+        .prepare(
+          `select date(created_at / 1000, 'unixepoch', '+8 hours') day,
+                  count(*) requests,
+                  coalesce(sum(prompt_hit), 0) hit,
+                  coalesce(sum(prompt_miss), 0) miss,
+                  coalesce(sum(output_tokens), 0) out,
+                  coalesce(sum(cost_cny), 0) cost
+             from usage_events where user_id = ? and created_at >= ?
+            group by day order by day desc limit 31`
+        )
+        .all(userId, since) as Array<{ day: string; requests: number; hit: number; miss: number; out: number; cost: number }>
+    ).map((d) => ({ day: d.day, requests: d.requests, hit: d.hit, miss: d.miss, output: d.out, costCny: d.cost }))
+
+    const bySession = (
+      this.db
+        .prepare(
+          `select session_id, count(*) requests,
+                  coalesce(sum(prompt_hit), 0) hit,
+                  coalesce(sum(prompt_miss), 0) miss,
+                  coalesce(sum(output_tokens), 0) out,
+                  coalesce(sum(cost_cny), 0) cost
+             from usage_events where user_id = ? and created_at >= ? and session_id is not null
+            group by session_id order by cost desc limit 20`
+        )
+        .all(userId, since) as Array<{ session_id: string; requests: number; hit: number; miss: number; out: number; cost: number }>
+    ).map((s) => ({ sessionId: s.session_id, requests: s.requests, hit: s.hit, miss: s.miss, output: s.out, costCny: s.cost }))
+
+    return {
+      requests: row.requests,
+      promptHit: row.hit,
+      promptMiss: row.miss,
+      output: row.out,
+      costCny: row.cost,
+      byDay,
+      bySession,
+    }
   }
 
   // ── 邮箱验证码 ────────────────────────────────────────

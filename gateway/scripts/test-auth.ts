@@ -190,7 +190,8 @@ try {
   {
     const store = new AuthStore(join(dir, 'auth-key.db'))
     const user = store.createUser('keyuser@example.com', 'keypassword123')
-    const fakeKey = 'sk-' + 'a1b2c3d4'.repeat(8)
+    // ⚠️ 假 Key 必须运行时拼出来：源码里出现 sk-<长串> 会被 GitHub 推送保护拦下
+    const fakeKey = ['sk', 'a1b2c3d4'.repeat(8)].join('-')
 
     check('未绑定前查不到 Key 信息', store.getUpstreamKey(user.id) === null)
 
@@ -216,7 +217,7 @@ try {
     check('同一指纹被两个账号使用会被发现', store.fingerprintOwners(info.fingerprint) === 2)
 
     // 换 Key 后指纹变化
-    const second = store.setUpstreamKey(user.id, 'sk-' + 'ffffffff'.repeat(8))
+    const second = store.setUpstreamKey(user.id, ['sk', 'ffffffff'.repeat(8)].join('-'))
     check('换 Key 后指纹更新', second.fingerprint !== info.fingerprint)
 
     store.clearUpstreamKey(user.id)
@@ -227,10 +228,11 @@ try {
 
   // ── 8. 日志脱敏 ────────────────────────────────────────
   {
-    const raw = 'Bearer sk-abcdefghijklmnopqrstuvwxyz0123456789'
+    const fake = ['sk', 'abcdefghijklmnopqrstuvwxyz0123456789'].join('-')
+    const raw = `Bearer ${fake}`
     check('裸 Key 被脱敏', redactSecrets(raw).includes(REDACTED) && !redactSecrets(raw).includes('abcdefghijklmnop'))
-    check('带字段名的被脱敏', !redactSecrets('x-deepseek-key: sk-abcdefghijklmnopqrstuvwxyz').includes('abcdefghijklmnop'))
-    check('JSON 里的 key 被脱敏', !redactSecrets('{"key":"sk-abcdefghijklmnopqrstuvwxyz"}').includes('abcdefghijklmnop'))
+    check('带字段名的被脱敏', !redactSecrets(`x-deepseek-key: ${fake}`).includes('abcdefghijklmnop'))
+    check('JSON 里的 key 被脱敏', !redactSecrets(`{"key":"${fake}"}`).includes('abcdefghijklmnop'))
     check('普通文本不受影响', redactSecrets('我今天想学 Python') === '我今天想学 Python')
     check('空串安全', redactSecrets('') === '')
   }

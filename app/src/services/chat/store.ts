@@ -359,12 +359,35 @@ export const initChat = (): Promise<void> => {
 }
 
 export type RemoteApplyResult = {
-  /** 云端清单看起来像被清空了，本轮拒绝合并（保住本地数据） */
+  /** 云端清单看起来像被清空了（本地已有数据时）：本轮只补推、不动列表 */
   suspicious: boolean
   /** 按墓碑删掉的本地会话数 */
   removed: number
   /** 只在云端、本地没有正文的会话数（列表里有，点开才下载） */
   added: number
+}
+
+/**
+ * 把若干本地会话推上去（批量：内部按 50 条一次请求）。
+ *
+ * 为什么不是一条会话一个请求：导入 1000 个会话之后，"云端没有、本地有"是常态，
+ * 逐条推就是 1000 个请求 —— 手机网络下要跑几分钟，还会撞限流。
+ */
+const pushLocalSessions = (ids: string[]): void => {
+  if (ids.length === 0) {
+    return
+  }
+  void (async () => {
+    const sync = await import('../sync/index.js')
+    const sessions = []
+    for (const id of ids) {
+      const session = await db.loadSession(id)
+      if (session) {
+        sessions.push(session)
+      }
+    }
+    await sync.pushSessions(sessions)
+  })().catch(() => undefined)
 }
 
 /**
@@ -383,7 +406,13 @@ export const applyRemoteIndex = (
   const deletedIds = deleted
     .map((item) => item?.id)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  /**
+   * 云端说"一条都没有"、又没有墓碑，而本地有数据：
+   * 先**不动列表**（一次异常响应不能把列表刷成空），但把本地全部补推上去。
+   * 真正常见的场景是导入完历史、还没推成功 —— 补推一轮之后下一轮就正常了。
+   */
   if (cloudLooksWiped(local.length, remote.length, deletedIds.length)) {
+    pushLocalSessions(local.map((summary) => summary.id))
     return { suspicious: true, removed: 0, added: 0 }
   }
   const { sessions, toPush, removed, remoteOnly } = mergeSessionIndex(local, remote, deletedIds)
@@ -413,14 +442,10 @@ export const applyRemoteIndex = (
     activeId: state.activeId !== null && gone.has(state.activeId) ? null : state.activeId,
   }))
   /**
-   * 本地更新 / 云端没有的推上去。失败不打扰用户：
-   * 下一次同步会再比一次，仍然不一致就再推。
+   * 本地更新 / 云端没有的推上去（**按批**，不是一条一个请求）。
+   * 失败不打扰用户：下一次同步会再比一次，仍然不一致就再推。
    */
-  for (const id of toPush) {
-    void import('../sync/index.js')
-      .then((sync) => sync.pushSession(id))
-      .catch(() => undefined)
-  }
+  pushLocalSessions(toPush)
   return { suspicious: false, removed: gone.size, added: remoteOnly.length }
 }
 

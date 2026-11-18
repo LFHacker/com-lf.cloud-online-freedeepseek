@@ -118,7 +118,8 @@ const gateway = spawn(process.execPath, ['src/index.ts'], {
     AUTH_DB_PATH: join(tmp, 'auth.db'),
     MEMORY_DATA_DIR: join(tmp, 'users'),
     ALLOW_INSTANCE_KEY: '1',
-    DEEPSEEK_API_KEY: 'sk-smoke-upstream-key-000000000000',
+    // 上游 Key 只是个占位：冒烟只关心同步链路，聊天请求到上游必然 401（正好验证错误呈现）
+    DEEPSEEK_API_KEY: 'dummy-upstream-key-for-smoke-test-000000',
     MEMORY_ENABLE: '0',
   },
   stdio: ['ignore', 'pipe', 'pipe'],

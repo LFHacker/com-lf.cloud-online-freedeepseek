@@ -59,9 +59,14 @@ export const syncNow = async (): Promise<SyncOutcome> => {
     // 动态 import：chat/store 依赖本模块的队列，静态互相 import 会成环
     const store = await import('../chat/store.js')
     const applied = store.applyRemoteIndex(index.sessions, index.deleted)
+    /**
+     * suspicious = 云端清单空、本地有数据。这时**不算失败**：
+     * 列表没被动过（数据安全），本地会话已经触发补推，下一轮就恢复正常。
+     * 当成错误反而会让状态条一直红着，而用户其实什么都没做错。
+     */
     if (applied.suspicious) {
-      // 云端"空且无墓碑"但本地有数据：几乎一定是服务端异常，宁可不同步也不清本地
-      return scheduleRetry('云端清单异常，已保留本地数据', true)
+      setSync({ phase: 'idle', lastSyncedAt: Date.now(), retryAt: 0, failures: 0, message: null })
+      return 'suspicious'
     }
     await saveSyncMeta({ lastSyncedAt: String(Date.now()) })
     await flushOutbox({ force: true })

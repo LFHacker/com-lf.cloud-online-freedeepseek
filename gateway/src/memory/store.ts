@@ -893,12 +893,16 @@ export class MemoryStore {
     const contextOf = this.db.prepare('select context from chunks where id = ?')
     for (const row of rows) {
       const context = (contextOf.get(row.chunk_id) as { context: string | null } | undefined)?.context
-      const extra = context ? context.length : 0
-      // 上下文也算进预算：否则带上下文时总字数会大幅超出 maxChars
-      if (used + row.body.length + extra > this.maxChars) {
+      /**
+       * ⚠️ 预算只算正文，**不算上下文**。
+       * 把上下文也算进来会让"能塞几条"变少（实测召回@4 从 82% 掉到 70%），
+       * 而上下文的作用是让模型读懂**已经命中的**那几条，不该挤掉别的命中。
+       * 注入总长度的上限由 buildRecallBlock 统一控制。
+       */
+      if (used + row.body.length > this.maxChars) {
         continue
       }
-      used += row.body.length + extra
+      used += row.body.length
       hits.push({
         chunkId: row.chunk_id,
         sessionId: row.session_id,
@@ -928,7 +932,10 @@ export class MemoryStore {
      * 带上回答的原因：用户问「Flutter 找不到 Chrome 怎么办」时，
      * 他这句话里只有报错，解法在回答里——只给问题，模型只能复述报错。
      */
-    const lines = hits.map((hit, index) => {
+    const blockBudget = Number(process.env.MEMORY_BLOCK_CHARS ?? 1800)
+    const lines: string[] = []
+    let usedChars = 0
+    hits.forEach((hit, index) => {
       const head = `[${formatDay(hit.createdAt)} · 会话 ${hit.sessionId.slice(0, 8)}]`
       /**
        * 只给**最相关的前几条**带上下文，且每条截断。
@@ -937,10 +944,22 @@ export class MemoryStore {
        */
       const context = index < this.contextHits ? hit.context?.trim() : null
       if (!context) {
-        return `${head} ${hit.body}`
+        const line = `${head} ${hit.body}`
+        if (usedChars + line.length > blockBudget) {
+          return
+        }
+        usedChars += line.length
+        lines.push(line)
+        return
       }
       const trimmed = context.length > this.contextChars ? `${context.slice(0, this.contextChars)}…` : context
-      return `${head} 用户说：${hit.body}\n（当时助手的回答：${trimmed}）`
+      const line = `${head} 用户说：${hit.body}\n（当时助手的回答：${trimmed}）`
+      // 总长上限：宁可少给一条，也不要把整个上下文预算吃光
+      if (usedChars + line.length > blockBudget) {
+        return
+      }
+      usedChars += line.length
+      lines.push(line)
     })
     return [
       '<回忆>',

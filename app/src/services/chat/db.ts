@@ -2,12 +2,47 @@ import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
-const DB_VERSION = 11
+const DB_VERSION = 12
 
 /** 文件原件按附件的本地 id 存储，所有引用同一 id 的消息共用一份；用于缩略图、打开查看，以及没有 serverId 时补传。 */
 export type StoredFile = {
   id: string
   blob: Blob
+}
+
+/**
+ * 云端会话清单缓存（阶段 2-1）。
+ *
+ * 会话列表**以服务端为准**，这份只是"离线时也能把列表画出来"的副本，
+ * 不作为真相来源：联网后一律由 `/sync/sessions` 覆盖。
+ */
+export type CloudSessionMeta = {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  pinned: boolean
+}
+
+/**
+ * 待发送消息队列（阶段 2-2）。
+ *
+ * 一条记录 = 一条"已经打在屏幕上、但服务端还没确认"的用户消息。
+ * 存在 IndexedDB 而不是内存：关掉 App / 手机重启之后，这条消息还得能自己发出去，
+ * 否则离线期间的输入会静默消失 —— 那比"发送失败"更糟。
+ */
+export type OutboxRecord = {
+  /** = 用户消息 id，天然幂等：同一条消息不会因为重试进入队列两次 */
+  id: string
+  sessionId: string
+  createdAt: number
+  /** 已失败的次数，退避时长由它算 */
+  attempts: number
+  /** 下次允许尝试的时间戳（0 = 立即） */
+  nextAttemptAt: number
+  /** queued：等待重试；sending：正在发；failed：不可重试（如 401） */
+  status: 'queued' | 'sending' | 'failed'
+  error?: string
 }
 
 /** 文件引用留在摘要中，删除会话时通过索引判断原件是否仍被引用。 */
@@ -29,6 +64,12 @@ interface ChatDB extends DBSchema {
    */
   sessionsStaging: { key: string; value: Session }
   filesStaging: { key: string; value: StoredFile }
+  /** 云端会话清单的离线副本（阶段 2-1） */
+  sessionIndex: { key: string; value: CloudSessionMeta }
+  /** 待发送消息队列（阶段 2-2） */
+  outbox: { key: string; value: OutboxRecord }
+  /** 同步小状态（lastSyncedAt 之类），只存字符串 */
+  syncMeta: { key: string; value: { key: string; value: string } }
 }
 
 let dbPromise: Promise<IDBPDatabase<ChatDB>> | null = null
@@ -57,10 +98,21 @@ const getDB = () =>
   (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
     upgrade(db, _oldVersion, _newVersion, tx) {
       // 初始化当前格式需要的存储与索引，不迁移旧消息。
-      for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
+      for (const name of [
+        'sessions',
+        'files',
+        'sessionsStaging',
+        'filesStaging',
+        'sessionIndex',
+        'outbox',
+      ] as const) {
         if (!db.objectStoreNames.contains(name)) {
           db.createObjectStore(name, { keyPath: 'id' })
         }
+      }
+      // 同步小状态用 key 作主键（不是 id），单独建
+      if (!db.objectStoreNames.contains('syncMeta')) {
+        db.createObjectStore('syncMeta', { keyPath: 'key' })
       }
       const summaries = db.objectStoreNames.contains('sessionSummaries')
         ? tx.objectStore('sessionSummaries')
@@ -111,8 +163,31 @@ export const saveSession = async (session: Session, files: StoredFile[] = []): P
   ])
 }
 
-/** 未打开的会话也可重命名，只读取该会话，原子更新详情和列表。 */
-export const renameSession = async (id: string, title: string): Promise<void> => {
+/**
+ * 把**从云端下载**的会话写进缓存。
+ *
+ * 刻意不复用 saveSession：那个函数会在落库后排队"推回云端"，
+ * 而这个正文本来就是云端来的 —— 推回去是纯浪费，
+ * 而且会额外制造一批无意义的请求（每次点开会话就一条）。
+ */
+export const cacheSessionOnly = async (session: Session): Promise<void> => {
+  const summary = storedSummary(session)
+  const tx = (await getDB()).transaction(['sessions', 'sessionSummaries'], 'readwrite')
+  await Promise.all([
+    (async () => {
+      try {
+        await tx.objectStore('sessions').put(session)
+        await tx.objectStore('sessionSummaries').put(summary)
+      } catch (error) {
+        abortTransaction(tx)
+        throw error
+      }
+    })(),
+    tx.done,
+  ])
+}
+
+/** 未打开的会话也可重命名，只读取该会话，原子更新详情和列表。 */export const renameSession = async (id: string, title: string): Promise<void> => {
   const tx = (await getDB()).transaction(['sessions', 'sessionSummaries'], 'readwrite')
   await Promise.all([
     (async () => {
@@ -321,4 +396,53 @@ export const commitStaging = async (): Promise<SessionSummary[]> => {
 export const reportStorageError = (action: string) => (error: unknown) => {
   // eslint-disable-next-line no-console
   console.error(`[storage] ${action} failed`, error)
+}
+
+// ── 云端清单缓存 / 待发送队列 / 同步状态（阶段 2） ──────────────
+
+/** 读出上一次拿到的云端清单（离线时先把列表画出来，不要空着等网络） */
+export const loadCloudIndex = async (): Promise<CloudSessionMeta[]> =>
+  (await getDB()).getAll('sessionIndex')
+
+/** 用最新一份云端清单整体替换缓存；已经不在云端的条目随之消失 */
+export const replaceCloudIndex = async (list: CloudSessionMeta[]): Promise<void> => {
+  const tx = (await getDB()).transaction('sessionIndex', 'readwrite')
+  const store = tx.store
+  // 所有请求同步发出，事务才不会在 await 之间被判为空闲而提前提交
+  await Promise.all([store.clear(), ...list.map((item) => store.put(item)), tx.done])
+}
+
+export const removeCloudIndex = async (ids: readonly string[]): Promise<void> => {
+  if (ids.length === 0) {
+    return
+  }
+  const tx = (await getDB()).transaction('sessionIndex', 'readwrite')
+  await Promise.all([...ids.map((id) => tx.store.delete(id)), tx.done])
+}
+
+export const loadOutbox = async (): Promise<OutboxRecord[]> => (await getDB()).getAll('outbox')
+
+export const putOutbox = async (record: OutboxRecord): Promise<void> => {
+  await (await getDB()).put('outbox', record)
+}
+
+export const removeOutbox = async (id: string): Promise<void> => {
+  await (await getDB()).delete('outbox', id)
+}
+
+export const loadSyncMeta = async (): Promise<Record<string, string>> => {
+  const rows = await (await getDB()).getAll('syncMeta')
+  return Object.fromEntries(rows.map((row) => [row.key, row.value]))
+}
+
+export const saveSyncMeta = async (patch: Record<string, string>): Promise<void> => {
+  const entries = Object.entries(patch)
+  if (entries.length === 0) {
+    return
+  }
+  const tx = (await getDB()).transaction('syncMeta', 'readwrite')
+  await Promise.all([
+    ...entries.map(([key, value]) => tx.store.put({ key, value })),
+    tx.done,
+  ])
 }

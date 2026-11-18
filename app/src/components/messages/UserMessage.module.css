@@ -70,6 +70,29 @@
   opacity: 1;
 }
 
+/**
+ * 发送状态（阶段 2-2）：服务端确认前，这条消息还不算"发出去了"。
+ * 放在气泡下方右对齐，与操作区同一水平线，不挤占正文。
+ */
+.status {
+  align-self: flex-end;
+  margin-top: 4px;
+  padding: 1px 8px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 999px;
+  background-color: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+  cursor: default;
+}
+
+.statusFailed {
+  border-color: var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-state-error-primary);
+  cursor: pointer;
+}
+
 .editor {
   width: 100%;
   box-sizing: border-box;

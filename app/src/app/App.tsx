@@ -26,6 +26,9 @@ import { stopReadAloud } from '../services/speech/readAloud.js'
 import { CollapsedSider } from '../components/sider/CollapsedSider.js'
 import { closeMobileSider } from '../components/sider/mobileSiderState.js'
 import { installDiagnosticsHooks } from '../services/diagnostics.js'
+import { restoreOutbox } from '../services/sync/outbox.js'
+import { startSyncEngine } from '../services/sync/engine.js'
+import { SyncStatusBar } from '../components/sync/SyncStatusBar.js'
 import { MobileSider, Sider } from '../components/sider/Sider.js'
 import styles from './App.module.css'
 
@@ -77,6 +80,10 @@ export const App = () => {
     void initChat()
     // 启动时校验登录态：没有令牌 / 令牌失效 → 显示登录页
     void initAuth()
+    // 上次没发出去的消息要能接着发（队列在 IndexedDB 里，重启不丢）
+    void restoreOutbox()
+    // 联网 / 回到前台时自动补一次同步
+    return startSyncEngine()
   }, [])
 
   const authStatus = useAuth((state) => state.status)
@@ -100,6 +107,7 @@ export const App = () => {
               </Button>
             </div>
           ) : null}
+          <SyncStatusBar />
           <div className={styles.content}>
             {siderCollapsed ? <CollapsedSider /> : null}
             {!ready || (activeId !== null && !session) ? (

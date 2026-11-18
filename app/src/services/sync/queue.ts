@@ -38,5 +38,5 @@ export const pushAllSessions = async (): Promise<number> => {
       sessions.push(session)
     }
   }
-  return sync.pushSessions(sessions)
+  return (await sync.pushSessions(sessions)).written
 }

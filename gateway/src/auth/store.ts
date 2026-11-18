@@ -121,10 +121,37 @@ create table if not exists user_sessions (
   title      text,
   created_at integer not null,
   updated_at integer not null,
+  pinned     integer not null default 0,
   payload    text not null,
   primary key (user_id, session_id)
 );
 create index if not exists idx_user_sessions_time on user_sessions(user_id, updated_at desc);
+
+/**
+ * 附件引用计数（阶段 3）。
+ *
+ * 一个附件可以同时被多条会话引用（编辑提问、重新生成、导入都会复用同一个 id），
+ * 所以删除会话时**不能直接删文件**：得先知道还有没有别的会话在用它。
+ *
+ * 表结构就是「谁引用了谁」的边表，计数天然可查（count(*)），
+ * 也天然可全量重建（从 user_sessions.payload 里重新抽一遍 id）。
+ * 为什么不存一个 count 列：多一台设备重复推送就会多算一次，边表主键去重后天然幂等。
+ */
+create table if not exists file_refs (
+  user_id    text not null,
+  file_id    text not null,
+  session_id text not null,
+  updated_at integer not null,
+  primary key (user_id, file_id, session_id)
+);
+create index if not exists idx_file_refs_file on file_refs(user_id, file_id);
+create index if not exists idx_file_refs_session on file_refs(user_id, session_id);
+
+/** 一次性迁移标记（如引用表首次全量重建），避免每次启动都重算 */
+create table if not exists store_meta (
+  key   text primary key,
+  value text
+);
 
 /**
  * 软删除（墓碑）。
@@ -209,6 +236,47 @@ create table if not exists user_upstream_keys (
 `
 
 const sha256Hex = (value: string): string => createHash('sha256').update(value).digest('hex')
+
+/**
+ * 附件 id 的形状（与 /sync/files/:id 的校验同一条规则）。
+ * 引用表里的 file_id 会直接用来拼磁盘路径，所以入表前必须过这一关 ——
+ * 否则一条 `../..` 的会话 payload 就能往库外写引用。
+ */
+const FILE_ID_RE = /^[A-Za-z0-9_-]{8,80}$/
+
+/**
+ * 从会话 payload 里抽附件 id。
+ *
+ * 这是**兼容兜底**：新客户端推送时会直接带 fileIds（它本地算好了），
+ * 老客户端没有这个字段，服务端就得自己从 JSON 里找。
+ * 解析失败一律返回空数组 —— 抽不到顶多是引用偏少，由 rebuildRefs 兜底；
+ * 抛异常会把整批同步打回。
+ */
+const collectPayloadFileIds = (payload: string): string[] => {
+  if (!payload || payload.length > 8 * 1024 * 1024) {
+    return []
+  }
+  try {
+    const parsed = JSON.parse(payload) as { messages?: unknown }
+    const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+    const ids = new Set<string>()
+    for (const message of messages) {
+      const files = (message as { files?: unknown }).files
+      if (!Array.isArray(files)) {
+        continue
+      }
+      for (const file of files) {
+        const id = (file as { id?: unknown }).id
+        if (typeof id === 'string' && FILE_ID_RE.test(id)) {
+          ids.add(id)
+        }
+      }
+    }
+    return [...ids]
+  } catch {
+    return []
+  }
+}
 
 /** 新建用户 id：`u_` + 16 位十六进制，可安全用作目录名 */
 const newUserId = (): string => `u_${randomBytes(8).toString('hex')}`
@@ -384,6 +452,43 @@ export class AuthStore {
     this.db.exec(
       'create unique index if not exists idx_users_username on users(lower(username)) where username is not null'
     )
+
+    /**
+     * 会话表后来才加 pinned：列表要按置顶排序，而列表读的是服务端（阶段 2-1），
+     * 所以置顶必须成为服务端字段，不能只留在会话 payload 里。
+     */
+    const sessionColumns = new Set(
+      (this.db.prepare('pragma table_info(user_sessions)').all() as Array<{ name: string }>).map(
+        (c) => c.name
+      )
+    )
+    if (!sessionColumns.has('pinned')) {
+      this.db.exec('alter table user_sessions add column pinned integer not null default 0')
+    }
+
+    /**
+     * 引用表首次启用时全量重建一次：老库里的会话早就存在，
+     * 不重建的话它们的附件永远"零引用"，第一次跑 GC 就会把还在用的文件删掉。
+     */
+    const rebuilt = this.db
+      .prepare('select value from store_meta where key = ?')
+      .get('file_refs_rebuilt_v1') as { value: string } | undefined
+    if (!rebuilt) {
+      try {
+        this.rebuildRefs()
+        this.db
+          .prepare(
+            'insert into store_meta (key, value) values (?, ?) on conflict(key) do update set value = excluded.value'
+          )
+          .run('file_refs_rebuilt_v1', String(Date.now()))
+      } catch (error) {
+        // 重建失败不该让网关起不来：引用表为空时 GC 会被安全护栏挡住（见 listGcCandidates）
+        console.warn(
+          '[gateway] 附件引用重建失败，GC 已暂停:',
+          error instanceof Error ? error.message : error
+        )
+      }
+    }
   }
 
   close(): void {
@@ -642,32 +747,66 @@ export class AuthStore {
    */
   upsertSessions(
     userId: string,
-    sessions: Array<{ id: string; title: string; createdAt: number; updatedAt: number; payload: string }>
-  ): { written: number; skipped: number } {
+    sessions: Array<{
+      id: string
+      title: string
+      createdAt: number
+      updatedAt: number
+      pinned?: boolean
+      /** 本条会话引用的附件 id；缺省时从 payload 里抽（兼容还没升级的客户端） */
+      fileIds?: string[]
+      payload: string
+    }>
+  ): { written: number; skipped: number; refs: number } {
     const statement = this.db.prepare(
-      `insert into user_sessions (user_id, session_id, title, created_at, updated_at, payload)
-       values (?, ?, ?, ?, ?, ?)
+      `insert into user_sessions (user_id, session_id, title, created_at, updated_at, pinned, payload)
+       values (?, ?, ?, ?, ?, ?, ?)
        on conflict(user_id, session_id) do update set
          title = excluded.title,
          created_at = excluded.created_at,
          updated_at = excluded.updated_at,
+         pinned = excluded.pinned,
          payload = excluded.payload
        where excluded.updated_at > user_sessions.updated_at`
     )
     let written = 0
+    /**
+     * 墓碑优先：会话被删过之后，任何"旧设备重推"都不能把它复活。
+     *
+     * 这是"云端为主"要付的代价里最重要的一条：离线设备带着旧副本上线时，
+     * 它手里的 payload 看起来比墓碑更"新"（本地时钟），但用户的删除意图更明确。
+     * 复活的后果是"删了又出现"，用户会以为删除功能坏了。
+     */
+    const tombstone = this.db.prepare(
+      'select 1 as hit from session_tombstones where user_id = ? and session_id = ?'
+    )
+    /**
+     * 只有真的写进去的会话才更新引用。
+     * 被"取较新者"拒绝的旧 payload 带的是旧附件列表，拿它去覆盖引用，
+     * 会把仍被新版本引用的附件记成零引用 —— 随后 GC 就会删还在用的文件。
+     */
+    const accepted: Array<{ id: string; fileIds: string[] }> = []
     this.db.exec('begin')
     try {
       for (const session of sessions) {
+        if (tombstone.get(userId, session.id)) {
+          continue
+        }
         const result = statement.run(
           userId,
           session.id,
           session.title,
           session.createdAt,
           session.updatedAt,
+          session.pinned ? 1 : 0,
           session.payload
         )
         if (Number(result.changes) > 0) {
           written += 1
+          accepted.push({
+            id: session.id,
+            fileIds: session.fileIds ?? collectPayloadFileIds(session.payload),
+          })
         }
       }
       this.db.exec('commit')
@@ -675,16 +814,50 @@ export class AuthStore {
       this.db.exec('rollback')
       throw error
     }
-    return { written, skipped: sessions.length - written }
+    const refs = accepted.length > 0 ? this.writeRefs(userId, accepted) : 0
+    return { written, skipped: sessions.length - written, refs }
   }
 
-  /** 软删除：记墓碑，并把会话行删掉（正文没必要留） */
+  /** 重写若干条会话的引用边（先删该会话的旧边、再插新边，幂等） */
+  private writeRefs(userId: string, sessions: Array<{ id: string; fileIds: string[] }>): number {
+    const remove = this.db.prepare('delete from file_refs where user_id = ? and session_id = ?')
+    const insert = this.db.prepare(
+      `insert into file_refs (user_id, file_id, session_id, updated_at) values (?, ?, ?, ?)
+       on conflict(user_id, file_id, session_id) do update set updated_at = excluded.updated_at`
+    )
+    const now = Date.now()
+    let count = 0
+    this.db.exec('begin')
+    try {
+      for (const session of sessions) {
+        remove.run(userId, session.id)
+        for (const fileId of new Set(session.fileIds)) {
+          if (!FILE_ID_RE.test(fileId)) {
+            continue
+          }
+          insert.run(userId, fileId, session.id, now)
+          count += 1
+        }
+      }
+      this.db.exec('commit')
+    } catch (error) {
+      this.db.exec('rollback')
+      throw error
+    }
+    return count
+  }
+
+  /** 软删除：记墓碑，并把会话行与它的引用边删掉（正文没必要留） */
   deleteSession(userId: string, sessionId: string): void {
     const now = Date.now()
     this.db.exec('begin')
     try {
       this.db
         .prepare('delete from user_sessions where user_id = ? and session_id = ?')
+        .run(userId, sessionId)
+      // 引用边跟着走：删完这条会话，它引用的附件可能就零引用了（GC 时才会真删）
+      this.db
+        .prepare('delete from file_refs where user_id = ? and session_id = ?')
         .run(userId, sessionId)
       this.db
         .prepare(
@@ -699,37 +872,66 @@ export class AuthStore {
     }
   }
 
-  /** 墓碑清单：各端据此删除本地副本 */
-  listTombstones(userId: string, since = 0): Array<{ id: string; deletedAt: number }> {
-    return (
-      this.db
-        .prepare(
-          'select session_id id, deleted_at from session_tombstones where user_id = ? and deleted_at >= ? order by deleted_at desc'
-        )
-        .all(userId, since) as Array<{ id: string; deleted_at: number }>
-    ).map((row) => ({ id: row.id, deletedAt: row.deleted_at }))
-  }
-
-  /** 会话列表（不含 payload，用于拉取前先比对） */
-  listSessions(
+  /**
+   * 墓碑清单：各端据此删除本地副本。
+   * 分页与 listSessions 同构（deleted_at desc + 复合游标），否则删得多了就翻不到后面的。
+   */
+  listTombstones(
     userId: string,
-    options: { since?: number; limit?: number } = {}
-  ): Array<{ id: string; title: string; createdAt: number; updatedAt: number }> {
+    options: { since?: number; before?: number; beforeId?: string; limit?: number } = {}
+  ): Array<{ id: string; deletedAt: number }> {
     const since = options.since ?? 0
     const limit = Math.min(Math.max(options.limit ?? 500, 1), 2000)
-    return (
-      this.db
-        .prepare(
-          `select session_id id, title, created_at, updated_at from user_sessions
-            where user_id = ? and updated_at >= ?
-            order by updated_at desc limit ?`
-        )
-        .all(userId, since, limit) as Array<{ id: string; title: string; created_at: number; updated_at: number }>
-    ).map((row) => ({
+    const before = options.before && options.before > 0 ? options.before : Number.MAX_SAFE_INTEGER
+    const beforeId = options.beforeId ?? '\uffff'
+    const rows = this.db
+      .prepare(
+        `select session_id id, deleted_at from session_tombstones
+          where user_id = ? and deleted_at >= ?
+            and (deleted_at < ? or (deleted_at = ? and session_id < ?))
+          order by deleted_at desc, session_id desc limit ?`
+      )
+      .all(userId, since, before, before, beforeId, limit + 1) as Array<{
+      id: string
+      deleted_at: number
+    }>
+    return rows.slice(0, limit).map((row) => ({ id: row.id, deletedAt: row.deleted_at }))
+  }
+
+  /**
+   * 会话列表（不含 payload）。
+   *
+   * 分页用**复合游标**（updated_at, session_id）：只用 updated_at 做 `before` 会在
+   * 同一毫秒创建的会话上把跨页的那几条漏掉，而客户端是"翻完所有页就当拿到全量"。
+   */
+  listSessions(
+    userId: string,
+    options: { since?: number; before?: number; beforeId?: string; limit?: number } = {}
+  ): Array<{ id: string; title: string; createdAt: number; updatedAt: number; pinned: boolean }> {
+    const since = options.since ?? 0
+    const limit = Math.min(Math.max(options.limit ?? 500, 1), 2000)
+    const before = options.before && options.before > 0 ? options.before : Number.MAX_SAFE_INTEGER
+    const beforeId = options.beforeId ?? '\uffff'
+    const rows = this.db
+      .prepare(
+        `select session_id id, title, created_at, updated_at, pinned from user_sessions
+          where user_id = ? and updated_at >= ?
+            and (updated_at < ? or (updated_at = ? and session_id < ?))
+          order by updated_at desc, session_id desc limit ?`
+      )
+      .all(userId, since, before, before, beforeId, limit + 1) as Array<{
+      id: string
+      title: string | null
+      created_at: number
+      updated_at: number
+      pinned: number
+    }>
+    return rows.slice(0, limit).map((row) => ({
       id: row.id,
-      title: row.title,
+      title: row.title ?? '',
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      pinned: row.pinned === 1,
     }))
   }
 
@@ -739,6 +941,94 @@ export class AuthStore {
       .prepare('select payload, updated_at from user_sessions where user_id = ? and session_id = ?')
       .get(userId, sessionId) as { payload: string; updated_at: number } | undefined
     return row ? { payload: row.payload, updatedAt: row.updated_at } : null
+  }
+
+  // ── 附件引用与回收（阶段 3） ──────────────────────────
+
+  /** 附件引用计数：file_id → 被多少条会话引用 */
+  fileRefCounts(userId: string): Map<string, number> {
+    const rows = this.db
+      .prepare('select file_id, count(*) n from file_refs where user_id = ? group by file_id')
+      .all(userId) as Array<{ file_id: string; n: number }>
+    return new Map(rows.map((row) => [row.file_id, Number(row.n)]))
+  }
+
+  /** 某条会话引用的附件 id */
+  sessionFileIds(userId: string, sessionId: string): string[] {
+    return (
+      this.db
+        .prepare('select file_id from file_refs where user_id = ? and session_id = ?')
+        .all(userId, sessionId) as Array<{ file_id: string }>
+    ).map((row) => row.file_id)
+  }
+
+  /** 该账号还有多少条会话（GC 报告用） */
+  countSessions(userId: string): number {
+    return Number(
+      (this.db
+        .prepare('select count(*) n from user_sessions where user_id = ?')
+        .get(userId) as { n: number }).n
+    )
+  }
+
+  /**
+   * 引用表可不可信（GC 的前置条件）。
+   *
+   * 不能用"引用表为空"来判断 —— 用户把最后一条引用附件的会话删掉之后，
+   * 引用表本来就该是空的，那正是需要回收的时刻。
+   * 真正的信号是"重建跑过没有"：跑过就说明表是从真实 payload 算出来的。
+   */
+  refsTrusted(): boolean {
+    const row = this.db
+      .prepare('select value from store_meta where key = ?')
+      .get('file_refs_rebuilt_v1') as { value: string } | undefined
+    return Boolean(row)
+  }
+
+  /**
+   * 全量重建引用表：从每条会话的 payload 里重新抽附件 id。
+   *
+   * 为什么需要它：引用表是"运行时维护"的派生数据，一旦某次写入漏了
+   * （老客户端没传 fileIds、手改过库、迁移中断），计数就会偏小 ——
+   * 而计数偏小的后果是 GC 删掉还在用的文件。所以必须能一键重算。
+   */
+  rebuildRefs(userId?: string): { sessions: number; refs: number } {
+    if (userId) {
+      this.db.prepare('delete from file_refs where user_id = ?').run(userId)
+    } else {
+      this.db.exec('delete from file_refs')
+    }
+    const pageStmt = userId
+      ? this.db.prepare(
+          'select rowid rid, user_id, session_id, payload from user_sessions where user_id = ? and rowid > ? order by rowid limit 200'
+        )
+      : this.db.prepare(
+          'select rowid rid, user_id, session_id, payload from user_sessions where rowid > ? order by rowid limit 200'
+        )
+    let cursor = 0
+    let sessions = 0
+    let refs = 0
+    // 分批读：payload 单条可达几百 KB，一次性 all() 会把整库拉进内存
+    for (;;) {
+      const rows = (
+        userId ? pageStmt.all(userId, cursor) : pageStmt.all(cursor)
+      ) as Array<{ rid: number; user_id: string; session_id: string; payload: string }>
+      if (rows.length === 0) {
+        break
+      }
+      const byUser = new Map<string, Array<{ id: string; fileIds: string[] }>>()
+      for (const row of rows) {
+        cursor = Number(row.rid)
+        const list = byUser.get(row.user_id) ?? []
+        list.push({ id: row.session_id, fileIds: collectPayloadFileIds(row.payload) })
+        byUser.set(row.user_id, list)
+      }
+      for (const [userId, list] of byUser) {
+        refs += this.writeRefs(userId, list)
+        sessions += list.length
+      }
+    }
+    return { sessions, refs }
   }
 
   // ── 用量账本 ──────────────────────────────────────────

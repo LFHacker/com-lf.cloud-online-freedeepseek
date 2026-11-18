@@ -1,18 +1,27 @@
 /**
  * 会话与附件的云端同步。
  *
- * 目标：换手机登录同一账号 → 会话全量回来，图片按需懒加载。
+ * 阶段 2 起这里的分工变了（**云端为主，本地仅缓存**）：
+ *  · 会话**列表**由 `/sync/sessions` 决定，本地只存副本，用于离线时也能画出来
+ *  · 会话**正文**点开才下载（本地缓存优先，云端的更新才覆盖）
+ *  · 附件仍然懒加载，且带引用计数（阶段 3），删会话后由服务端 GC 回收
  *
- * 分工：
- *  · **会话**登录时全量下发（文字小、用户要的是"打开就在"）
- *  · **图片**懒加载（你的导出包 191 MB，移动网络等不起）
- *
- * 冲突策略与服务端一致：谁的 `updatedAt` 新谁赢。
- * 本地较新就跳过下载，云端较旧也不会覆盖本地。
+ * 三条容易做错、做错就丢数据的规矩：
+ *  1. 拉清单失败 ≠ 云端没有会话。失败必须返回 null 让上层走"离线"分支，
+ *     否则一次网络抖动就会被当成"云端被清空"，本地跟着清空。
+ *  2. 推送失败要区分能不能重试。401/413 重试一万次也不会成功，
+ *     而网络错误/5xx 必须重试，否则消息就卡死在队列里。
+ *  3. 旧 payload 不能被"顺手重推"：服务端按 updatedAt 取较新者，
+ *     但引用计数只在真正写入时更新，所以重推旧版本既无效也不该更新引用。
  */
 import { apiOrigin } from '../api/client.js'
 import { useSettings } from '../settings.js'
-import { deleteSession, loadFile, loadSession, loadSessionSummaries, saveSession } from '../chat/db.js'
+import {
+  cacheSessionOnly,
+  loadFile,
+  loadSession,
+  type CloudSessionMeta,
+} from '../chat/db.js'
 import type { Session } from '../chat/types.js'
 
 const sessionToken = (): string => useSettings.getState().apiKey ?? ''
@@ -22,40 +31,196 @@ const jsonHeaders = (): Record<string, string> => ({
   'x-api-key': sessionToken(),
 })
 
-export type RemoteSessionMeta = { id: string; title: string; createdAt: number; updatedAt: number }
+/**
+ * 一次同步失败值不值得重试。
+ *
+ * 没有 status 表示请求根本没到服务端（断网、跨域、DNS）—— 必须重试。
+ * 5xx / 429 / 408 是暂时性的 —— 重试。
+ * 其余 4xx 是"这条请求本身有问题"（401 令牌失效、413 太大、400 参数错）——
+ * 重试只会无限刷日志，要停下来告诉用户。
+ */
+const isRetryableStatus = (status?: number): boolean =>
+  status === undefined || status === 408 || status === 429 || status >= 500
 
-/** 拉云端会话清单（不含正文）+ 墓碑（已删除的会话 id） */
-export const listRemoteSessions = async (): Promise<{
-  sessions: RemoteSessionMeta[]
+const failureMessage = (status?: number): string => {
+  if (status === undefined) {
+    return '网络不可用'
+  }
+  if (status === 401) {
+    return '登录状态已失效'
+  }
+  if (status === 413) {
+    return '会话或附件过大'
+  }
+  return `服务端返回 ${status}`
+}
+
+export type PushOutcome = {
+  ok: boolean
+  /** 值不值得退避重试；false 表示要停下来让用户处理 */
+  retryable: boolean
+  status?: number
+  message?: string
+}
+
+export type RemoteIndex = {
+  sessions: CloudSessionMeta[]
   deleted: Array<{ id: string; deletedAt: number }>
-}> => {
+  /** 服务端时间：用它做增量游标，避免依赖手机本地时钟 */
+  serverTime: number
+}
+
+/** 每页条数；服务端上限 500，200 是移动网络下的稳妥值 */
+const PAGE_SIZE = 200
+/** 防御性上限：1 万条会话，再多说明游标逻辑坏了，不要无限翻 */
+const MAX_PAGES = 60
+
+/**
+ * 拉全量云端清单（自动翻页）。
+ *
+ * 失败返回 null，**不返回空数组** —— 空数组在这个函数里的语义是
+ * "云端确实一条都没有"，用它去覆盖本地缓存就等于清空用户数据。
+ */
+export const fetchSessionIndex = async (): Promise<RemoteIndex | null> => {
+  const sessions: CloudSessionMeta[] = []
+  const deleted: Array<{ id: string; deletedAt: number }> = []
+  let before = 0
+  let beforeId = ''
+  let deletedBefore = 0
+  let deletedBeforeId = ''
+  let serverTime = 0
   try {
-    const response = await fetch(`${apiOrigin()}/sync/sessions`, { headers: jsonHeaders() })
-    if (!response.ok) {
-      return { sessions: [], deleted: [] }
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE) })
+      if (before > 0) {
+        params.set('before', String(before))
+        params.set('beforeId', beforeId)
+      }
+      if (deletedBefore > 0) {
+        params.set('deletedBefore', String(deletedBefore))
+        params.set('deletedBeforeId', deletedBeforeId)
+      }
+      const response = await fetch(`${apiOrigin()}/sync/sessions?${params}`, {
+        headers: jsonHeaders(),
+      })
+      if (!response.ok) {
+        return null
+      }
+      const payload = (await response.json()) as {
+        sessions?: CloudSessionMeta[]
+        deleted?: Array<{ id: string; deletedAt: number }>
+        hasMore?: boolean
+        nextBefore?: number
+        nextBeforeId?: string
+        deletedHasMore?: boolean
+        nextDeletedBefore?: number
+        nextDeletedBeforeId?: string
+        serverTime?: number
+      }
+      for (const item of payload.sessions ?? []) {
+        if (typeof item?.id === 'string') {
+          sessions.push({
+            id: item.id,
+            title: typeof item.title === 'string' ? item.title : '',
+            createdAt: Number(item.createdAt ?? 0),
+            updatedAt: Number(item.updatedAt ?? 0),
+            pinned: item.pinned === true,
+          })
+        }
+      }
+      for (const item of payload.deleted ?? []) {
+        if (typeof item?.id === 'string') {
+          deleted.push({ id: item.id, deletedAt: Number(item.deletedAt ?? 0) })
+        }
+      }
+      serverTime = Number(payload.serverTime ?? 0) || serverTime
+      const sessionsMore = payload.hasMore === true
+      const deletedMore = payload.deletedHasMore === true
+      if (sessionsMore) {
+        before = Number(payload.nextBefore ?? 0)
+        beforeId = payload.nextBeforeId ?? ''
+        // 游标没前进就停手，别把同一页拉 60 次
+        if (before <= 0) {
+          break
+        }
+      }
+      if (deletedMore) {
+        deletedBefore = Number(payload.nextDeletedBefore ?? 0)
+        deletedBeforeId = payload.nextDeletedBeforeId ?? ''
+        if (deletedBefore <= 0) {
+          break
+        }
+      }
+      if (!sessionsMore && !deletedMore) {
+        break
+      }
     }
-    const payload = (await response.json()) as {
-      sessions?: RemoteSessionMeta[]
-      deleted?: Array<{ id: string; deletedAt: number }>
-    }
-    return { sessions: payload.sessions ?? [], deleted: payload.deleted ?? [] }
+    return { sessions, deleted, serverTime: serverTime || Date.now() }
   } catch {
-    return { sessions: [], deleted: [] }
+    return null
   }
 }
 
-/** 推送一批会话（每批 50 条，避免单次请求过大） */
-export const pushSessions = async (sessions: Session[]): Promise<number> => {
-  if (sessions.length === 0) {
-    return 0
+/** 单条会话全文（列表里点开某个还没缓存的会话时用） */
+export const fetchSessionPayload = async (id: string): Promise<Session | null> => {
+  try {
+    const response = await fetch(`${apiOrigin()}/sync/session?id=${encodeURIComponent(id)}`, {
+      headers: jsonHeaders(),
+    })
+    if (!response.ok) {
+      return null
+    }
+    const payload = (await response.json()) as { payload?: string }
+    if (!payload.payload) {
+      return null
+    }
+    return JSON.parse(payload.payload) as Session
+  } catch {
+    return null
   }
-  let written = 0
+}
+
+/** 会话引用的附件 id（服务端据此维护引用计数） */
+const sessionFileIds = (session: Session): string[] => {
+  const ids = new Set<string>()
+  for (const message of session.messages ?? []) {
+    const files = (message as { files?: Array<{ id?: string }> }).files
+    if (!Array.isArray(files)) {
+      continue
+    }
+    for (const file of files) {
+      if (typeof file?.id === 'string' && file.id.length >= 8) {
+        ids.add(file.id)
+      }
+    }
+  }
+  return [...ids]
+}
+
+export type PushResult = {
+  written: number
+  failed: number
+  /** 有一批是因为"可重试原因"失败的 */
+  retryable: boolean
+  status?: number
+  message?: string
+}
+
+/** 推送一批会话（每批 50 条，避免单次请求过大）。按批汇总成败，供上层决定是否重试 */
+export const pushSessions = async (sessions: Session[]): Promise<PushResult> => {
+  const result: PushResult = { written: 0, failed: 0, retryable: false }
+  if (sessions.length === 0) {
+    return result
+  }
   for (let index = 0; index < sessions.length; index += 50) {
     const batch = sessions.slice(index, index + 50).map((session) => ({
       id: session.id,
       title: session.title ?? '',
       createdAt: session.createdAt ?? Date.now(),
       updatedAt: session.updatedAt ?? Date.now(),
+      pinned: session.pinned === true,
+      // 让服务端直接拿到引用，不必再解析几百 KB 的 payload
+      fileIds: sessionFileIds(session),
       payload: JSON.stringify(session),
     }))
     try {
@@ -65,79 +230,65 @@ export const pushSessions = async (sessions: Session[]): Promise<number> => {
         body: JSON.stringify({ sessions: batch }),
       })
       if (response.ok) {
-        const result = (await response.json()) as { written?: number }
-        written += result.written ?? 0
+        const payload = (await response.json()) as { written?: number }
+        result.written += payload.written ?? 0
+        continue
       }
+      result.failed += batch.length
+      result.status = response.status
+      result.retryable ||= isRetryableStatus(response.status)
+      result.message = failureMessage(response.status)
     } catch {
-      // 单批失败不影响后续批次；下次同步会补上
+      result.failed += batch.length
+      result.retryable = true
+      result.message = failureMessage(undefined)
     }
   }
-  return written
+  return result
 }
 
 /**
- * 登录后全量恢复。
+ * 把本地某个会话推上去。
  *
- * 只下载"云端比本地新"或"本地没有"的会话；
- * 图片不在这里下——会话里的附件只记 id，真正显示时再取。
+ * 读一次本地库再推，避免把正在流式更新的半成品推上去；
+ * 返回值区分"可以重试"和"停下来"，队列靠它决定下一步。
  */
-export const pullSessions = async (
-  onProgress?: (done: number, total: number) => void
-): Promise<{ downloaded: number; skipped: number; removed: number }> => {
-  const { sessions: remote, deleted } = await listRemoteSessions()
+export const pushSession = async (sessionId: string): Promise<PushOutcome> => {
+  const session = await loadSession(sessionId).catch(() => undefined)
+  if (!session) {
+    // 本地都没了：重试也没意义，交给上层把队列条目判死
+    return { ok: false, retryable: false, message: '本地找不到这条会话' }
+  }
+  const result = await pushSessions([session])
+  return {
+    ok: result.failed === 0,
+    retryable: result.failed === 0 ? false : result.retryable,
+    status: result.status,
+    message: result.message,
+  }
+}
 
-  /**
-   * 先按墓碑删本地。
-   *
-   * 这是"云端为主"的关键一步：别的设备删掉的会话，
-   * 本机下次同步必须跟着消失，否则会一直显示已经不存在的东西。
-   */
-  for (const tomb of deleted) {
-    const local = await loadSession(tomb.id).catch(() => undefined)
-    if (local) {
-      await deleteSession(tomb.id).catch(() => undefined)
+/**
+ * 删除一条会话（云端为主模型）。
+ *
+ * 顺序：**先删云端，成功后再删本地**。反过来的话，
+ * 云端删失败、本地已删，下次同步又会把它拉回来，用户会看到"删了又出现"。
+ */
+export const deleteRemoteSession = async (sessionId: string): Promise<PushOutcome> => {
+  try {
+    const response = await fetch(
+      `${apiOrigin()}/sync/session?id=${encodeURIComponent(sessionId)}`,
+      { method: 'DELETE', headers: jsonHeaders() }
+    )
+    return {
+      ok: response.ok,
+      retryable: !response.ok && isRetryableStatus(response.status),
+      status: response.status,
+      message: response.ok ? undefined : failureMessage(response.status),
     }
+  } catch {
+    return { ok: false, retryable: true, message: failureMessage(undefined) }
   }
-
-  if (remote.length === 0) {
-    return { downloaded: 0, skipped: 0, removed: deleted.length }
-  }
-  const local = new Map<string, number>()
-  for (const summary of await loadSessionSummaries()) {
-    local.set(summary.id, summary.updatedAt ?? 0)
-  }
-
-  let downloaded = 0
-  let skipped = 0
-  for (const [index, item] of remote.entries()) {
-    const localUpdated = local.get(item.id) ?? 0
-    if (localUpdated >= item.updatedAt) {
-      skipped += 1
-      onProgress?.(index + 1, remote.length)
-      continue
-    }
-    try {
-      const response = await fetch(
-        `${apiOrigin()}/sync/session?id=${encodeURIComponent(item.id)}`,
-        { headers: jsonHeaders() }
-      )
-      if (!response.ok) {
-        skipped += 1
-        continue
-      }
-      const payload = (await response.json()) as { payload?: string }
-      if (payload.payload) {
-        const session = JSON.parse(payload.payload) as Session
-        // 附件二进制不在这里写；saveSession 的 files 传空，图片走懒加载
-        await saveSession(session, [])
-        downloaded += 1
-      }
-    } catch {
-      skipped += 1
-    }
-    onProgress?.(index + 1, remote.length)
-  }
-  return { downloaded, skipped, removed: deleted.length }
 }
 
 /** 上传一个附件（图片）。已存在则由服务端幂等覆盖 */
@@ -154,22 +305,41 @@ export const uploadAttachment = async (id: string, blob: Blob): Promise<boolean>
   }
 }
 
-/** 云端附件清单（id → 是否存在） */
-export const listRemoteFiles = async (): Promise<Set<string>> => {
+export type RemoteFileInfo = {
+  id: string
+  size: number
+  updatedAt: number
+  /** 被多少条会话引用；0 表示孤儿，服务端 GC 会回收 */
+  refs: number
+}
+
+/** 云端附件清单（含引用计数）；失败返回 null，调用方不应据此认为"云端没有" */
+export const listRemoteFiles = async (): Promise<Map<string, RemoteFileInfo> | null> => {
   try {
     const response = await fetch(`${apiOrigin()}/sync/files`, { headers: jsonHeaders() })
     if (!response.ok) {
-      return new Set()
+      return null
     }
-    const payload = (await response.json()) as { files?: Array<{ id: string }> }
-    return new Set((payload.files ?? []).map((file) => file.id))
+    const payload = (await response.json()) as { files?: RemoteFileInfo[] }
+    const map = new Map<string, RemoteFileInfo>()
+    for (const file of payload.files ?? []) {
+      if (typeof file?.id === 'string') {
+        map.set(file.id, {
+          id: file.id,
+          size: Number(file.size ?? 0),
+          updatedAt: Number(file.updatedAt ?? 0),
+          refs: Number(file.refs ?? 0),
+        })
+      }
+    }
+    return map
   } catch {
-    return new Set()
+    return null
   }
 }
 
 /**
- * 懒加载：本地没有这张图时从云端取回并写进本地库。
+ * 懒加载：本地没有这张图时从云端取回。
  * 失败返回 undefined，界面显示占位即可（不阻塞渲染）。
  */
 export const fetchAttachment = async (id: string): Promise<Blob | undefined> => {
@@ -190,37 +360,42 @@ export const fetchAttachment = async (id: string): Promise<Blob | undefined> => 
   }
 }
 
-/**
- * 把本地某个会话推上去（对话结束后调用）。
- * 读一次本地库再推，避免把正在流式更新的半成品推上去。
- */
-export const pushSession = async (sessionId: string): Promise<boolean> => {
-  try {
-    const session = await loadSession(sessionId)
-    if (!session) {
-      return false
-    }
-    const written = await pushSessions([session])
-    return written > 0
-  } catch {
-    return false
-  }
+export type GcReport = {
+  dryRun: boolean
+  graceDays: number
+  candidates: Array<{ id: string; size: number; ageDays: number }>
+  removed: number
 }
 
 /**
- * 删除一条会话（云端为主模型）。
+ * 触发服务端附件回收（默认 dryRun，真删要显式传 dryRun:false）。
  *
- * 顺序：**先删云端，成功后再删本地**。反过来的话，
- * 云端删失败、本地已删，下次同步又会把它拉回来，用户会看到"删了又出现"。
+ * 刻意没接进界面：真删不可逆，这种操作应该由运维脚本（gateway/scripts/gc-files.ts）
+ * 或 cron 决定，不该让用户在一次误触里清掉历史图片。这里留一个客户端入口，
+ * 是为了排查「某个附件为什么没了」时能先 dry-run 看一遍清单。
  */
-export const deleteRemoteSession = async (sessionId: string): Promise<boolean> => {
+export const gcRemoteFiles = async (
+  options: { dryRun?: boolean; graceDays?: number } = {}
+): Promise<GcReport | null> => {
   try {
-    const response = await fetch(
-      `${apiOrigin()}/sync/session?id=${encodeURIComponent(sessionId)}`,
-      { method: 'DELETE', headers: jsonHeaders() }
-    )
-    return response.ok
+    const response = await fetch(`${apiOrigin()}/sync/files/gc`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        dryRun: options.dryRun !== false,
+        graceDays: options.graceDays ?? 7,
+      }),
+    })
+    if (!response.ok) {
+      return null
+    }
+    return (await response.json()) as GcReport
   } catch {
-    return false
+    return null
   }
+}
+
+/** 把云端正文写进本地缓存（附件走懒加载，这里不带 files；也不触发"落库后推云端"） */
+export const cacheSession = async (session: Session): Promise<void> => {
+  await cacheSessionOnly(session)
 }

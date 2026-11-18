@@ -12,7 +12,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { Readable, Transform } from 'node:stream'
 import { timingSafeEqual } from 'node:crypto'
-import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { ChatModel } from '../../shared/protocol.js'
 /**
@@ -1181,12 +1181,19 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const dir = join(MEMORY_DATA_DIR, user.id, 'files')
       const names = await readdir(dir).catch(() => [] as string[])
-      const files: Array<{ id: string; size: number; updatedAt: number }> = []
+      /** 引用计数：客户端据此知道哪些附件是孤儿（阶段 3） */
+      const refs = authStore.fileRefCounts(user.id)
+      const files: Array<{ id: string; size: number; updatedAt: number; refs: number }> = []
       for (const name of names) {
         if (name.endsWith('.tmp')) continue
         const info = await stat(join(dir, name)).catch(() => null)
         if (info && info.isFile()) {
-          files.push({ id: name, size: info.size, updatedAt: Math.round(info.mtimeMs) })
+          files.push({
+            id: name,
+            size: info.size,
+            updatedAt: Math.round(info.mtimeMs),
+            refs: refs.get(name) ?? 0,
+          })
         }
       }
       json(res, 200, { ok: true, files })
@@ -1251,6 +1258,103 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   }
 
   /**
+   * 附件回收（阶段 3）：删掉「零引用且超过宽限期」的附件。
+   *
+   * 默认 dryRun —— 真删不可逆，默认必须是安全的那一侧，不能指望调用方记得传 dryRun。
+   * 宽限期存在的理由：附件上传与"引用它的会话推上来"之间有真实的时间差，
+   * 刚上传但会话还没同步完的图片，在引用表里就是零引用。
+   */
+  if (req.method === 'POST' && url.pathname === '/sync/files/gc') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const read = await readBodyCapped(req, 64 * 1024)
+    let body: Record<string, unknown> = {}
+    if (read.ok && read.buffer.length > 0) {
+      try {
+        body = JSON.parse(read.buffer.toString('utf8')) as Record<string, unknown>
+      } catch {
+        body = {}
+      }
+    }
+    const dryRun = body.dryRun !== false
+    const graceDays = Math.min(Math.max(Number(body.graceDays ?? 7) || 0, 0), 3650)
+    const refs = authStore.fileRefCounts(user.id)
+    const sessionCount = authStore.countSessions(user.id)
+    /**
+     * 安全护栏：引用表没建起来时，一个文件都不许删。
+     *
+     * 注意判断的是"重建跑过没有"，不是"引用表空不空" ——
+     * 用户删掉最后一条引用附件的会话之后，引用表本来就该是空的，
+     * 那恰恰是需要回收的时刻。只有重建没跑过（迁移失败）时，
+     * 所有文件才会看起来都是零引用，真删一次就清空用户的全部图片。
+     */
+    if (!authStore.refsTrusted()) {
+      json(res, 409, {
+        ok: false,
+        error: 'refs_not_ready',
+        message: '附件引用表尚未建立，已拒绝回收；请先调用 /sync/files/refs/rebuild',
+      })
+      return
+    }
+    try {
+      const dir = join(MEMORY_DATA_DIR, user.id, 'files')
+      const names = await readdir(dir).catch(() => [] as string[])
+      const now = Date.now()
+      const cutoff = now - graceDays * 86_400_000
+      const candidates: Array<{ id: string; size: number; ageDays: number }> = []
+      for (const name of names) {
+        // 只认合法附件 id：.tmp 之类的半截文件不是附件，不该走这条路径
+        if (!/^[A-Za-z0-9_-]{8,80}$/.test(name)) continue
+        if ((refs.get(name) ?? 0) > 0) continue
+        const info = await stat(join(dir, name)).catch(() => null)
+        if (!info?.isFile() || Math.round(info.mtimeMs) > cutoff) continue
+        candidates.push({
+          id: name,
+          size: info.size,
+          ageDays: Math.floor((now - info.mtimeMs) / 86_400_000),
+        })
+      }
+      if (!dryRun) {
+        for (const item of candidates) {
+          await unlink(join(dir, item.id)).catch(() => undefined)
+        }
+      }
+      json(res, 200, {
+        ok: true,
+        dryRun,
+        graceDays,
+        sessions: sessionCount,
+        referencedFiles: refs.size,
+        candidates,
+        removed: dryRun ? 0 : candidates.length,
+      })
+    } catch (error) {
+      console.warn('[gateway] 附件回收失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'gc_failed', message: '附件回收失败' })
+    }
+    return
+  }
+
+  /** 全量重建该账号的附件引用（从会话 payload 重算），修好"计数偏小 → 误删"的前提 */
+  if (req.method === 'POST' && url.pathname === '/sync/files/refs/rebuild') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    try {
+      json(res, 200, { ok: true, ...authStore.rebuildRefs(user.id) })
+    } catch (error) {
+      console.warn('[gateway] 引用重建失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'rebuild_failed', message: '引用重建失败' })
+    }
+    return
+  }
+
+  /**
    * 会话云端同步：把手机上的会话推到服务器。
    *
    * body: { sessions: [{ id, title, createdAt, updatedAt, payload }] }
@@ -1303,6 +1407,16 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
             title: typeof item.title === 'string' ? item.title : '',
             createdAt: Number(item.createdAt ?? Date.now()),
             updatedAt: Number(item.updatedAt ?? Date.now()),
+            pinned: item.pinned === true,
+            /**
+             * 客户端本地算好的附件引用。服务端还会自己从 payload 抽一遍作为兜底，
+             * 但优先用客户端这份：它已经有摘要里的 fileIds，不必再解析几百 KB 的 JSON。
+             */
+            fileIds: Array.isArray(item.fileIds)
+              ? (item.fileIds as unknown[])
+                  .filter((id): id is string => typeof id === 'string')
+                  .slice(0, 200)
+              : undefined,
             payload: String(item.payload),
           }))
       )
@@ -1314,7 +1428,12 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
-  /** 会话清单（不含正文）：App 用它比对哪些需要下载 */
+  /**
+   * 会话清单（不含正文）：App 列表**以它为准**（阶段 2-1），本地只是缓存。
+   *
+   * 分页用复合游标（时间 + id）：同一毫秒可能有多条会话，
+   * 只用时间做游标跨页时会漏掉并列的那几条，而客户端翻完最后一页就当拿到全量。
+   */
   if (req.method === 'GET' && url.pathname === '/sync/sessions') {
     const user = userFromRequest(req)
     if (!user) {
@@ -1322,12 +1441,43 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       return
     }
     const since = Number(url.searchParams.get('since') ?? 0) || 0
-    const limit = Number(url.searchParams.get('limit') ?? 0) || undefined
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 0) || 500, 1), 500)
+    const before = Number(url.searchParams.get('before') ?? 0) || 0
+    const beforeId = url.searchParams.get('beforeId') ?? ''
+    const deletedBefore = Number(url.searchParams.get('deletedBefore') ?? 0) || 0
+    const deletedBeforeId = url.searchParams.get('deletedBeforeId') ?? ''
+    // 多取一条用来判断"还有没有下一页"，比再发一次 count 查询便宜
+    const pagePlusOne = authStore.listSessions(user.id, {
+      since,
+      before,
+      beforeId,
+      limit: limit + 1,
+    })
+    const hasMore = pagePlusOne.length > limit
+    const sessions = pagePlusOne.slice(0, limit)
+    const deletedPlusOne = authStore.listTombstones(user.id, {
+      since,
+      before: deletedBefore,
+      beforeId: deletedBeforeId,
+      limit: limit + 1,
+    })
+    const deletedHasMore = deletedPlusOne.length > limit
+    const deleted = deletedPlusOne.slice(0, limit)
+    const last = sessions.at(-1)
+    const lastDeleted = deleted.at(-1)
     json(res, 200, {
       ok: true,
-      sessions: authStore.listSessions(user.id, { since, limit }),
+      sessions,
       /** 墓碑：这些会话已被删除，客户端要删掉本地副本 */
-      deleted: authStore.listTombstones(user.id, since),
+      deleted,
+      hasMore,
+      nextBefore: hasMore && last ? last.updatedAt : 0,
+      nextBeforeId: hasMore && last ? last.id : '',
+      deletedHasMore,
+      nextDeletedBefore: deletedHasMore && lastDeleted ? lastDeleted.deletedAt : 0,
+      nextDeletedBeforeId: deletedHasMore && lastDeleted ? lastDeleted.id : '',
+      /** 客户端用它做增量同步的 since（避免用本机时钟，那台手机可能不准） */
+      serverTime: Date.now(),
     })
     return
   }

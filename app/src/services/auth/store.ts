@@ -10,7 +10,6 @@ import { ApiError } from '../api/client.js'
 import { setApiKey, useSettings } from '../settings.js'
 import { loadUpstreamKey } from '../secure/upstreamKey.js'
 import * as api from './client.js'
-import { pullSessions } from '../sync/index.js'
 
 export type AuthStatus = 'unknown' | 'signedOut' | 'signedIn'
 
@@ -55,10 +54,11 @@ export const initAuth = async (): Promise<void> => {
     const result = await api.me(token)
     useAuth.setState({ status: 'signedIn', user: result.user, error: null })
     /**
-     * 登录成功 → 全量拉云端会话（换新手机就靠这一步恢复）。
-     * 失败不影响使用：本地有什么用什么。
+     * 登录成功 → 同步一次（阶段 2-1：列表以云端为准）。
+     * 失败不影响使用：本地缓存有什么先显示什么，状态条会说明在重试。
      */
-    void pullSessions()
+    void import('../sync/engine.js')
+      .then((engine) => engine.syncNow())
       .catch(() => undefined)
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {

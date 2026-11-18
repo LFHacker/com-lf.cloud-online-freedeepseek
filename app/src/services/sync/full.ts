@@ -77,9 +77,9 @@ export const pushEverything = async (
   const BATCH = 50
   for (let index = 0; index < sessions.length; index += BATCH) {
     const batch = sessions.slice(index, index + BATCH)
-    const written = await pushSessions(batch)
-    result.sessionsPushed += written
-    result.sessionsFailed += Math.max(0, batch.length - written)
+    const pushed = await pushSessions(batch)
+    result.sessionsPushed += pushed.written
+    result.sessionsFailed += pushed.failed
     onProgress?.({
       phase: 'sessions',
       done: Math.min(index + BATCH, sessions.length),
@@ -95,7 +95,8 @@ export const pushEverything = async (
     }
   }
   const remote = await listRemoteFiles()
-  const missing = [...fileIds].filter((id) => !remote.has(id))
+  // 清单拉不到（网络失败）不等于云端没有：全部当缺的上传，失败的自会计数
+  const missing = [...fileIds].filter((id) => !remote || !remote.has(id))
   result.filesSkipped = fileIds.size - missing.length
 
   let uploaded = 0

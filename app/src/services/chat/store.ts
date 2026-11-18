@@ -15,6 +15,16 @@ import {
   prepareDraftMessage,
 } from './drafts.js'
 import { createLatestReminder } from './latestReminder.js'
+import { cloudLooksWiped, mergeSessionIndex } from '../sync/merge.js'
+import {
+  dropOutboxEntry,
+  enqueueOutbox,
+  hasPendingForSession,
+  onOutboxEvent,
+  useOutbox,
+  type OutboxRecord,
+} from '../sync/outbox.js'
+import { fetchSessionPayload } from '../sync/index.js'
 import {
   applyEvent,
   canContinueReply,
@@ -323,8 +333,16 @@ export const initChat = (): Promise<void> => {
   initTask = (async () => {
     try {
       const summaries = await db.loadSessionSummaries()
+      /**
+       * 列表以云端为准（阶段 2-1）：启动时先把上一次拿到的云端清单读出来，
+       * 和本地缓存合并 —— 离线启动也能看到完整列表，
+       * 而不是"只有本机打开过的那几条"。联网后由 syncNow 覆盖成最新。
+       */
+      const cachedIndex = await db.loadCloudIndex().catch(() => [] as db.CloudSessionMeta[])
+      const merged =
+        cachedIndex.length > 0 ? mergeSessionIndex(summaries, cachedIndex, []).sessions : summaries
       if (epoch === historyEpoch) {
-        set({ ready: true, sessions: sortSessions(summaries) })
+        set({ ready: true, sessions: sortSessions(merged) })
       }
     } catch (error) {
       if (epoch === historyEpoch) {
@@ -339,6 +357,127 @@ export const initChat = (): Promise<void> => {
   })()
   return initTask
 }
+
+export type RemoteApplyResult = {
+  /** 云端清单看起来像被清空了，本轮拒绝合并（保住本地数据） */
+  suspicious: boolean
+  /** 按墓碑删掉的本地会话数 */
+  removed: number
+  /** 只在云端、本地没有正文的会话数（列表里有，点开才下载） */
+  added: number
+}
+
+/**
+ * 把云端清单合并进列表（阶段 2-1 的核心）。
+ *
+ * 这里是"云端为主"落地的地方，三条不可让的规则：
+ *  1. 云端清单为空且没有墓碑 → 判为异常，**不合并**（一次网络抖动不能清空历史）
+ *  2. 云端有、本地没有 → 列表照常显示，正文点开时才下载
+ *  3. 本地有、云端没有 → 保留并推上去，绝不静默丢弃
+ */
+export const applyRemoteIndex = (
+  remote: db.CloudSessionMeta[],
+  deleted: Array<{ id: string }>
+): RemoteApplyResult => {
+  const local = get().sessions
+  const deletedIds = deleted
+    .map((item) => item?.id)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  if (cloudLooksWiped(local.length, remote.length, deletedIds.length)) {
+    return { suspicious: true, removed: 0, added: 0 }
+  }
+  const { sessions, toPush, removed, remoteOnly } = mergeSessionIndex(local, remote, deletedIds)
+  // 正在删除的会话不在这里重复删（用户主动删除的流程自己收尾）
+  const gone = new Set(removed.filter((id) => !deletingSessions.has(id)))
+  for (const id of gone) {
+    void db.deleteSession(id).catch(db.reportStorageError('delete session'))
+    sessionAccess.delete(id)
+    unsavedSessions.delete(id)
+    pendingFiles.delete(id)
+    sessionLoads.delete(id)
+    clearDraft(id)
+  }
+  // 刷新离线副本：墓碑不在 remote 里，写入即等于把它从缓存里清掉
+  void db.replaceCloudIndex(remote).catch(db.reportStorageError('cache cloud index'))
+  set((state) => ({
+    sessions: sortSessions(sessions.filter((session) => !gone.has(session.id))),
+    sessionCache: Object.fromEntries(
+      Object.entries(state.sessionCache).filter(([id]) => !gone.has(id))
+    ),
+    sessionLoadErrors: Object.fromEntries(
+      Object.entries(state.sessionLoadErrors).filter(([id]) => !gone.has(id))
+    ),
+    sessionSaveErrors: Object.fromEntries(
+      Object.entries(state.sessionSaveErrors).filter(([id]) => !gone.has(id))
+    ),
+    activeId: state.activeId !== null && gone.has(state.activeId) ? null : state.activeId,
+  }))
+  /**
+   * 本地更新 / 云端没有的推上去。失败不打扰用户：
+   * 下一次同步会再比一次，仍然不一致就再推。
+   */
+  for (const id of toPush) {
+    void import('../sync/index.js')
+      .then((sync) => sync.pushSession(id))
+      .catch(() => undefined)
+  }
+  return { suspicious: false, removed: gone.size, added: remoteOnly.length }
+}
+
+/**
+ * 队列确认之后才开始回答（阶段 2-2）。
+ *
+ * 能走到这里说明服务端已经收下这条消息，现在起流是安全的；
+ * 离线时它根本不会被调用，消息会一直挂在队列上。
+ */
+const startConfirmedReply = async (entry: OutboxRecord): Promise<void> => {
+  const { sessionId } = entry
+  /**
+   * 重启后队列还在、但列表可能是空的（还没同步完）：先把这条会话弄进内存，
+   * 否则确认完却起不了流，用户会看到"消息发出去了但没有回答"。
+   */
+  if (!get().sessions.some((session) => session.id === sessionId)) {
+    const remote = await fetchSessionPayload(sessionId).catch(() => null)
+    if (remote) {
+      await import('../sync/index.js')
+        .then((sync) => sync.cacheSession(remote))
+        .catch(() => undefined)
+      set((state) =>
+        state.sessions.some((session) => session.id === sessionId)
+          ? state
+          : { sessions: sortSessions([...state.sessions, toSessionSummary(remote)]) }
+      )
+    }
+  }
+  await ensureSessionLoaded(sessionId).catch(() => undefined)
+  const session = getSession(sessionId)
+  if (!session || getStreamController(sessionId)) {
+    return
+  }
+  const path = getVisibleMessages(session)
+  const index = path.findIndex((message) => message.id === entry.id)
+  const question = path[index]
+  if (question?.role !== 'user') {
+    return
+  }
+  // 已经有回答了（用户手动重试过、或这条是重复投递）：不要再来一遍
+  if (path[index + 1]?.role === 'assistant') {
+    return
+  }
+  const reply = createReply()
+  updateSession(sessionId, (current) => ({
+    ...appendBranch(current, question.id, [reply]),
+    updatedAt: Date.now(),
+  }))
+  persist(sessionId)
+  void streamReply(sessionId, reply, { history: path.slice(0, index), question })
+}
+
+onOutboxEvent((event) => {
+  if (event.type === 'confirmed') {
+    void startConfirmedReply(event.entry)
+  }
+})
 
 /** 同一会话合并并发读取；切换只改变 activeId，旧请求不会把界面切回去。 */
 const ensureSessionLoaded = (id: string): Promise<void> => {
@@ -355,13 +494,27 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
   sessionLoads.set(id, load)
   load.promise = (async () => {
     try {
-      const stored = await db.loadSession(id)
+      let stored = await db.loadSession(id)
       if (epoch !== historyEpoch || sessionLoads.get(id) !== load) {
         return
       }
       const summary = get().sessions.find((session) => session.id === id)
       if (!summary) {
         return
+      }
+      /**
+       * 云端为主：本地没有正文、或云端的更新（别的设备改过）→ 从云端取一次。
+       * 本地更新的情况（还没推上去）必须保留本地，否则会把用户刚改的内容冲掉。
+       */
+      if (!stored || (stored.updatedAt ?? 0) < summary.updatedAt) {
+        const remote = await fetchSessionPayload(id).catch(() => null)
+        if (remote) {
+          stored = remote
+          // 写缓存不写"推回云端"钩子：它本来就是云端来的
+          await import('../sync/index.js')
+            .then((sync) => sync.cacheSession(remote))
+            .catch(() => undefined)
+        }
       }
       if (!stored) {
         throw new Error(`Session ${id} is missing from local storage`)
@@ -479,6 +632,23 @@ export const selectSession = (id: string) => {
   }
 }
 
+/**
+ * 未缓存的会话要先从云端把正文拉下来，才改得动、也才推得上去。
+ *
+ * 云端为主之后列表里的会话不一定有本地正文（点开才下载），
+ * 而推送推的是**整条 payload** —— 本地没正文就没东西可推，
+ * 硬改摘要只会在下次同步时被云端标题覆盖回来。
+ */
+const loadThenMutate = (id: string, mutate: () => void) => {
+  void ensureSessionLoaded(id)
+    .then(() => {
+      if (getSession(id)) {
+        mutate()
+      }
+    })
+    .catch(() => undefined)
+}
+
 /** 置顶/取消置顶。置顶的会话在列表里排在最前。 */
 export const setSessionPinned = (id: string, pinned: boolean) => {
   if (get().importingHistory || deletingSessions.has(id)) {
@@ -489,12 +659,13 @@ export const setSessionPinned = (id: string, pinned: boolean) => {
     persist(id)
     set((state) => ({ sessions: sortSessions(state.sessions) }))
   } else {
+    // 先乐观改列表：点一下要立刻看到反应，不能等网络
     set((state) => ({
       sessions: sortSessions(
         state.sessions.map((session) => (session.id === id ? { ...session, pinned } : session))
       ),
     }))
-    void db.setSessionPinned(id, pinned).catch(db.reportStorageError('pin session'))
+    loadThenMutate(id, () => setSessionPinned(id, pinned))
   }
 }
 
@@ -515,7 +686,7 @@ export const renameSession = (id: string, title: string) => {
         session.id === id ? { ...session, title } : session
       ),
     }))
-    void db.renameSession(id, title).catch(db.reportStorageError('rename session'))
+    loadThenMutate(id, () => renameSession(id, title))
   }
 }
 
@@ -550,11 +721,20 @@ const removeSessionData = async (id: string): Promise<boolean> => {
      * 本地也不删 —— 宁可删不掉，也不要制造幽灵会话。
      */
     const { deleteRemoteSession } = await import('../sync/index.js')
-    const remoteDeleted = await deleteRemoteSession(id).catch(() => false)
-    if (!remoteDeleted) {
+    const outcome = await deleteRemoteSession(id).catch(() => ({ ok: false, retryable: true }))
+    if (!outcome.ok) {
       return false
     }
     await db.deleteSession(id)
+    /**
+     * 这条会话的待发送消息一起作废：会话都没了，消息发出去也没有地方落，
+     * 而且推上去还会把刚删掉的会话"复活"（服务端虽然没有复活它，但白推一次）。
+     */
+    for (const entry of Object.values(useOutbox.getState().entries)) {
+      if (entry.sessionId === id) {
+        void dropOutboxEntry(entry.id)
+      }
+    }
     if (epoch !== historyEpoch) {
       return true
     }
@@ -639,6 +819,14 @@ export const sendMessage = (targetSessionId: string | null) => {
   if (!current) {
     return false
   }
+  /**
+   * 同一个会话同时只允许一条"未确认"的消息。
+   * 两条一起确认会让两个回复流抢同一个 streaming 槽（那槽按会话 id 存），
+   * 后一个会覆盖前一个的 abort controller。
+   */
+  if (hasPendingForSession(sessionId)) {
+    return false
+  }
   const history = getVisibleMessages(current)
   const question: UserMessage = {
     id: createId(),
@@ -654,9 +842,8 @@ export const sendMessage = (targetSessionId: string | null) => {
     })),
     createdAt: now,
   }
-  const reply = createReply()
   updateSession(sessionId, (session) => ({
-    ...appendBranch(session, history.at(-1)?.id ?? null, [question, reply]),
+    ...appendBranch(session, history.at(-1)?.id ?? null, [question]),
     updatedAt: now,
   }))
   if (files.length > 0) {
@@ -667,7 +854,12 @@ export const sendMessage = (targetSessionId: string | null) => {
   }
   persist(sessionId)
   clearSentDraft(targetSessionId)
-  void streamReply(sessionId, reply, { history, question })
+  /**
+   * 服务端确认后再回答（阶段 2-2）：
+   * 消息先进本地持久队列，等网关确认它已经落到云端，才起流。
+   * 离线时它留在队列里（关掉 App 也不丢），恢复后自动补发。
+   */
+  void enqueueOutbox({ id: question.id, sessionId })
   return true
 }
 

@@ -11,6 +11,7 @@ import {
 import { setSearch, setThinking, useSettings } from '../../services/settings.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { sendMessage, setPendingMemoryScope, stopReply, useChatStore } from '../../services/chat/store.js'
+import { useOutbox } from '../../services/sync/outbox.js'
 import {
   addDraftFiles,
   EMPTY_DRAFT,
@@ -140,7 +141,18 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const recording = voice.status === 'recording'
 
   // 排队、上传中或上传失败的附件都留在输入框，全部上传成功后才能发送
-  const canSend = !importingHistory && !streaming && voice.status === 'idle' && draftReady
+  /**
+   * 服务端确认前（阶段 2-2）这个会话里始终有一条"未确认"的消息，
+   * 这时不能再发 —— 两条同时确认会让两个回复流抢同一个槽。
+   */
+  const pendingSend = useOutbox((state) =>
+    sessionId === null
+      ? false
+      : Object.values(state.entries).some(
+          (entry) => entry.sessionId === sessionId && entry.status !== 'failed'
+        )
+  )
+  const canSend = !importingHistory && !streaming && !pendingSend && voice.status === 'idle' && draftReady
 
   const send = () => {
     if (
@@ -151,7 +163,13 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
       return
     }
     // 文本与上传完成态由提交动作读取最新快照，不使用上一次渲染的草稿。
-    if (!ensureApiKey() || !sendMessage(sessionId)) {
+    if (!ensureApiKey()) {
+      return
+    }
+    if (!sendMessage(sessionId)) {
+      if (pendingSend) {
+        showToast({ key: 'sendWhilePending' })
+      }
       return
     }
     stopReadAloud()

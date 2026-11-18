@@ -4,6 +4,7 @@ import { memo, useLayoutEffect, useRef, useState } from 'react'
 import { useIsMobile } from '../../app/viewport.js'
 import { IconEditOutline16 } from '../base/icons.js'
 import { editMessage, retryUpload } from '../../services/chat/store.js'
+import { retryOutboxEntry, useOutbox } from '../../services/sync/outbox.js'
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import type { UserMessage as UserMessageType } from '../../services/chat/types.js'
 import { Button } from '../base/Button.js'
@@ -44,6 +45,8 @@ export const UserMessage = memo(function UserMessage({
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const isMobile = useIsMobile()
   const canSend = !busy && (draft.trim() !== '' || message.files.length > 0)
+  /** 还没被服务端确认的这条消息（阶段 2-2）：确认前它不算"发出去" */
+  const pending = useOutbox((state) => state.entries[message.id])
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current
@@ -113,6 +116,21 @@ export const UserMessage = memo(function UserMessage({
       ) : (
         <>
           {message.content ? <div className={styles.bubble}>{message.content}</div> : null}
+          {pending ? (
+            pending.status === 'failed' ? (
+              <button
+                type="button"
+                className={clsx(styles.status, styles.statusFailed)}
+                onClick={() => void retryOutboxEntry(pending.id)}
+              >
+                {t('messageSendFailed')}
+              </button>
+            ) : (
+              <span className={styles.status}>
+                {pending.status === 'sending' ? t('messageSending') : t('messageQueued')}
+              </span>
+            )
+          ) : null}
           <div className={styles.bottom}>
             <div className={clsx(styles.actions, isLast && styles.alwaysShow)}>
               {message.content ? <CopyButton text={message.content} /> : null}

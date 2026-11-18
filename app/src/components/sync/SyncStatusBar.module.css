@@ -1,0 +1,69 @@
+/* 顶部同步状态条：一行、克制、只在需要时出现 */
+.bar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.06));
+  background: var(--dsw-alias-bg-layer-2, #f7f8fa);
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.active {
+  color: var(--dsw-alias-brand-primary, #4d6bfe);
+  /* 同步中给一点呼吸感；减少动态偏好下保持静止 */
+  animation: syncPulse 1.4s ease-in-out infinite;
+}
+
+.wait {
+  color: var(--dsw-static-amber-500, #f59e0b);
+}
+
+.offline {
+  color: var(--dsw-alias-label-tertiary, #9ca3af);
+}
+
+.error {
+  color: var(--dsw-alias-state-error-primary, #d92d20);
+}
+
+@keyframes syncPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .active {
+    animation: none;
+  }
+}
+
+@media not all and (min-width: 768px) {
+  .bar {
+    padding: 6px 12px;
+  }
+}

@@ -33,6 +33,7 @@ import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall, injectStable } from './memory/wire.ts'
 import { ensureProfile, readProfileConfig } from './memory/profile.ts'
+import { isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
 const VERSION = '1.1.4'
 const PORT = Number(process.env.PORT ?? 8787)
@@ -1035,6 +1036,55 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
+  /**
+   * 账户余额：用**用户自己的 Key** 去问上游，网关不保存任何 Key。
+   * 这个接口只是"带鉴权的转发"，余额数据不落库。
+   */
+  if (req.method === 'GET' && url.pathname === '/usage/balance') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    const key = (readHeader(req, 'x-deepseek-key') ?? '').trim()
+    if (key.length < 20) {
+      json(res, 409, { ok: false, error: 'no_upstream_key', message: '还没有填写 DeepSeek API Key' })
+      return
+    }
+    try {
+      const upstreamBalance = await fetch(`${UPSTREAM}/user/balance`, {
+        headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+      })
+      const payload = (await upstreamBalance.json()) as Record<string, unknown>
+      if (!upstreamBalance.ok) {
+        json(res, 502, { ok: false, error: 'balance_failed', message: '查询余额失败，请检查 Key 是否有效' })
+        return
+      }
+      json(res, 200, { ok: true, ...payload })
+    } catch (error) {
+      console.warn('[gateway] 余额查询失败:', error instanceof Error ? error.message : error)
+      json(res, 502, { ok: false, error: 'balance_failed', message: '查询余额失败，请稍后重试' })
+    }
+    return
+  }
+
+  /** 价格表 + 当前是否峰时（前端据此算费用，价格不写死在 App 里） */
+  if (req.method === 'GET' && url.pathname === '/usage/pricing') {
+    const peak = readPriceTable(process.env)
+    const now = new Date()
+    json(res, 200, {
+      ok: true,
+      currency: peak.currency,
+      unit: 'USD / 1M tokens',
+      peak: isPeakNow(now),
+      peakTable: peak,
+      offPeakTable: offPeakTable(peak),
+      peakWindows: 'UTC 周一至周五 01:00–04:00、06:00–10:00',
+      note: '估算值，以平台实际扣费为准',
+    })
+    return
+  }
   if (req.method === 'GET' && url.pathname === '/health') {
     json(res, 200, {
       ok: true,
@@ -1347,7 +1397,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'GET' && url.pathname === '/auth/me') {
       const user = userFromRequest(req)
       if (!user) {
-        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
         return
       }
       const store = memoryFor(user)
@@ -1381,7 +1431,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'POST' && url.pathname === '/auth/password') {
       const user = userFromRequest(req)
       if (!user) {
-        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
         return
       }
       const body = await readJsonBody()
@@ -1413,7 +1463,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'POST' && url.pathname === '/auth/upstream-key') {
       const user = userFromRequest(req)
       if (!user) {
-        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
         return
       }
       const body = await readJsonBody()
@@ -1461,7 +1511,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'GET' && url.pathname === '/auth/upstream-key') {
       const user = userFromRequest(req)
       if (!user) {
-        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
         return
       }
       const info = authStore.getUpstreamKey(user.id)
@@ -1477,7 +1527,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'DELETE' && url.pathname === '/auth/upstream-key') {
       const user = userFromRequest(req)
       if (!user) {
-        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
         return
       }
       authStore.clearUpstreamKey(user.id)
@@ -1490,7 +1540,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'PATCH' && url.pathname === '/auth/profile') {
       const user = userFromRequest(req)
       if (!user) {
-        fail(401, 'unauthorized', '登录状态已失效，请重新登录')
+        json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
         return
       }
       const body = await readJsonBody()

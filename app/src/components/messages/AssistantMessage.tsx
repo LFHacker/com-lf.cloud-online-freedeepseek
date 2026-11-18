@@ -15,6 +15,7 @@ import { SiteThumbnails } from '../search/SiteLogo.js'
 import { toggleSearchPanel, useSearchPanel } from '../search/searchPanelState.js'
 import { ReadAloudButton } from './ReadAloudButton.js'
 import { CopyButton } from './CopyButton.js'
+import { MessageStats } from './MessageStats.js'
 import { ReplyArea } from './ReplyArea.js'
 import { useReplyView } from './useReplyView.js'
 import {
@@ -144,6 +145,8 @@ export const AssistantMessage = memo(function AssistantMessage({
           </span>
         </div>
       ) : null}
+      {/* 本轮用量：token、缓存命中率、记忆条数、估算费用 */}
+      {streaming ? null : <MessageStats usage={message.usage} isLast={isLast} />}
       {streaming ? null : (
         <div className={styles.bottom}>
           <BranchSwitcher versions={versions} disabled={busy} onSelect={onSelectVersion} />

@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslate } from '../../i18n/index.js'
 import { changePassword } from '../../services/auth/client.js'
 import { replaceToken, signOut, useAuth } from '../../services/auth/store.js'
 import { apiOrigin } from '../../services/api/client.js'
 import { renameSelf } from '../../services/auth/client.js'
+import { loadBalance, type BalanceInfo } from '../../services/usage/index.js'
 import { useSettings } from '../../services/settings.js'
 import styles from './Settings.module.css'
 
@@ -25,6 +26,20 @@ export const AccountField = () => {
   const [editingName, setEditingName] = useState(false)
   const [draftName, setDraftName] = useState('')
   const [nameBusy, setNameBusy] = useState(false)
+  const [balance, setBalance] = useState<BalanceInfo[] | null>(null)
+
+  // 余额只在打开设置时拉一次；失败就静默不显示，不要为它弹错误
+  useEffect(() => {
+    let alive = true
+    void loadBalance().then((result) => {
+      if (alive && result) {
+        setBalance(result.infos)
+      }
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
 
   const origin = apiOrigin()
 
@@ -76,6 +91,17 @@ export const AccountField = () => {
             <div className={styles.accountMeta}>
               {user?.role === 'admin' ? t('accountRoleAdmin') : t('accountRoleUser')} · {origin}
             </div>
+            {balance && balance.length > 0 ? (
+              <div className={styles.accountMeta}>
+                {t('accountBalance')}：
+                {balance.map((item) => (
+                  <b key={item.currency}>
+                    {item.currency === 'CNY' ? '¥' : '$'}
+                    {item.total}
+                  </b>
+                ))}
+              </div>
+            ) : null}
             <div className={styles.accountMeta}>
               {t('accountUsername')}：{user?.username ?? '—'} · {t('accountPublicId')}：{user?.publicId ?? '—'}
             </div>

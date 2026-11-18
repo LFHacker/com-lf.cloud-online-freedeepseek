@@ -74,10 +74,36 @@ const readErrorResponse = async (
   return new ApiError(kind, message, response.status)
 }
 
+/**
+ * 网关在响应头里额外给了两条本轮元信息：
+ *   x-ds-memory-recall       本次注入了多少条记忆
+ *   x-ds-context-kept-tokens 裁剪后保留了多少上下文 token
+ * 响应头只能在拿到 Response 的那一刻读，所以在这里顺手存一份给界面用。
+ */
+export type TurnMeta = { memoryHits: number; contextTokens: number; at: number }
+
+let lastTurnMeta: TurnMeta | null = null
+
+/** 最近一次请求的元信息（界面渲染「本轮」统计用；刷新页面会丢，属预期） */
+export const readLastTurnMeta = (): TurnMeta | null => lastTurnMeta
+
+const captureTurnMeta = (response: Response): void => {
+  const recall = Number(response.headers.get('x-ds-memory-recall') ?? '')
+  const kept = Number(response.headers.get('x-ds-context-kept-tokens') ?? '')
+  if (!Number.isFinite(recall) && !Number.isFinite(kept)) {
+    return
+  }
+  lastTurnMeta = {
+    memoryHits: Number.isFinite(recall) ? recall : 0,
+    contextTokens: Number.isFinite(kept) ? kept : 0,
+    at: Date.now(),
+  }
+}
 export const request = async (url: string, init: RequestInit): Promise<Response> => {
   let response: Response
   try {
     response = await fetch(url, init)
+    captureTurnMeta(response)
   } catch (error) {
     if (init.signal?.aborted) {
       throw error

@@ -1,0 +1,32 @@
+/* 一轮回答下方的用量统计：小、灰、不抢注意力 */
+.line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  padding: 0 2px;
+  color: var(--text-secondary, #8a8f99);
+  font-size: 12px;
+  line-height: 1.6;
+  user-select: text;
+}
+
+.item {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.item b {
+  font-weight: 600;
+  color: var(--text-primary, #3c4149);
+}
+
+.estimate {
+  margin-left: 2px;
+  font-style: normal;
+  font-size: 11px;
+  opacity: 0.7;
+}

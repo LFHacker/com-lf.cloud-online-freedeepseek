@@ -780,3 +780,24 @@ api.deepseek.com
 - 每账号 token 用量统计（现在只限请求数，未统计上游 usage）
 - 2FA、登录审计日志
 - 记忆库明文落盘（SQLCipher）
+
+### 自动推送打通（2026-11-18）
+
+**结论：SSH 部署密钥 + 无密码私钥 + ssh.github.com:443。**
+
+**踩坑：`ssh-keygen -N '""'` 在 PowerShell 里会传入字面两个引号**，等于给私钥设了密码 `""`。
+表现极具误导性：日志里先出现 `Server accepts key`（GitHub 认这把钥匙），紧接着
+`we did not send a packet, disable method` + `Permission denied (publickey)` ——
+看起来像"权限没配对"，实际是**客户端无法用带密码的私钥签名**（BatchMode 下不能提示输入）。
+
+**正确做法**：用 Node 的 `execFileSync` 传 argv 绕开 shell 引号：
+`['-p','-f',key,'-P','""','-N','']` —— 把旧密码 `""` 改成空。
+
+**配置**
+
+- `~/.ssh/config`：`Host github.com` → `HostName ssh.github.com` / `Port 443` / 指定 IdentityFile / IdentitiesOnly yes
+  （本机到 22 端口被拒，443 可用）
+- `scripts/sync.ps1`：先跑密钥检查，再 `git push`，可带 `-Tag`
+
+**限制**：Deploy key 只能做 git 操作；**创建 Release 并上传 APK 需要 API 令牌**（PAT）。
+所以"推代码"是自动的，"挂附件到 Release"目前仍需要令牌或手工操作。

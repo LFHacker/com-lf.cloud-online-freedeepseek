@@ -40,8 +40,14 @@ export const createLatestReminder = (
   {
     locale,
     location,
+    ipLocation,
     contextInfo,
-  }: { locale: Locale; location: UserLocation | null; contextInfo?: boolean },
+  }: {
+    locale: Locale
+    location: UserLocation | null
+    ipLocation?: UserLocation | null
+    contextInfo?: boolean
+  },
   now = new Date()
 ): string => {
   if (contextInfo === false) {
@@ -50,7 +56,8 @@ export const createLatestReminder = (
   return [
     formatDateTime(now),
     new Intl.DateTimeFormat(locale, { weekday: 'long' }).format(now),
-    locationName(location, locale),
+    /** 手填优先；没填就用 IP 推断的（只到省市） */
+    locationName(location ?? ipLocation ?? null, locale),
     'Web',
     translate('latestReminderLanguage'),
   ].join(',')

@@ -200,6 +200,8 @@ export const en = {
   settingsContextInfo: 'Share time and location with the model',
   settingsContextInfoOn: 'On: the model knows the current time (to the minute) and your region',
   settingsContextInfoOff: 'Off: no time or location is sent',
+  settingsLocationFromIp: 'Not set manually; inferred from IP as {place}',
+  settingsLocationEmpty: 'Not set (the model will not know your location)',
   loginTitle: 'Freedeepseek',
   loginSignIn: 'Sign in',
   loginSignUp: 'Sign up',

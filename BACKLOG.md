@@ -1777,3 +1777,85 @@ ssh root@59.110.64.118 "cd /opt/ds-gateway && node scripts/publish-update.mjs \
 
 # 3) 开发通道同理，--channel dev
 ```
+
+## 环境信息（时间 + 位置）下发：最终形态与两个坑（2026-11-19 验证通过）
+
+### 最终链路
+
+```text
+客户端  每轮带 x-ds-local-time（YYYY-MM-DD HH:mm）+ x-ds-tz-offset
+        仅当设置里「向模型提供时间与位置」开启（contextInfo）时才带
+网关    读该头 → 在消息尾部注入：
+          <当前时间>2026-11-19 12:20</当前时间>
+          <当前位置>甘肃省兰州市（按网络出口 IP 推断，仅到城市，可能有偏差）</当前位置>
+位置来源 ip2region 离线库（npm 依赖，包内自带 xdb 11MB），IP 不外发第三方
+```
+
+实测回复：`你在**甘肃省兰州市**（根据网络出口 IP 推断，仅到城市，可能有偏差）。现在时间是 **2026-11-19 12:20**。`
+
+### 坑 1：latest_reminder 字段格式极严，不能塞时分
+
+```text
+Failed: invalid date '2026-11-19 11:53'           ← 带时分
+Failed: weekday '星期三' does not match date …    ← 星期与日期不自洽
+```
+
+该字段只接受 `YYYY-MM-DD,<weekday>,<location>,<platform>,<language>`，
+**日期与星期必须自洽**，语言名要是 `中文` / `English` 这类受支持的原生名。
+所以时间一律走消息尾部，不要碰这个字段。
+
+### 坑 2：客户端「名字→代码」映射不可靠，位置改由网关算
+
+`UserLocation.province/city` 存的是行政区划代码（`620000`），而 IP 库给的是名字（`甘肃省`）。
+客户端映射任何一步对不上，位置就变成空 → 模型答"不知道你在哪"。
+**现在位置完全由网关按来源 IP 算**，客户端只负责开关（带不带时间头）。
+
+### 坑 3：proxy 作用域里的 clientKey 会遮蔽同名函数
+
+```ts
+const clientKey = readHeader(req, 'x-deepseek-key')  // 局部：DeepSeek Key 字符串
+const clientKey = (req) => ...                        // 模块级：取 IP 的函数
+```
+
+在 proxy 里写 `clientKey(req)` → TS「String 不可调用」，运行时也会崩。
+已加别名 `clientIpOf(req)`。**以后在 proxy 里取 IP 一律用它。**
+
+### 运维注意
+
+`ip2region` 是新增 npm 依赖（`/opt/ds-gateway/node_modules`，约 47MB）。
+**换机器/重装网关后必须 `cd /opt/ds-gateway && npm install`**，否则 `/geo` 与位置注入会静默失效
+（日志里出现 `GeoIP 初始化失败`，且只记一次）。
+
+## 清场上线记录（2026-11-19）
+
+开发阶段结束，服务器重置为纯净生产环境。
+
+### 已清空
+
+```text
+users 1 | auth_sessions 5 | user_upstream_keys 1 | usage_events 5
+user_sessions 1015 | file_refs 1076 | store_meta 1 | auth_audit 2
+合计 2106 行 + 所有 users/<id>/ 数据目录（记忆库 + 附件）
+服务器端备份、/root 脚本、env 备份、临时 APK/补丁 全部删除
+update 通道只保留 release（1.0.2–1.0.13 + 补丁），删掉 dev 与 0.17.x debug
+```
+
+清场前快照已下载到本机：`server-snapshot-20261119/`（auth 31MB + memory 33MB 等）。
+
+### 上线前的两处代码改动
+
+1. **管理员自举改为条件式**：`ADMIN_EMAIL` 留空即不自举；改由**首位注册者成为管理员**
+   （实测：注册后 role=admin）。原来无条件自举，删账号会被重启撤销。
+
+2. **密码提示修正**：真实规则是 **10–200 位**且不能包含邮箱名/常见密码/连续字符，
+   旧文案写「至少 8 位」会让人按错误规则反复试错。网关与 App 文案均已改。
+
+### 当前状态
+
+```text
+/health     账号 0 | 管理员 null | 注册开启 | 实例Key disabled
+记忆        会话 0 消息 0 切片 0
+DeepSeek Key 服务器不再保存（用户自备）
+```
+
+首次启用：App 注册 → 邮箱验证码 → 该账号自动成为管理员。

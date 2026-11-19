@@ -155,6 +155,53 @@ const DAILY_TOKEN_QUOTA = Number(process.env.DAILY_TOKEN_QUOTA ?? 2_000_000)
 
 const PROFILE = readProfileConfig(process.env)
 
+/**
+ * GeoIP 读取器（延迟初始化，进程内复用）。
+ *
+ * 为什么要缓存：xdb 有 11MB，每次请求都读一遍盘既慢又浪费内存。
+ * lookup 是纯函数式查表，可以安全共享。
+ */
+type GeoHit = {
+  country?: { name?: string; code?: string }
+  subdivisions?: Array<{ name?: string }>
+  city?: { name?: string }
+  isp?: string
+}
+let geoReader: { lookup(target: string): unknown; close?(): void } | null = null
+let geoFailed = false
+
+const lookupGeo = async (ip: string): Promise<GeoHit | null> => {
+  if (geoFailed) {
+    return null
+  }
+  try {
+    if (!geoReader) {
+      const specifier = ['ip2region', 'node'].join('/')
+      const mod = (await import(specifier)) as unknown as {
+        IP2Region: new () => { lookup(target: string): unknown; close?(): void }
+      }
+      geoReader = new mod.IP2Region()
+    }
+    return (geoReader.lookup(ip) as GeoHit | null) ?? null
+  } catch (error) {
+    // 只记录一次，避免每轮刷日志；后续直接跳过
+    geoFailed = true
+    console.warn('[gateway] GeoIP 初始化失败，位置信息将不再提供:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
+/** 位置文本：'甘肃省兰州市'；查不到返回空串 */
+const resolvePlaceLabel = async (ip: string): Promise<string> => {
+  const hit = await lookupGeo(ip)
+  if (!hit?.country) {
+    return ''
+  }
+  const parts = [hit.subdivisions?.[0]?.name, hit.city?.name]
+    .filter((part): part is string => Boolean(part) && part !== '0')
+  return parts.join('')
+}
+
 /** 更新包与补丁目录（publish-update.mjs 写入） */
 const UPDATES_DIR = process.env.UPDATES_DIR ?? '/opt/ds-gateway/updates'
 
@@ -340,12 +387,21 @@ const bootstrapAdmin = (): User => {
   return created
 }
 
-const adminUser = bootstrapAdmin()
+/**
+ * 管理员自举只在显式配置了 ADMIN_EMAIL 时执行。
+ *
+ * 为什么改成条件式：原来无条件执行，意味着"删掉管理员账号"这件事
+ * 在重启后会被自动撤销 —— 想从零开始干净启用时做不到。
+ * 现在留空 ADMIN_EMAIL 就不会自举，改由"首位注册者成为管理员"。
+ */
+const adminUser = ADMIN_EMAIL ? bootstrapAdmin() : null
 
 // 多用户改造之前的数据都在单库里，归到管理员账号下（只做一次）
-const adopted = registry?.adoptLegacy(adminUser.id)
-if (adopted?.adopted) {
-  console.log(`[gateway] 已把改造前的单库迁移到管理员账号 ${adminUser.email} 名下`)
+if (adminUser) {
+  const adopted = registry?.adoptLegacy(adminUser.id)
+  if (adopted?.adopted) {
+    console.log(`[gateway] 已把改造前的单库迁移到管理员账号 ${adminUser.email} 名下`)
+  }
 }
 
 /** 会话 id 只允许安全字符，避免被当成路径或 SQL 拼接素材 */
@@ -373,6 +429,15 @@ const clientKey = (req: IncomingMessage): string => {
   }
   return req.socket.remoteAddress ?? 'unknown'
 }
+
+/**
+ * 客户端 IP 的别名。
+ *
+ * 为什么需要别名：代理处理函数内部有一个局部变量也叫 clientKey
+ * （存的是用户的 DeepSeek Key 字符串），它会把上面那个取 IP 的函数遮蔽掉 ——
+ * 在 proxy 里写 clientKey(req) 会被 TS 判成"String 不可调用"，运行时也会崩。
+ */
+const clientIpOf = (req: IncomingMessage): string => clientKey(req)
 
 /** 白名单就是 App 实际会调的全部接口 */
 const ALLOWED_PATHS: readonly RegExp[] = [
@@ -912,9 +977,20 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
            * 放在尾部则两全：既让模型知道现在几点，又不改动任何历史消息。
            */
           const localTime = readHeader(req, 'x-ds-local-time')
+          /**
+           * 位置由网关按来源 IP 推断，不经客户端。
+           *
+           * 为什么不让客户端传：客户端要先拿名字再换代码，链路上任何一步出错
+           * 位置就变成空的（实测就是这样：模型答"不知道你在哪"）。
+           * 网关这条路径已经在服务器上验证过，直接用它最可靠。
+           *
+           * 开关跟随客户端：只有开了"时间与位置"总开关，客户端才会带时间头。
+           */
+          const place = localTime ? await resolvePlaceLabel(clientIpOf(req)) : ''
           const blocks = [
             recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
             localTime ? ['<当前时间>', localTime, '</当前时间>'].join('\n') : '',
+            place ? ['<当前位置>', place, '（按网络出口 IP 推断，仅到城市，可能有偏差）</当前位置>'].join('\n') : '',
             ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'),
             prefix,
           ].filter(Boolean)
@@ -1787,18 +1863,18 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         users: authStore.countUsers(),
         signupAllowed: ALLOW_SIGNUP,
         legacyTokenWorks: GATEWAY_TOKEN.length > 0,
-        admin: adminUser.email,
+        admin: adminUser?.email ?? null,
       },
       memory: registry
         ? {
             enabled: true,
             /** 每用户一个库；这里报的是管理员那份作为概览 */
             dataDir: MEMORY_DATA_DIR,
-            dbPath: registry.pathFor(adminUser.id),
+            dbPath: adminUser ? registry.pathFor(adminUser.id) : null,
             localReadsGlobal: MEMORY_LOCAL_READS_GLOBAL,
             maxHits: MEMORY_MAX_HITS,
             /** 向量检索是否已启用（配了 embedding 接口才为 true） */
-            vectors: memoryFor(adminUser)?.vectorEnabled ?? false,
+            vectors: adminUser ? (memoryFor(adminUser)?.vectorEnabled ?? false) : false,
             /** P4：记忆新鲜度半衰期与权重修正幅度 */
             decayHalfLifeDays: Number(process.env.MEMORY_DECAY_HALF_LIFE_DAYS ?? 90),
             freshnessBoost: Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25),
@@ -1886,7 +1962,8 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         usernameTaken: [409, '这个用户名已被占用'],
         usernameReserved: [400, '这个用户名被系统保留，请换一个'],
         usernameTooSoon: [429, '改名太频繁：24 小时内最多 3 次'],
-        weakPassword: [400, '密码至少 8 位'],
+        // 真实规则：10–200 位，且不能包含邮箱名、常见弱密码、连续重复或键盘序列
+  weakPassword: [400, '密码需 10 位以上，且不能包含邮箱名、常见密码或连续字符'],
         emailTaken: [409, '该邮箱已注册'],
         badCredentials: [401, '邮箱或密码不正确'],
         disabled: [403, '账号已被停用'],
@@ -2028,7 +2105,22 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         // 先验码再建号：验证码错误时不要留下半个账号
         authStore.verifyEmailCode(email, 'register', code)
-        const user = authStore.createUser(email, str(body.password), 'user', str(body.username) || undefined)
+        /**
+ * 首位注册者成为管理员。
+ *
+ * "干净环境正式启用"需要这个语义：没有预置账号、也没有自举，
+ * 谁先注册谁是管理员；之后注册的一律是普通用户。
+ */
+const firstUserAdmin = authStore.countUsers() === 0
+const user = authStore.createUser(
+  email,
+  str(body.password),
+  firstUserAdmin ? 'admin' : 'user',
+  str(body.username) || undefined
+)
+if (firstUserAdmin) {
+  console.log(`[gateway] 首位注册者 ${user.email} 已设为管理员`)
+}
         authStore.consumeEmailCode(email, 'register')
         const session = authStore.createSession(user.id, device())
         authStore.recordAudit({ email, userId: user.id, ip: clientKey(req), action: 'register', ok: true })

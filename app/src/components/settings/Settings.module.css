@@ -612,3 +612,45 @@
   color: #00806b;
   font-size: 13px;
 }
+
+/* 环境信息总开关：实心滑块，与整体扁平风格一致 */
+.switch {
+  position: relative;
+  width: 44px;
+  height: 24px;
+  flex: none;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #e6e8ec;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+  padding: 0;
+}
+
+.switchOn {
+  background: #3b5bfd;
+  border-color: #3b5bfd;
+}
+
+.switchKnob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition: transform 0.16s ease;
+}
+
+.switchOn .switchKnob {
+  transform: translateX(20px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch,
+  .switchKnob {
+    transition: none;
+  }
+}

@@ -37,6 +37,7 @@ import {
   isChineseBrowser,
   setApiOrigin,
   setLocale,
+  setContextInfo,
   setLocation,
   setModel,
   setSystemPrompt,
@@ -120,6 +121,7 @@ const SettingsContent = () => {
               <LocaleSetting />
               <TtsVoiceSetting />
               <LocationSetting />
+              <ContextInfoSetting />
               <UpdateField />
             </>
           ) : section === 'advanced' ? (
@@ -593,6 +595,37 @@ const ThemeSetting = () => {
         ))}
       </div>
     </div>
+  )
+}
+
+/**
+ * 环境信息总开关：是否把「当前时间（精确到分）+ 大致位置」告诉模型。
+ *
+ * 关掉后模型完全不知道现在几点、你在哪个地区 —— 问"今天几号""本地天气"
+ * 这类问题会答不上来；但也不再有任何时间/位置信息离开设备。
+ */
+const ContextInfoSetting = () => {
+  const t = useTranslate()
+  const contextInfo = useSettings((state) => state.contextInfo)
+  return (
+    <SettingCell
+      label={t('settingsContextInfo')}
+      status={{
+        key: contextInfo ? 'settingsContextInfoOn' : 'settingsContextInfoOff',
+      }}
+      action={
+        <button
+          type="button"
+          role="switch"
+          aria-checked={contextInfo}
+          aria-label={t('settingsContextInfo')}
+          className={clsx(styles.switch, contextInfo && styles.switchOn)}
+          onClick={() => setContextInfo(!contextInfo)}
+        >
+          <span className={styles.switchKnob} />
+        </button>
+      }
+    />
   )
 }
 

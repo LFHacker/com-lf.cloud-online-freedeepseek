@@ -1272,9 +1272,15 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         const prepared = await prepareFiles(sessionId, request, controller.signal)
         preparing = false
         // 附件就绪后获取本轮信息；续写沿用原回答快照，重新生成的快照独立保存。
-        const latestReminder = prepared.prefix
-          ? prepared.prefix.latestReminder
-          : createLatestReminder(useSettings.getState())
+        /**
+         * 总开关关掉时，createLatestReminder 返回空串；
+         * 这里同时把 undefined 传下去，保证不往 messages 里压一条空的
+         * latest_reminder —— 空消息既浪费 token，也可能让服务端报错。
+         */
+        const latestReminder =
+          (prepared.prefix
+            ? prepared.prefix.latestReminder
+            : createLatestReminder(useSettings.getState())) || undefined
         reply = { ...reply, latestReminder }
         updateReply(sessionId, reply)
         persist(sessionId)

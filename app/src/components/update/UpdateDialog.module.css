@@ -1,0 +1,160 @@
+/* 更新提示窗：白色实心面板 + 细彩边 + 扁平偏移底面 */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 320;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(16, 18, 22, 0.55);
+}
+
+.panel {
+  width: min(520px, 100%);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  padding: 18px 20px 16px;
+  border-radius: 14px;
+  background: #fff;
+  border: 1px solid rgba(59, 91, 253, 0.18);
+  box-shadow: 0 8px 0 rgba(59, 91, 253, 0.08);
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #22262e;
+}
+
+.version {
+  font-size: 13px;
+  color: #3b5bfd;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: #8a8f99;
+}
+
+.notes {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #f7f9ff;
+  border: 1px solid rgba(59, 91, 253, 0.12);
+  overflow-y: auto;
+}
+
+.notesTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: #3b5bfd;
+  margin-bottom: 4px;
+}
+
+.notesBody {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.72;
+  color: #3c4149;
+  white-space: pre-wrap;
+}
+
+.progressBlock {
+  margin-top: 12px;
+}
+
+.progressLabel {
+  font-size: 12px;
+  color: #3c4149;
+  margin-bottom: 6px;
+}
+
+.progressTrack {
+  height: 6px;
+  border-radius: 999px;
+  background: #eceef3;
+  overflow: hidden;
+}
+
+.progressFill {
+  height: 100%;
+  background: #3b5bfd;
+  transition: width 0.2s ease;
+}
+
+.progressHint {
+  margin-top: 5px;
+  font-size: 11px;
+  color: #8a8f99;
+}
+
+.error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fff2f1;
+  border: 1px solid rgba(219, 68, 55, 0.24);
+  color: #b3261e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.later,
+.primary {
+  padding: 8px 18px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.later {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #fff;
+  color: #3c4149;
+}
+
+.primary {
+  border: none;
+  background: #3b5bfd;
+  color: #fff;
+  box-shadow: 0 2px 0 #2a45d0;
+}
+
+.primary:active {
+  transform: translateY(1px);
+  box-shadow: 0 1px 0 #2a45d0;
+}
+
+.later:disabled,
+.primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progressFill {
+    transition: none;
+  }
+}

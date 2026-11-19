@@ -13,4 +13,8 @@ ext {
     androidxJunitVersion = '1.3.0'
     androidxEspressoCoreVersion = '3.7.0'
     cordovaAndroidVersion = '14.0.1'
+    // 应用内更新的 zstd 补丁库（AAR 自带 Android 原生库；JAR 供 JVM 单测用）
+    // ⚠️ 别升到 1.5.7-15+：它要求 compileSdk 37，而本项目 AGP/compileSdk 是 36，
+    //    Gradle 会在 checkAarMetadata 直接拒绝（实测报 "requires ... 37 or later"）。
+    zstdJniVersion = '1.5.7-10'
 }

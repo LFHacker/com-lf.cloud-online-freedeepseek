@@ -88,6 +88,16 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
+
+    /**
+     * 应用内更新的增量补丁：zstd-jni。
+     *
+     * 必须用 **AAR**（自带 Android 原生库 .so）；普通 JAR 里是桌面系统的原生库，
+     * 装到手机上会 UnsatisfiedLinkError。反过来 JVM 单测要用 JAR（AAR 里的 .so 在 JVM 上加载不了），
+     * 所以两个作用域各声明一次。
+     */
+    implementation "com.github.luben:zstd-jni:${zstdJniVersion}@aar"
+    testImplementation "com.github.luben:zstd-jni:${zstdJniVersion}"
 }
 
 apply from: 'capacitor.build.gradle'

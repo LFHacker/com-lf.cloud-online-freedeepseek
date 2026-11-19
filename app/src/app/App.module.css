@@ -60,3 +60,35 @@
     height: var(--app-viewport-height, 100dvh);
   }
 }
+
+/* 鉴权未确认时的启动遮罩：盖住登录页与主界面，避免启动瞬间的页面跳动 */
+.bootCover {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f7f8fa;
+}
+
+.bootSpinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid rgba(59, 91, 253, 0.25);
+  border-top-color: #3b5bfd;
+  border-radius: 50%;
+  animation: boot-spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bootSpinner {
+    animation-duration: 2.4s;
+  }
+}
+
+@keyframes boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

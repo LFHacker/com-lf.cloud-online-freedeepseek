@@ -98,15 +98,13 @@ export const App = () => {
       */}
       {authStatus === 'signedOut' ? <LoginScreen /> : null}
       {/*
-        状态未确认时盖一层与启动图同色的遮罩：
-        既避免登录页闪出，也避免主界面在鉴权完成前先露出半个空壳。
-      */}
-      {authStatus === 'unknown' ? (
-        <div className={styles.bootCover} aria-hidden>
-          <div className={styles.bootSpinner} />
-        </div>
-      ) : null}
-      <div ref={frameRef} className={styles.frame}>
+        ⚠️ 这里**不要**放全屏遮罩。
+        1.0.5 曾加过一层"鉴权未确认时盖住整个应用"的遮罩，
+        结果 authStatus 一旦停在 'unknown'（网络慢、me() 挂住），
+        遮罩就永远盖着，用户表现为"一直加载、进不去"。
+        启动逻辑永远不应该具备"卡死整个应用"的能力 —— 已移除。
+        现在只保留上面的登录页判定，主界面始终可用。
+      */}      <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : siderCollapsed ? null : <Sider />}
         <main className={styles.main}>
           {saveError ? (

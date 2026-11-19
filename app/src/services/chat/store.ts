@@ -346,7 +346,17 @@ export const initChat = (): Promise<void> => {
       }
     } catch (error) {
       if (epoch === historyEpoch) {
-        set({ initError: true })
+        /**
+         * ⚠️ 这里**必须**同时把 ready 置为 true。
+         *
+         * 原来只设 initError，ready 一直是 false，而界面条件是 `!ready → 显示加载中`，
+         * 于是任何一次会话索引读取异常（IndexedDB 被占、云端索引合并失败…）
+         * 都会让 App **永远停在"加载中"**，用户进不去、也没有任何可操作的按钮。
+         *
+         * 正确语义是：初始化"结束"了（无论成败），只是带了错误标记。
+         * 本地能读多少就先显示多少，错误由顶部提示条告知，而不是把用户锁在启动页。
+         */
+        set({ initError: true, ready: true })
         db.reportStorageError('read local sessions')(error)
       }
     } finally {

@@ -1634,3 +1634,63 @@ GC dry-run  1011 会话 / 1076 引用 → 候选 0 个（不会误删任何在�
 
 核对脚本已入库：`gateway/scripts/attach-audit.mjs`（拷到服务器 `/root/` 跑，逐个对齐磁盘文件与会话引用）。
 
+
+## 应用内更新（OTA + 增量补丁）—— 服务端已完成，App 原生侧待做
+
+### 已完成并实测（2026-11-19）
+
+```text
+publish-update.mjs   登记 APK + 为最近 N 个旧版本生成 zstd --patch-from 补丁 + 写 manifest.json
+GET /update/manifest?channel=release|dev    版本/大小/sha256/补丁表（公开，不需登录）
+GET /update/file/<name>                     APK 与补丁下发，支持 Range 断点续传（206）
+```
+
+实测数据：
+
+```text
+4.23 MB APK → 160 KB 补丁（3.7%，省 96.3%）
+生成耗时 1.5 秒
+打补丁后与目标 APK 逐字节一致（cmp 通过）
+两段 Range 拼接后仍可正确还原 → 断点续传可用
+release / dev 两个通道互不影响
+```
+
+目录：`/opt/ds-gateway/updates/`（APK + patch-<旧版本>-to-<新版本>.zst + manifest.json）
+
+**踩过的坑**：PowerShell here-string 会把 `\d` 吃掉，写进代码变成 `bytes=d*-d*`，
+导致 Range 永远不匹配、下载恒为 200 全量。**正则里用 `[0-9]` 别用 `\d`。**
+
+### 待做：App 原生侧（需要新会话，涉及 Gradle + Java）
+
+1. **Gradle 依赖**：`com.github.luben:zstd-jni`（有 Android AAR，用于打补丁）
+2. **Capacitor 插件**（Java）三个方法：
+   - `fetchManifest(channel)` → GET /update/manifest
+   - `download(url, dest, onProgress)` → 支持 Range 续传，写文件
+   - `applyPatch(oldApk, patch, outApk)` → zstd `--patch-from` 等价调用
+   - `installApk(path)` → FileProvider + `ACTION_VIEW` + `application/vnd.android.package-archive`
+3. **更新流程**（顺序不能错）：
+   ```text
+   比对 versionCode（清单里给的是自动推导值）
+   → 有补丁就下补丁，否则下全量
+   → 校验 sha256
+   → 打补丁 → 再校验产物 sha256（必须与全量一致）
+   → 校验签名（与已装包一致，否则装不上）
+   → 唤起系统安装器
+   ```
+4. **失败回退**：补丁失败/哈希不符/签名不符 → 自动改下全量。
+   **绝不能出现"打完补丁装不上"**——那等于把用户卡死在旧版。
+5. **权限**：`REQUEST_INSTALL_PACKAGES` 已加入 AndroidManifest。
+6. **UI**：设置页"检查更新" + 顶部进度（复用现有云同步状态条的位置）。
+
+### 发版时的新步骤（以后每次发版都要做）
+
+```bash
+# 1) 构建 APK 后上传到服务器
+scp delivery/freedeepseek-vX.Y.Z.apk root@59.110.64.118:/tmp/new.apk
+
+# 2) 发布（自动生成到最近 5 个版本的补丁）
+ssh root@59.110.64.118 "cd /opt/ds-gateway && node scripts/publish-update.mjs \
+  --apk /tmp/new.apk --version X.Y.Z --channel release --notes '本次更新内容'"
+
+# 3) 开发通道同理，--channel dev
+```

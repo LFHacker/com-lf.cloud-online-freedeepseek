@@ -136,17 +136,31 @@ export const MessageFile = ({
       )
     }
 
-    // 正常态：链接到原件
+    /**
+     * 正常态：点击在应用内全屏查看。
+     *
+     * ⚠️ 这里原来是 <a href target="_blank"> —— 图片走的正是这条路径，
+     * 所以在 WebView 里点击会开一个**没有关闭入口**的新窗口，
+     * 用户放大后只能杀进程。上次只改了文件卡片的 onOpen（非图片分支），
+     * 图片这条路没动，于是"看起来改了但没生效"。
+     */
+    // url 在闭包里不会被收窄，这里显式判空
+    const openImagePreview = () => {
+      if (url) {
+        useImagePreview.getState().open(url, file.name ?? '')
+      }
+    }
+
     return url ? (
-      <a
+      <button
+        type="button"
         className={clsx(styles.image, styles.imageThumb)}
-        href={url}
-        target="_blank"
-        rel="noreferrer"
         title={file.name}
+        aria-label={file.name}
+        onClick={openImagePreview}
       >
         {preview}
-      </a>
+      </button>
     ) : (
       // 原件还没加载出来（极短暂）
       <div className={styles.image} />

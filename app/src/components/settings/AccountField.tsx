@@ -5,6 +5,8 @@ import { replaceToken, signOut, useAuth } from '../../services/auth/store.js'
 import { apiOrigin } from '../../services/api/client.js'
 import { renameSelf } from '../../services/auth/client.js'
 import { loadBalance, loadUsageTotals, type BalanceInfo, type UsageTotals } from '../../services/usage/index.js'
+import { LegalDialog } from '../legal/LegalDialog.js'
+import type { LegalDoc } from '../../legal/documents.js'
 import { useSettings } from '../../services/settings.js'
 import styles from './Settings.module.css'
 
@@ -29,6 +31,7 @@ export const AccountField = () => {
   const [balance, setBalance] = useState<BalanceInfo[] | null>(null)
   /** 全部会话合计（服务端账本，用于与官方后台对照） */
   const [totals, setTotals] = useState<UsageTotals | null>(null)
+  const [legalOpen, setLegalOpen] = useState<LegalDoc['id'] | null>(null)
 
   // 余额只在打开设置时拉一次；失败就静默不显示，不要为它弹错误
   useEffect(() => {
@@ -108,6 +111,20 @@ export const AccountField = () => {
                 {t('statsTotalCost')} ¥{totals.costCny.toFixed(4)}
               </div>
             ) : null}
+            <div className={styles.accountMeta}>
+              <button type="button" className={styles.accountSecondary} onClick={() => setLegalOpen('terms')}>
+                用户服务协议
+              </button>
+              {' · '}
+              <button type="button" className={styles.accountSecondary} onClick={() => setLegalOpen('privacy')}>
+                隐私政策
+              </button>
+              {' · '}
+              <button type="button" className={styles.accountSecondary} onClick={() => setLegalOpen('ai')}>
+                AI 内容声明
+              </button>
+            </div>
+            {legalOpen ? <LegalDialog initial={legalOpen} onClose={() => setLegalOpen(null)} /> : null}
             {balance && balance.length > 0 ? (
               <div className={styles.accountMeta}>
                 {t('accountBalance')}：

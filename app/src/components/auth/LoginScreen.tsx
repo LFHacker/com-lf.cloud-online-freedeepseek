@@ -8,6 +8,8 @@ import {
   signUp,
   useAuth,
 } from '../../services/auth/store.js'
+import { LegalDialog } from '../legal/LegalDialog.js'
+import { CONSENT_TEXT, type LegalDoc } from '../../legal/documents.js'
 import styles from './LoginScreen.module.css'
 
 type Mode = 'signIn' | 'signUp' | 'reset'
@@ -41,6 +43,9 @@ export const LoginScreen = () => {
   const [deadline, setDeadline] = useState(0)
   const [now, setNow] = useState(() => Date.now())
   const [notice, setNotice] = useState<string | null>(null)
+  /** 注册必须勾选同意；登录不需要（老用户已同意过） */
+  const [agreed, setAgreed] = useState(false)
+  const [legalOpen, setLegalOpen] = useState<LegalDoc['id'] | null>(null)
 
   const cooldown = Math.max(0, Math.ceil((deadline - now) / 1000))
 
@@ -107,6 +112,10 @@ export const LoginScreen = () => {
       return
     }
     if (mode === 'signUp') {
+      if (!agreed) {
+        setNotice(null)
+        return
+      }
       await signUp(email, password, code, username.trim())
     } else {
       await resetWithCode(email, code, password)
@@ -118,6 +127,7 @@ export const LoginScreen = () => {
     email.trim().length > 0 &&
     password.length > 0 &&
     (!needsCode || code.trim().length > 0) &&
+    (mode !== 'signUp' || agreed) &&
     !busy
 
   return (
@@ -228,6 +238,28 @@ export const LoginScreen = () => {
             {mode !== 'signIn' ? <span className={styles.hint}>{t('loginPasswordHint')}</span> : null}
           </label>
 
+          {mode === 'signUp' ? (
+            <label className={styles.consent}>
+              <input
+                type="checkbox"
+                checked={agreed}
+                onChange={(event) => setAgreed(event.target.checked)}
+              />
+              <span>
+                {CONSENT_TEXT}
+                <button type="button" className={styles.linkInline} onClick={() => setLegalOpen('terms')}>
+                  《用户服务协议》
+                </button>
+                <button type="button" className={styles.linkInline} onClick={() => setLegalOpen('privacy')}>
+                  《隐私政策》
+                </button>
+                <button type="button" className={styles.linkInline} onClick={() => setLegalOpen('ai')}>
+                  《AI 生成内容声明》
+                </button>
+              </span>
+            </label>
+          ) : null}
+
           {notice ? <div className={styles.notice}>{notice}</div> : null}
           {error ? <div className={styles.error}>{error}</div> : null}
 
@@ -254,6 +286,7 @@ export const LoginScreen = () => {
 
         <div className={styles.footer}>{t('loginFooter')}</div>
       </div>
+      {legalOpen ? <LegalDialog initial={legalOpen} onClose={() => setLegalOpen(null)} /> : null}
     </div>
   )
 }

@@ -240,9 +240,13 @@ const LocationSetting = () => {
   const location = useSettings((state) => state.location)
   /** IP 推断出来的位置（用户没手填时才生效） */
   const ipLocation = useSettings((state) => state.ipLocation)
-  const ipLabel = [ipLocation?.province, ipLocation?.city]
-    .filter((part): part is string => Boolean(part) && part !== '0')
-    .join(' ')
+  /**
+   * ipLocation 里存的是行政区划**代码**（'330000'），显示前要换回名字，
+   * 否则界面上会出现"330000 330100"这种看不懂的东西。
+   */
+  const ipProvince = provinces.find((item) => item.code === ipLocation?.province)
+  const ipCity = ipProvince?.cities.find((item) => item.code === ipLocation?.city)
+  const ipLabel = [ipProvince?.name, ipCity?.name].filter(Boolean).join(' ')
   const province =
     location?.region === 'CN'
       ? provinces.find((item) => item.code === location.province)

@@ -238,6 +238,11 @@ const LocationSetting = () => {
   const t = useTranslate()
   const locale = useSettings((state) => state.locale)
   const location = useSettings((state) => state.location)
+  /** IP 推断出来的位置（用户没手填时才生效） */
+  const ipLocation = useSettings((state) => state.ipLocation)
+  const ipLabel = [ipLocation?.province, ipLocation?.city]
+    .filter((part): part is string => Boolean(part) && part !== '0')
+    .join(' ')
   const province =
     location?.region === 'CN'
       ? provinces.find((item) => item.code === location.province)
@@ -246,7 +251,20 @@ const LocationSetting = () => {
   return (
     <SettingCell
       label={t('settingsLocation')}
-      status={null}
+      /*
+        说明当前生效来源：
+        · 手填过 → 以手填为准
+        · 没填但 IP 推断出来了 → 显示"按 IP 推断：省/市"
+        · 都没有 → 提示可以手动选
+        这样用户不会疑惑"模型怎么知道我在哪"。
+      */
+      status={
+        location
+          ? null
+          : ipLocation
+            ? { key: 'settingsLocationFromIp', params: { place: ipLabel } }
+            : { key: 'settingsLocationEmpty' }
+      }
       className={styles.locationCell}
       action={
         <div className={styles.locationSelectors}>

@@ -15,6 +15,7 @@ import { SiteThumbnails } from '../search/SiteLogo.js'
 import { toggleSearchPanel, useSearchPanel } from '../search/searchPanelState.js'
 import { ReadAloudButton } from './ReadAloudButton.js'
 import { CopyButton } from './CopyButton.js'
+import { AiGeneratedBadge } from './AiGeneratedBadge.js'
 import { MessageStats } from './MessageStats.js'
 import { ReplyArea } from './ReplyArea.js'
 import { useReplyView } from './useReplyView.js'
@@ -54,7 +55,12 @@ export const AssistantMessage = memo(function AssistantMessage({
   const responseText = [answer?.text, notice?.presentation === 'response' ? notice.text : null]
     .filter(Boolean)
     .join('\n\n')
-  const copyText = responseText || notice?.text
+  /**
+   * 复制时追加一行来源标识：
+   * 内容一旦离开应用（贴到别处、发给别人），界面上的标识就没了。
+   * 这条是隐式标识在纯文本场景下能做到的最实在的形式。
+   */
+  const copyText = responseText ? `${responseText}\n\n—— 以上内容由 AI 生成（自由的deepseek）` : notice?.text
   const waiting = streaming && view.steps.length === 0 && !view.answer && !message.thinking
   const summaryEntry = `${message.id}-summary`
   return (
@@ -145,6 +151,8 @@ export const AssistantMessage = memo(function AssistantMessage({
           </span>
         </div>
       ) : null}
+      {/* 显式标识：这条是 AI 生成的（截图/转发后仍带） */}
+      {streaming ? null : <AiGeneratedBadge />}
       {/* 本轮用量：token、缓存命中率、记忆条数、估算费用 */}
       {streaming ? null : <MessageStats usage={message.usage} isLast={isLast} sessionId={sessionId} streaming={streaming} />}
       {streaming ? null : (

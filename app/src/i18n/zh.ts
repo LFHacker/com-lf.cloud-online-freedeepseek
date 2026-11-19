@@ -190,6 +190,8 @@ export const zh = {
   statsTotalCost: '总费用约',
   accountUsageAll: '全部会话合计',
   statsRequests: '次请求',
+  aiBadge: 'AI 生成',
+  aiBadgeHint: '本条内容由人工智能模型生成，可能不准确，请自行核实',
   loginTitle: '自由的deepseek',
   loginSignIn: '登录',
   loginSignUp: '注册',

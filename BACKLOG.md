@@ -1825,3 +1825,37 @@ const clientKey = (req) => ...                        // 模块级：取 IP 的�
 `ip2region` 是新增 npm 依赖（`/opt/ds-gateway/node_modules`，约 47MB）。
 **换机器/重装网关后必须 `cd /opt/ds-gateway && npm install`**，否则 `/geo` 与位置注入会静默失效
 （日志里出现 `GeoIP 初始化失败`，且只记一次）。
+
+## 清场上线记录（2026-11-19）
+
+开发阶段结束，服务器重置为纯净生产环境。
+
+### 已清空
+
+```text
+users 1 | auth_sessions 5 | user_upstream_keys 1 | usage_events 5
+user_sessions 1015 | file_refs 1076 | store_meta 1 | auth_audit 2
+合计 2106 行 + 所有 users/<id>/ 数据目录（记忆库 + 附件）
+服务器端备份、/root 脚本、env 备份、临时 APK/补丁 全部删除
+update 通道只保留 release（1.0.2–1.0.13 + 补丁），删掉 dev 与 0.17.x debug
+```
+
+清场前快照已下载到本机：`server-snapshot-20261119/`（auth 31MB + memory 33MB 等）。
+
+### 上线前的两处代码改动
+
+1. **管理员自举改为条件式**：`ADMIN_EMAIL` 留空即不自举；改由**首位注册者成为管理员**
+   （实测：注册后 role=admin）。原来无条件自举，删账号会被重启撤销。
+
+2. **密码提示修正**：真实规则是 **10–200 位**且不能包含邮箱名/常见密码/连续字符，
+   旧文案写「至少 8 位」会让人按错误规则反复试错。网关与 App 文案均已改。
+
+### 当前状态
+
+```text
+/health     账号 0 | 管理员 null | 注册开启 | 实例Key disabled
+记忆        会话 0 消息 0 切片 0
+DeepSeek Key 服务器不再保存（用户自备）
+```
+
+首次启用：App 注册 → 邮箱验证码 → 该账号自动成为管理员。

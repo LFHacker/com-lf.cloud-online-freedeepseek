@@ -387,12 +387,21 @@ const bootstrapAdmin = (): User => {
   return created
 }
 
-const adminUser = bootstrapAdmin()
+/**
+ * 管理员自举只在显式配置了 ADMIN_EMAIL 时执行。
+ *
+ * 为什么改成条件式：原来无条件执行，意味着"删掉管理员账号"这件事
+ * 在重启后会被自动撤销 —— 想从零开始干净启用时做不到。
+ * 现在留空 ADMIN_EMAIL 就不会自举，改由"首位注册者成为管理员"。
+ */
+const adminUser = ADMIN_EMAIL ? bootstrapAdmin() : null
 
 // 多用户改造之前的数据都在单库里，归到管理员账号下（只做一次）
-const adopted = registry?.adoptLegacy(adminUser.id)
-if (adopted?.adopted) {
-  console.log(`[gateway] 已把改造前的单库迁移到管理员账号 ${adminUser.email} 名下`)
+if (adminUser) {
+  const adopted = registry?.adoptLegacy(adminUser.id)
+  if (adopted?.adopted) {
+    console.log(`[gateway] 已把改造前的单库迁移到管理员账号 ${adminUser.email} 名下`)
+  }
 }
 
 /** 会话 id 只允许安全字符，避免被当成路径或 SQL 拼接素材 */
@@ -1854,18 +1863,18 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         users: authStore.countUsers(),
         signupAllowed: ALLOW_SIGNUP,
         legacyTokenWorks: GATEWAY_TOKEN.length > 0,
-        admin: adminUser.email,
+        admin: adminUser?.email ?? null,
       },
       memory: registry
         ? {
             enabled: true,
             /** 每用户一个库；这里报的是管理员那份作为概览 */
             dataDir: MEMORY_DATA_DIR,
-            dbPath: registry.pathFor(adminUser.id),
+            dbPath: adminUser ? registry.pathFor(adminUser.id) : null,
             localReadsGlobal: MEMORY_LOCAL_READS_GLOBAL,
             maxHits: MEMORY_MAX_HITS,
             /** 向量检索是否已启用（配了 embedding 接口才为 true） */
-            vectors: memoryFor(adminUser)?.vectorEnabled ?? false,
+            vectors: adminUser ? (memoryFor(adminUser)?.vectorEnabled ?? false) : false,
             /** P4：记忆新鲜度半衰期与权重修正幅度 */
             decayHalfLifeDays: Number(process.env.MEMORY_DECAY_HALF_LIFE_DAYS ?? 90),
             freshnessBoost: Number(process.env.MEMORY_FRESHNESS_BOOST ?? 0.25),
@@ -1953,7 +1962,8 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         usernameTaken: [409, '这个用户名已被占用'],
         usernameReserved: [400, '这个用户名被系统保留，请换一个'],
         usernameTooSoon: [429, '改名太频繁：24 小时内最多 3 次'],
-        weakPassword: [400, '密码至少 8 位'],
+        // 真实规则：10–200 位，且不能包含邮箱名、常见弱密码、连续重复或键盘序列
+  weakPassword: [400, '密码需 10 位以上，且不能包含邮箱名、常见密码或连续字符'],
         emailTaken: [409, '该邮箱已注册'],
         badCredentials: [401, '邮箱或密码不正确'],
         disabled: [403, '账号已被停用'],
@@ -2095,7 +2105,22 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       try {
         // 先验码再建号：验证码错误时不要留下半个账号
         authStore.verifyEmailCode(email, 'register', code)
-        const user = authStore.createUser(email, str(body.password), 'user', str(body.username) || undefined)
+        /**
+ * 首位注册者成为管理员。
+ *
+ * "干净环境正式启用"需要这个语义：没有预置账号、也没有自举，
+ * 谁先注册谁是管理员；之后注册的一律是普通用户。
+ */
+const firstUserAdmin = authStore.countUsers() === 0
+const user = authStore.createUser(
+  email,
+  str(body.password),
+  firstUserAdmin ? 'admin' : 'user',
+  str(body.username) || undefined
+)
+if (firstUserAdmin) {
+  console.log(`[gateway] 首位注册者 ${user.email} 已设为管理员`)
+}
         authStore.consumeEmailCode(email, 'register')
         const session = authStore.createSession(user.id, device())
         authStore.recordAudit({ email, userId: user.id, ip: clientKey(req), action: 'register', ok: true })

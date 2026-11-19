@@ -31,7 +31,7 @@ export type MemorySummary = {
 
 const errorMessages: Record<string, string> = {
   invalidEmail: '邮箱格式不正确',
-  weakPassword: '密码至少 8 位',
+  weakPassword: '密码需 10 位以上，且不能包含邮箱名',
   emailTaken: '该邮箱已注册，直接登录即可',
   badCredentials: '邮箱或密码不正确',
   disabled: '账号已被停用',

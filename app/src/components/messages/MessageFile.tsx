@@ -7,6 +7,7 @@ import type { FileAttachment } from '../../services/chat/types.js'
 import { IconPhotoErrorFill20, IconRefreshOutline16 } from '../base/icons.js'
 import { Tooltip } from '../base/Tooltip.js'
 import { FileCard } from '../files/FileCard.js'
+import { useImagePreview } from './ImageLightbox.js'
 import styles from './MessageFile.module.css'
 
 /** 原件从 IndexedDB 读出并生成本地地址；undefined 表示加载中，null 表示原件缺失。 */
@@ -159,7 +160,16 @@ export const MessageFile = ({
       status={uploading ? 'uploading' : failed ? 'error' : 'done'}
       error={errorText}
       onRetry={retry ?? undefined}
-      onOpen={url && !upload ? () => window.open(url, '_blank', 'noreferrer') : undefined}
+      /**
+         * 改成应用内全屏查看。
+         * 原来用 window.open，在 WebView 里开出的新窗口没有关闭入口，
+         * 用户放大后只能杀进程 —— 就是这个 bug。
+         */
+        onOpen={
+          url && !upload
+            ? () => useImagePreview.getState().open(url, name ?? '')
+            : undefined
+        }
     />
   )
 }

@@ -30,6 +30,7 @@ import { installDiagnosticsHooks } from '../services/diagnostics.js'
 import { restoreOutbox } from '../services/sync/outbox.js'
 import { startSyncEngine } from '../services/sync/engine.js'
 import { SyncStatusBar } from '../components/sync/SyncStatusBar.js'
+import { ImageLightbox } from '../components/messages/ImageLightbox.js'
 import { UpdateDialog } from '../components/update/UpdateDialog.js'
 import { useUpdateStore } from '../services/update/store.js'
 import { MobileSider, Sider } from '../components/sider/Sider.js'
@@ -186,6 +187,8 @@ export const App = () => {
       <MemoryDialog />
       {/* 更新提示：启动时若发现新版本自动弹出，与当前在哪个页面无关 */}
       <UpdateDialog />
+      {/* 图片全屏查看：替代 window.open，保证有明确的关闭入口 */}
+      <ImageLightbox />
       <Toast />
     </>
   )

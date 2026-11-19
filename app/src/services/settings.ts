@@ -32,6 +32,11 @@ type Settings = {
   ttsVoice: TtsVoice
   thinking: boolean
   search: boolean
+  /**
+   * 总开关：是否把「当前时间 + 大致位置」告诉模型。
+   * 关掉后 latest_reminder 整个不下发，模型就不知道现在几点、你在哪儿。
+   */
+  contextInfo: boolean
   siderCollapsed: boolean
   apiOrigin: string
   model: ChatModel
@@ -46,6 +51,7 @@ const KEYS = {
   ttsVoice: 'chat-demo:tts-voice',
   thinking: 'chat-demo:thinking',
   search: 'chat-demo:search',
+  contextInfo: 'chat-demo:context-info',
   siderCollapsed: 'chat-demo:sider-collapsed',
   apiOrigin: 'chat-demo:api-origin',
   model: 'chat-demo:model',
@@ -138,6 +144,8 @@ export const useSettings = create<Settings>(() => ({
   ttsVoice: initialTtsVoice(),
   thinking: read(KEYS.thinking) === 'true',
   search: read(KEYS.search) === 'true',
+  // 默认开启：只有显式关过（存了 'false'）才关闭
+  contextInfo: read(KEYS.contextInfo) !== 'false',
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
   apiOrigin: initialApiOrigin(),
   model: initialModel(),
@@ -178,6 +186,11 @@ export const setThinking = (thinking: boolean) => {
 export const setSearch = (search: boolean) => {
   write(KEYS.search, String(search))
   useSettings.setState({ search })
+}
+
+export const setContextInfo = (contextInfo: boolean) => {
+  write(KEYS.contextInfo, String(contextInfo))
+  useSettings.setState({ contextInfo })
 }
 
 export const setSiderCollapsed = (siderCollapsed: boolean) => {

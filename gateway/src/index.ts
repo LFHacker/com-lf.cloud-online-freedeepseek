@@ -149,6 +149,9 @@ if (MEMORY_ENABLED) {
 const authStore = new AuthStore(AUTH_DB_PATH)
 
 /** 稳定层（长期档案）配置；没有 API key 就等于不启用 */
+/** 每账号每日 token 上限（命中+未命中+输出）。0 = 不限制 */
+const DAILY_TOKEN_QUOTA = Number(process.env.DAILY_TOKEN_QUOTA ?? 2_000_000)
+
 const PROFILE = readProfileConfig(process.env)
 
 /**
@@ -669,6 +672,27 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
           : `请求过于频繁，请 ${quota.retryAfterSeconds ?? 60} 秒后再试`,
     })
     return
+  }
+  /**
+   * 每日 token 配额。
+   *
+   * 限流按"次"算，防不住一次长上下文就烧掉几块钱；
+   * 配额按 token 算，才是真正兜住成本的闸门。数据来自 usage_events 账本。
+   */
+  if (DAILY_TOKEN_QUOTA > 0) {
+    try {
+      const used = authStore.todayTokenUsage(user.id)
+      if (used >= DAILY_TOKEN_QUOTA) {
+        json(res, 429, {
+          ok: false,
+          error: 'token_quota',
+          message: `今日 token 用量已达上限（${DAILY_TOKEN_QUOTA.toLocaleString()}），明天再来`,
+        })
+        return
+      }
+    } catch {
+      // 统计失败不阻断聊天
+    }
   }
   const inbound = readGatewayToken(req)
   /**
@@ -1571,6 +1595,23 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     return
   }
 
+  /** 登录审计（仅管理员）：排查异地登录/撞库 */
+  if (req.method === 'GET' && url.pathname === '/auth/audit') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    if (user.role !== 'admin') {
+      json(res, 403, { ok: false, error: 'forbidden', message: '仅管理员可查看审计' })
+      return
+    }
+    const limit = Math.min(Number(url.searchParams.get('limit') ?? 100) || 100, 500)
+    const email = url.searchParams.get('email') ?? undefined
+    json(res, 200, { ok: true, entries: authStore.listAudit(limit, email) })
+    return
+  }
+
   /** 价格表 + 当前是否峰时（前端据此算费用，价格不写死在 App 里） */
   if (req.method === 'GET' && url.pathname === '/usage/pricing') {
     const peak = readPriceTable(process.env)
@@ -1847,6 +1888,7 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
         const user = authStore.createUser(email, str(body.password), 'user', str(body.username) || undefined)
         authStore.consumeEmailCode(email, 'register')
         const session = authStore.createSession(user.id, device())
+        authStore.recordAudit({ email, userId: user.id, ip: clientKey(req), action: 'register', ok: true })
         console.log(`[gateway] 新注册（邮箱已验证）：${user.email}`)
         json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
       } catch (error) {
@@ -1870,11 +1912,19 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       }
       try {
         const user = authStore.verifyPassword(email, str(body.password))
+        authStore.recordAudit({ email, userId: user.id, ip: clientKey(req), action: 'login', ok: true })
         authStore.clearLoginFailures(email)
         const session = authStore.createSession(user.id, device())
         json(res, 200, { ok: true, token: session.token, expiresAt: session.expiresAt, user: payloadUser(user) })
       } catch (error) {
         if (error instanceof AuthFailure && error.key === 'badCredentials') {
+          authStore.recordAudit({
+            email,
+            ip: clientKey(req),
+            action: 'login',
+            ok: false,
+            detail: 'bad credentials',
+          })
           const guard = authStore.noteLoginFailure(email)
           if (guard.retryAfterSeconds > 0) {
             res.setHeader('Retry-After', String(guard.retryAfterSeconds))

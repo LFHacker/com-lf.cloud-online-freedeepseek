@@ -33,6 +33,11 @@ type Settings = {
   thinking: boolean
   search: boolean
   /**
+   * 按 IP 推断的位置（缓存），用户手填的 location 优先于它。
+   * 由 services/geo.ts 填充，不直接暴露给设置界面。
+   */
+  ipLocation: UserLocation | null
+  /**
    * 总开关：是否把「当前时间 + 大致位置」告诉模型。
    * 关掉后 latest_reminder 整个不下发，模型就不知道现在几点、你在哪儿。
    */
@@ -146,6 +151,7 @@ export const useSettings = create<Settings>(() => ({
   search: read(KEYS.search) === 'true',
   // 默认开启：只有显式关过（存了 'false'）才关闭
   contextInfo: read(KEYS.contextInfo) !== 'false',
+  ipLocation: null,
   siderCollapsed: read(KEYS.siderCollapsed) === 'true',
   apiOrigin: initialApiOrigin(),
   model: initialModel(),

@@ -195,6 +195,8 @@ export const zh = {
   settingsContextInfo: '向模型提供时间与位置',
   settingsContextInfoOn: '已开启：模型知道当前时间（精确到分钟）和你的大致地区',
   settingsContextInfoOff: '已关闭：不发送任何时间与位置信息',
+  settingsLocationFromIp: '未手动选择，当前按 IP 推断为：{place}',
+  settingsLocationEmpty: '未选择（模型不会知道你的位置）',
   loginTitle: '自由的deepseek',
   loginSignIn: '登录',
   loginSignUp: '注册',

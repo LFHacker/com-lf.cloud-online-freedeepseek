@@ -16,6 +16,7 @@ import { MobileHeader } from '../components/session/MobileHeader.js'
 import { Welcome } from '../components/session/Welcome.js'
 import { LoginScreen } from '../components/auth/LoginScreen.js'
 import { initAuth, useAuth } from '../services/auth/store.js'
+import { loadIpLocation } from '../services/geo.js'
 import { SettingsDialog } from '../components/settings/SettingsDialog.js'
 import { MemoryDialog } from '../components/memory/MemoryDialog.js'
 import { Toast } from '../components/base/Toast.js'
@@ -80,6 +81,18 @@ export const App = () => {
     void initChat()
     // 启动时校验登录态：没有令牌 / 令牌失效 → 显示登录页
     void initAuth()
+    /**
+     * 按 IP 推断大致位置（只有总开关开启时才做）。
+     * 结果存进 settings.ipLocation，每轮的环境信息会用到它。
+     * 失败不提示：模型拿不到位置只是少一点上下文，不影响聊天。
+     */
+    if (useSettings.getState().contextInfo) {
+      void loadIpLocation().then((location) => {
+        if (location) {
+          useSettings.setState({ ipLocation: location })
+        }
+      })
+    }
     // 上次没发出去的消息要能接着发（队列在 IndexedDB 里，重启不丢）
     void restoreOutbox()
     // 联网 / 回到前台时自动补一次同步

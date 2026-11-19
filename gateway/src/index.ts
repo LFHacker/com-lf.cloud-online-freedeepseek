@@ -1600,6 +1600,60 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
   }
 
   /**
+   * 按来源 IP 推断大致位置（离线库 ip2region，不外发你的 IP）。
+   *
+   * 为什么要服务端做：客户端拿不到自己的公网 IP（拿到的是内网地址或运营商中转地址），
+   * 而且让第三方在线接口去查，等于把用户 IP 交给别人 —— 这里用本地离线库。
+   *
+   * 只精确到**省/市**，返回给客户端后由客户端决定是否塞进给模型的环境信息。
+   */
+  if (req.method === 'GET' && url.pathname === '/geo') {
+    const ip = clientKey(req)
+    try {
+      /**
+       * 必须用 "ip2region/node" 子路径：它会自动加载包内自带的 xdb 数据。
+       * 走包根的 IP2Region 需要自己传 source，反而更啰嗦。
+       *
+       * 用变量拼接 specifier 是为了让 TS 不去解析这个子路径的
+       * 类型声明（该包没提供），否则类型检查会报"找不到模块"。
+       */
+      const specifier = ['ip2region', 'node'].join('/')
+      const mod = (await import(specifier)) as unknown as {
+        IP2Region: new () => {
+          lookup(target: string): unknown
+          close?(): void
+        }
+      }
+      const searcher = new mod.IP2Region()
+      const hit = searcher.lookup(ip) as {
+        country?: { name?: string; code?: string }
+        subdivisions?: Array<{ name?: string }>
+        city?: { name?: string }
+        isp?: string
+      } | null
+      searcher.close?.()
+      if (!hit?.country) {
+        json(res, 200, { ok: true, found: false, ip })
+        return
+      }
+      json(res, 200, {
+        ok: true,
+        found: true,
+        // 不回传 IP 本身：客户端只需要位置，没必要知道/保存自己的公网地址
+        country: hit.country.code ?? '',
+        countryName: hit.country.name ?? '',
+        region: hit.subdivisions?.[0]?.name ?? '',
+        city: hit.city?.name ?? '',
+        isp: hit.isp ?? '',
+      })
+    } catch (error) {
+      console.warn('[gateway] 位置推断失败:', error instanceof Error ? error.message : error)
+      json(res, 200, { ok: true, found: false, ip })
+    }
+    return
+  }
+
+  /**
    * 更新清单（公开接口，不需要登录）。
    *
    * 为什么公开：App 启动时可能还没登录就要检查更新；

@@ -53,8 +53,15 @@ export const createLatestReminder = (
   if (contextInfo === false) {
     return ''
   }
+  /**
+   * ⚠️ 这里**只能**是 YYYY-MM-DD（不含时分）。
+   * 服务端对该字段格式校验极严，带时分会被整条请求打回：
+   *   Invalid 'messages.0.content': invalid date '2026-11-19 11:53'
+   * 时间（时分）走另一条路：客户端把它放进 x-ds-local-time 头，
+   * 由网关写进消息尾部，不经过这个字段。
+   */
   return [
-    formatDateTime(now),
+    formatDate(now),
     new Intl.DateTimeFormat(locale, { weekday: 'long' }).format(now),
     /** 手填优先；没填就用 IP 推断的（只到省市） */
     locationName(location ?? ipLocation ?? null, locale),

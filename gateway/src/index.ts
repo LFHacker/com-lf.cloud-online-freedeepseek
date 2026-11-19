@@ -904,8 +904,17 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
             .reverse()
             .map((item) => `- [${new Date(item.createdAt).toISOString().slice(0, 16).replace('T', ' ')}] ${item.body.slice(0, 200)}`)
             .join('\n')
+          /**
+           * 客户端本地时间（精确到分钟）。
+           *
+           * 为什么由网关拼：latest_reminder 字段只接受 YYYY-MM-DD，
+           * 带时分会被上游整条拒绝；塞进用户正文又会污染历史与缓存。
+           * 放在尾部则两全：既让模型知道现在几点，又不改动任何历史消息。
+           */
+          const localTime = readHeader(req, 'x-ds-local-time')
           const blocks = [
             recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
+            localTime ? ['<当前时间>', localTime, '</当前时间>'].join('\n') : '',
             ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'),
             prefix,
           ].filter(Boolean)

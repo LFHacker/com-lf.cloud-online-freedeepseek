@@ -30,6 +30,8 @@ import { installDiagnosticsHooks } from '../services/diagnostics.js'
 import { restoreOutbox } from '../services/sync/outbox.js'
 import { startSyncEngine } from '../services/sync/engine.js'
 import { SyncStatusBar } from '../components/sync/SyncStatusBar.js'
+import { UpdateDialog } from '../components/update/UpdateDialog.js'
+import { useUpdateStore } from '../services/update/store.js'
 import { MobileSider, Sider } from '../components/sider/Sider.js'
 import styles from './App.module.css'
 
@@ -95,6 +97,11 @@ export const App = () => {
     }
     // 上次没发出去的消息要能接着发（队列在 IndexedDB 里，重启不丢）
     void restoreOutbox()
+    /**
+     * 启动时检查一次更新（不轮询：更新不是实时需求）。
+     * 用户点过稍后、或检查失败时，内部都已静默处理。
+     */
+    void useUpdateStore.getState().checkOnStart()
     // 联网 / 回到前台时自动补一次同步
     return startSyncEngine()
   }, [])
@@ -177,6 +184,8 @@ export const App = () => {
       </div>
       <SettingsDialog />
       <MemoryDialog />
+      {/* 更新提示：启动时若发现新版本自动弹出，与当前在哪个页面无关 */}
+      <UpdateDialog />
       <Toast />
     </>
   )

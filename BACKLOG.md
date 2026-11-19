@@ -1660,27 +1660,70 @@ release / dev 两个通道互不影响
 **踩过的坑**：PowerShell here-string 会把 `\d` 吃掉，写进代码变成 `bytes=d*-d*`，
 导致 Range 永远不匹配、下载恒为 200 全量。**正则里用 `[0-9]` 别用 `\d`。**
 
-### 待做：App 原生侧（需要新会话，涉及 Gradle + Java）
+### ✅ App 原生侧已完成（v0.17.0H-debug，2026-11-19）
 
-1. **Gradle 依赖**：`com.github.luben:zstd-jni`（有 Android AAR，用于打补丁）
-2. **Capacitor 插件**（Java）三个方法：
-   - `fetchManifest(channel)` → GET /update/manifest
-   - `download(url, dest, onProgress)` → 支持 Range 续传，写文件
-   - `applyPatch(oldApk, patch, outApk)` → zstd `--patch-from` 等价调用
-   - `installApk(path)` → FileProvider + `ACTION_VIEW` + `application/vnd.android.package-archive`
-3. **更新流程**（顺序不能错）：
-   ```text
-   比对 versionCode（清单里给的是自动推导值）
-   → 有补丁就下补丁，否则下全量
-   → 校验 sha256
-   → 打补丁 → 再校验产物 sha256（必须与全量一致）
-   → 校验签名（与已装包一致，否则装不上）
-   → 唤起系统安装器
-   ```
-4. **失败回退**：补丁失败/哈希不符/签名不符 → 自动改下全量。
-   **绝不能出现"打完补丁装不上"**——那等于把用户卡死在旧版。
-5. **权限**：`REQUEST_INSTALL_PACKAGES` 已加入 AndroidManifest。
-6. **UI**：设置页"检查更新" + 顶部进度（复用现有云同步状态条的位置）。
+```text
+android-app/.../update/ApkPatcher.java          zstd --patch-from 的解码侧（纯 Java）
+android-app/.../update/ResumableDownloader.java Range 续传下载（纯 Java）
+android-app/.../update/UpdateInstaller.java     FileProvider + 签名比对 + 安装 Intent
+android-app/.../update/AppUpdatePlugin.java     Capacitor 插件：getInfo/checkManifest/download/applyPatch/install/openInstallPermission/cancel/clearCache
+app/src/services/update/index.ts                流程编排：比版本 → 补丁优先 → 校验 → 安装，失败自动回退全量
+app/src/components/settings/SettingsDialog.tsx  通用设置里「检查更新」一行（进度/已是最新/去授权）
+```
+
+**实测（JVM 单测 8 项全绿，`gradlew :app:testDebugUnitTest`）**
+
+```text
+patchReproducesTargetByteForByte   真数据：服务端 4.4MB→160KB 的补丁打在真 APK 上，逐字节还原目标
+rejectsPatchAppliedToWrongBase     用错底包打补丁 → 抛错/哈希不符，产物不落地
+resumesFromPartialFile             有 100KB 残片时只请求剩余字节（服务端确认收到 Range）
+restartsWhenServerIgnoresRange     服务端回 200（不支持续传）→ 整体重下，不拼坏文件
+rejectsCorruptedDownload           哈希不符 → 删残片并报错
+cancelsMidway                      取消 → 不产生目标文件
+```
+
+APK 内容核对：`lib/{arm64-v8a,armeabi-v7a,x86,x86_64}/libzstd-jni-1.5.7-10.so` 都在，dex 内含 `AppUpdatePlugin`。
+
+**四个必须记住的坑**
+
+1. **zstd-jni 版本不能随便升**：`1.5.7-15` 及以后要求 **compileSdk 37**，本项目 AGP/compileSdk 是 36，
+   Gradle 在 `checkDebugAarMetadata` 直接失败（`requires ... 37 or later`）。已钉在 **1.5.7-10**。
+   选版本的方法：拉 AAR 读 `META-INF/com/android/build/gradle/aar-metadata.properties` 的 `minCompileSdk`
+   （脚本：`delivery/deploy/probe-zstd-aar.mjs`），别靠猜。
+2. **`java.nio.file` 要 API 26**，而 minSdk = 24 → 用它会在此前的设备上 `NoClassDefFoundError`。
+   补丁与下载两个类刻意只用 `java.io`。
+3. **Android 单测编译面对的是 android.jar**，没有 `com.sun.net.httpserver` → 测试服务器得自己用 `ServerSocket` 写
+   （`RangeTestServer`，能造 206/200/416 三种响应）。
+4. **`@capacitor/core` 必须打进 Web 包**：原生只注入极简的 `window.Capacitor = {Plugins:{}}`，
+   插件调用机制在 core 里。之前 app 没用过任何插件，所以没有这个依赖，这次补上了。
+   另外插件必须在 `super.onCreate()` **之前** `registerPlugin`，否则 JS 侧找不到。
+
+**体积代价**：APK 5.29MB → **7.77MB**（zstd 原生库 4 个 ABI 合计 ~2.4MB）。
+只给真机发的话可以用 `abiFilters 'arm64-v8a','armeabi-v7a'` 砍掉 x86/x86_64（省 ~1.4MB），暂未改。
+
+**真机自测路径（已发布到 dev 通道）**
+
+```text
+dev 通道当前：0.17.0I-debug（versionCode 170009）
+补丁：0.17.0H-debug → 0.17.0I-debug，4.5 KB（只改了版本号，所以几乎没差异）
+验证：装 0.17.0H → 设置·通用设置 → 检查更新 → 应下 4.5KB 补丁 → 打补丁 → 系统安装器 → 装完是 0.17.0I
+```
+
+公网接口已核对：`/update/manifest?channel=dev` 200、补丁可取且 sha 正确、APK 的 `Range` 请求返回 206。
+
+**尚未验证的**：本机没有连接真机、也没有 AVD，所以"系统安装器真的弹出来 + 装完覆盖成功"这一步只能由用户在手机上走一次。
+
+<details>
+<summary>当初的计划（已全部落地，留作对照）</summary>
+
+1. **Gradle 依赖**：`com.github.luben:zstd-jni`（AAR 版给 Android，JAR 版给 JVM 单测）
+2. **Capacitor 插件**：`getInfo` / `checkManifest` / `download` / `applyPatch` / `install` / `openInstallPermission` / `cancel` / `clearCache`
+3. **更新流程**：比对 versionCode → 有补丁下补丁 → 校验 sha256 → 打补丁再校验 → 校验签名 → 唤起系统安装器
+4. **失败回退**：补丁失败/哈希不符/签名不符 → 自动改下全量
+5. **权限**：`REQUEST_INSTALL_PACKAGES` 已在 AndroidManifest
+6. **UI**：设置 → 通用设置 → 「检查更新」（进度直接显示在这一行，没有另做顶部条）
+
+</details>
 
 ### 发版时的新步骤（以后每次发版都要做）
 

@@ -172,11 +172,118 @@ public class AppUpdatePlugin extends Plugin {
         });
     }
 
+    // ── WebView 代下（原生 TLS 被网络打断时的兜底通道）─────────
+    /**
+     * 为什么需要这一组方法：
+     *   真机上出现过「原生 HttpURLConnection 建连即被 reset，而 WebView 走同一地址完全正常」
+     *   （服务端访问日志里连一条 /update 请求都没有 → 请求死在 TLS 握手）。
+     *   这种环境下唯一可靠的网络栈就是已经跑通的 WebView，所以：
+     *   **JS 用 fetch 取字节 → 分块交给原生落盘 → 原生校验、打补丁、安装。**
+     *
+     * 断点续传照样保留：JS 先问 partSize，再从该偏移发 Range 请求。
+     */
+
+    /** 分配一个新下载（清掉同名的旧残片） */
+    @PluginMethod
+    public void beginDownload(PluginCall call) {
+        String name = call.getString("name");
+        if (name == null || !SAFE_NAME.matcher(name).matches()) {
+            call.reject("参数不合法", "bad_args");
+            return;
+        }
+        runAsync(call, ignored -> {
+            File part = new File(updatesDir(), name + ".part");
+            //noinspection ResultOfMethodCallIgnored
+            part.delete();
+            JSObject result = new JSObject();
+            result.put("name", name);
+            result.put("bytes", 0);
+            call.resolve(result);
+        });
+    }
+
+    /** 已有残片长度（JS 拿它决定 Range 起点） */
+    @PluginMethod
+    public void partSize(PluginCall call) {
+        String name = call.getString("name");
+        if (name == null || !SAFE_NAME.matcher(name).matches()) {
+            call.reject("参数不合法", "bad_args");
+            return;
+        }
+        runAsync(call, ignored -> {
+            File part = new File(updatesDir(), name + ".part");
+            JSObject result = new JSObject();
+            result.put("name", name);
+            result.put("bytes", ChunkAssembler.partSize(part));
+            call.resolve(result);
+        });
+    }
+
+    /**
+     * 追加一块（base64）。
+     * params: { name, data } → 返回累计字节数
+     */
+    @PluginMethod
+    public void appendChunk(PluginCall call) {
+        String name = call.getString("name");
+        String data = call.getString("data");
+        if (name == null || !SAFE_NAME.matcher(name).matches() || data == null) {
+            call.reject("参数不合法", "bad_args");
+            return;
+        }
+        runAsync(call, ignored -> {
+            // android.util.Base64：minSdk 24 上不能用 java.util.Base64（那是 API 26）
+            byte[] bytes = android.util.Base64.decode(data, android.util.Base64.DEFAULT);
+            File part = new File(updatesDir(), name + ".part");
+            long size = ChunkAssembler.append(part, bytes);
+            JSObject result = new JSObject();
+            result.put("name", name);
+            result.put("bytes", size);
+            call.resolve(result);
+        });
+    }
+
+    /**
+     * 收尾：校验大小 + sha256，通过才重命名成正式文件。
+     * params: { name, sha256?, size? }
+     */
+    @PluginMethod
+    public void finishDownload(PluginCall call) {
+        String name = call.getString("name");
+        String expectedSha256 = call.getString("sha256");
+        Long expectedSize = call.getLong("size");
+        if (name == null || !SAFE_NAME.matcher(name).matches()) {
+            call.reject("参数不合法", "bad_args");
+            return;
+        }
+        runAsync(call, ignored -> {
+            File part = new File(updatesDir(), name + ".part");
+            File target = new File(updatesDir(), name);
+            ChunkAssembler.Result result = ChunkAssembler.finish(
+                    part,
+                    target,
+                    expectedSha256,
+                    expectedSize == null ? -1 : expectedSize
+            );
+            call.resolve(fileResult(name, target, result.sha256));
+        });
+    }
+
+    /** 放弃本次下载（清残片） */
+    @PluginMethod
+    public void abortDownload(PluginCall call) {
+        String name = call.getString("name");
+        if (name != null && SAFE_NAME.matcher(name).matches()) {
+            //noinspection ResultOfMethodCallIgnored
+            new File(updatesDir(), name + ".part").delete();
+        }
+        call.resolve();
+    }
+
     /**
      * 打补丁：用**本机已安装的 APK** 当字典，还原出目标 APK。
      * params: { patchName, targetName, sha256?, size? }
-     */
-    @PluginMethod
+     */    @PluginMethod
     public void applyPatch(PluginCall call) {
         String patchName = call.getString("patchName");
         String targetName = call.getString("targetName");

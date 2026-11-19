@@ -1713,6 +1713,46 @@ dev 通道当前：0.17.0I-debug（versionCode 170009）
 
 **尚未验证的**：本机没有连接真机、也没有 AVD，所以"系统安装器真的弹出来 + 装完覆盖成功"这一步只能由用户在手机上走一次。
 
+### 🚨 真机第一次跑就失败：原生 TLS 被重置（v0.17.0J 修复）
+
+**现象**：点「检查更新」显示「更新失败：Connection reset」。
+
+**取证过程（关键：先证明请求有没有到服务器）**
+
+```text
+Caddy 访问日志里 /update/* 共 3 条，全部来自我这台电脑（124.152.254.136, HTTP/1.1）
+手机（117.136.27.155）同一时段有大量 /sync、/memory、/usage 请求，但 /update 一条都没有
+Caddy 近 15 分钟也没有任何 TLS/handshake 报错
+```
+
+→ **请求死在建连/TLS 握手阶段，服务端连字节都没看到**。
+而 WebView 走同一个域名、同一个端口、同一时刻完全正常（日志里全是它的 h2 请求）。
+结论：这台手机上 **原生 `HttpURLConnection` 的 TLS 握手被中间盒重置**（运营商对该端口非浏览器指纹的常见处理），
+和证书、CORS、鉴权都无关。
+
+**修法：网络 I/O 交给 WebView，原生只做磁盘与安装**
+
+```text
+JS fetch（已证明可用的栈）→ 分块 base64 → 原生 appendChunk 落盘 → finishDownload 校验 sha256 → applyPatch → install
+```
+
+新增原生方法：`beginDownload` / `partSize` / `appendChunk` / `finishDownload` / `abortDownload`，
+拼接与校验逻辑抽成纯 Java 的 `ChunkAssembler`（可在 JVM 单测）。
+原生下载仍然先试一次（能通就省一次桥接），失败自动切 WebView 通道 —— 两条路都失败时，
+错误信息会**同时**带上两层的原文，下次不用再猜是哪一层。
+
+**为什么不用"让原生更像浏览器"**：改不了 Conscrypt 的 ClientHello；而 WebView 的栈本来就是通的，
+绕开它只会在更多机型上继续踩。
+
+**顺带确认**：`Range` 从 WebView 发是允许的（不是 fetch 的 forbidden header），
+服务端预检回 `access-control-allow-headers: range`、实际请求回 206 —— 已实测。
+
+**新增单测（ChunkAssemblerTest，5 项）**：分块拼接后逐字节一致、残片续传、
+少一半必须失败并删残片、哈希不符必须失败、没有任何数据必须失败。
+（连同之前的 8 项，`gradlew :app:testDebugUnitTest` 共 13 项）
+
+**待真机确认**：J → K（54KB 补丁）走一遍，看安装器是否正常弹出。
+
 <details>
 <summary>当初的计划（已全部落地，留作对照）</summary>
 

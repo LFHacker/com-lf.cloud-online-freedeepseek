@@ -1777,3 +1777,51 @@ ssh root@59.110.64.118 "cd /opt/ds-gateway && node scripts/publish-update.mjs \
 
 # 3) 开发通道同理，--channel dev
 ```
+
+## 环境信息（时间 + 位置）下发：最终形态与两个坑（2026-11-19 验证通过）
+
+### 最终链路
+
+```text
+客户端  每轮带 x-ds-local-time（YYYY-MM-DD HH:mm）+ x-ds-tz-offset
+        仅当设置里「向模型提供时间与位置」开启（contextInfo）时才带
+网关    读该头 → 在消息尾部注入：
+          <当前时间>2026-11-19 12:20</当前时间>
+          <当前位置>甘肃省兰州市（按网络出口 IP 推断，仅到城市，可能有偏差）</当前位置>
+位置来源 ip2region 离线库（npm 依赖，包内自带 xdb 11MB），IP 不外发第三方
+```
+
+实测回复：`你在**甘肃省兰州市**（根据网络出口 IP 推断，仅到城市，可能有偏差）。现在时间是 **2026-11-19 12:20**。`
+
+### 坑 1：latest_reminder 字段格式极严，不能塞时分
+
+```text
+Failed: invalid date '2026-11-19 11:53'           ← 带时分
+Failed: weekday '星期三' does not match date …    ← 星期与日期不自洽
+```
+
+该字段只接受 `YYYY-MM-DD,<weekday>,<location>,<platform>,<language>`，
+**日期与星期必须自洽**，语言名要是 `中文` / `English` 这类受支持的原生名。
+所以时间一律走消息尾部，不要碰这个字段。
+
+### 坑 2：客户端「名字→代码」映射不可靠，位置改由网关算
+
+`UserLocation.province/city` 存的是行政区划代码（`620000`），而 IP 库给的是名字（`甘肃省`）。
+客户端映射任何一步对不上，位置就变成空 → 模型答"不知道你在哪"。
+**现在位置完全由网关按来源 IP 算**，客户端只负责开关（带不带时间头）。
+
+### 坑 3：proxy 作用域里的 clientKey 会遮蔽同名函数
+
+```ts
+const clientKey = readHeader(req, 'x-deepseek-key')  // 局部：DeepSeek Key 字符串
+const clientKey = (req) => ...                        // 模块级：取 IP 的函数
+```
+
+在 proxy 里写 `clientKey(req)` → TS「String 不可调用」，运行时也会崩。
+已加别名 `clientIpOf(req)`。**以后在 proxy 里取 IP 一律用它。**
+
+### 运维注意
+
+`ip2region` 是新增 npm 依赖（`/opt/ds-gateway/node_modules`，约 47MB）。
+**换机器/重装网关后必须 `cd /opt/ds-gateway && npm install`**，否则 `/geo` 与位置注入会静默失效
+（日志里出现 `GeoIP 初始化失败`，且只记一次）。

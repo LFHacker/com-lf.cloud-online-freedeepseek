@@ -13,7 +13,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { Readable, Transform } from 'node:stream'
 import { timingSafeEqual } from 'node:crypto'
 import { appendFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
-import { createReadStream } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChatModel } from '../../shared/protocol.js'
 /**
@@ -1348,10 +1348,41 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
     try {
       const dir = join(MEMORY_DATA_DIR, user.id, 'files')
       await mkdir(dir, { recursive: true })
-      // 先写临时文件再改名：中途断开不会留下半个文件被当成"已同步"
       const target = join(dir, id)
-      await writeFile(`${target}.tmp`, read.buffer)
-      await rename(`${target}.tmp`, target)
+
+      /**
+       * 附件是**内容寻址**的（id 即内容），所以重复上传必须幂等。
+       *
+       * 实锤过的故障：同步引擎会并发上传同一个附件（多会话引用同一张图，
+       * 或重试与首次上传叠加），第一个请求把 `.tmp` 改名成正式文件后，
+       * 第二个请求再 rename 就 ENOENT，被记成"附件同步失败"——
+       * 但文件其实早就传上去了，用户看到的是假报错。
+       *
+       * 两道防线：
+       *  1. 临时文件名带随机后缀，避免两个请求互相踩同一个 .tmp
+       *  2. rename 失败但目标文件已存在 → 直接当成功
+       */
+      if (existsSync(target)) {
+        const info = await stat(target).catch(() => null)
+        json(res, 200, { ok: true, id, size: info?.size ?? read.buffer.length, deduped: true })
+        return
+      }
+
+      const uniqueTmpSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const tmpPath = `${target}.${uniqueTmpSuffix}.tmp`
+      await writeFile(tmpPath, read.buffer)
+      try {
+        await rename(tmpPath, target)
+      } catch (renameError) {
+        // 另一个并发请求可能刚好先完成了：目标在就算成功，清理自己的临时文件
+        const existing = await stat(target).catch(() => null)
+        await unlink(tmpPath).catch(() => undefined)
+        if (!existing) {
+          throw renameError
+        }
+        json(res, 200, { ok: true, id, size: existing.size, deduped: true })
+        return
+      }
       json(res, 200, { ok: true, id, size: read.buffer.length })
     } catch (error) {
       console.warn('[gateway] 附件写入失败:', error instanceof Error ? error.message : error)

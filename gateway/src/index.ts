@@ -1002,24 +1002,7 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
       body = injectRecall(managed.body, prefix)
     }
 
-    /**
-     * 稳定层：长期档案拼进 system。
-     *
-     * 它一天最多重建一次，所以是"逐字节稳定"的前缀 → 吃 1/10 缓存价。
-     * 动态召回必须留在尾部（见 injectRecall 的注释）：把会变的东西放进前缀，
-     * 等于每轮让整段缓存作废。实测稳定前缀 6009 token 时，
-     * 第二次调用命中 5760、只有 249 全价。
-     */
-    /**
-     * 时间与位置必须**独立于记忆**注入。
-     *
-     * 曾经的写法把这几行嵌在 `if (profile.body)` 里面，
-     * 结果是：新账号 / 清空记忆后档案为空 → 整块被跳过 →
-     * 模型既不知道时间也不知道位置（实测就是这个 bug）。
-     *
-     * 顺序按可信度：最近原话 → 时间 → 位置 → 长期档案 → 回忆。
-     * 任何一段缺失都不影响其它段。
-     */
+
     /**
      * 尾部注入分两层，互不依赖：
      *  ① buildRuntimeContext —— 通用上下文（时间/位置），每个请求都有

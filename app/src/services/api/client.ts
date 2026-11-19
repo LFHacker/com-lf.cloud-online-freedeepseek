@@ -137,6 +137,30 @@ export type SessionMeta = {
 const sessionHeaders = (meta?: SessionMeta): Record<string, string> =>
   meta ? { 'x-ds-session-id': meta.sessionId, 'x-ds-memory-scope': meta.scope } : {}
 
+/**
+ * 本地时间（精确到分钟）随请求带给网关。
+ *
+ * 为什么走请求头而不是塞进消息正文：
+ *  · 服务端对 latest_reminder 字段的格式校验极严，只接受 YYYY-MM-DD，
+ *    带时分会让整条请求被拒（实测：invalid date '2026-11-19 11:53'）
+ *  · 放进用户消息正文又会污染会话历史、破坏前缀缓存
+ *  · 走头 → 网关写进"消息尾部"，既不碰历史，也不影响缓存
+ *
+ * 总开关关闭时头也不带：网关拿不到时间，模型就完全不知道现在几点。
+ */
+const localTimeHeader = (): Record<string, string> => {
+  if (!useSettings.getState().contextInfo) {
+    return {}
+  }
+  const now = new Date()
+  const pad = (value: number) => (value < 10 ? `0${value}` : String(value))
+  const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
+  return {
+    'x-ds-local-time': stamp,
+    'x-ds-tz-offset': String(-now.getTimezoneOffset()),
+  }
+}
+
 /** 用 GET /models 校验 API Key（不产生费用） */
 export const verifyApiKey = async (apiKey: string, signal?: AbortSignal): Promise<void> => {
   await request(`${apiOrigin()}/models`, {
@@ -203,6 +227,7 @@ export async function* streamMessage(
     headers: {
       ...anthropicHeaders(apiKey, hasFile(body)),
       ...sessionHeaders(sessionMeta),
+      ...localTimeHeader(),
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     },

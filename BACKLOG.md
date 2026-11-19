@@ -1634,3 +1634,146 @@ GC dry-run  1011 会话 / 1076 引用 → 候选 0 个（不会误删任何在�
 
 核对脚本已入库：`gateway/scripts/attach-audit.mjs`（拷到服务器 `/root/` 跑，逐个对齐磁盘文件与会话引用）。
 
+
+## 应用内更新（OTA + 增量补丁）—— 服务端已完成，App 原生侧待做
+
+### 已完成并实测（2026-11-19）
+
+```text
+publish-update.mjs   登记 APK + 为最近 N 个旧版本生成 zstd --patch-from 补丁 + 写 manifest.json
+GET /update/manifest?channel=release|dev    版本/大小/sha256/补丁表（公开，不需登录）
+GET /update/file/<name>                     APK 与补丁下发，支持 Range 断点续传（206）
+```
+
+实测数据：
+
+```text
+4.23 MB APK → 160 KB 补丁（3.7%，省 96.3%）
+生成耗时 1.5 秒
+打补丁后与目标 APK 逐字节一致（cmp 通过）
+两段 Range 拼接后仍可正确还原 → 断点续传可用
+release / dev 两个通道互不影响
+```
+
+目录：`/opt/ds-gateway/updates/`（APK + patch-<旧版本>-to-<新版本>.zst + manifest.json）
+
+**踩过的坑**：PowerShell here-string 会把 `\d` 吃掉，写进代码变成 `bytes=d*-d*`，
+导致 Range 永远不匹配、下载恒为 200 全量。**正则里用 `[0-9]` 别用 `\d`。**
+
+### ✅ App 原生侧已完成（v0.17.0H-debug，2026-11-19）
+
+```text
+android-app/.../update/ApkPatcher.java          zstd --patch-from 的解码侧（纯 Java）
+android-app/.../update/ResumableDownloader.java Range 续传下载（纯 Java）
+android-app/.../update/UpdateInstaller.java     FileProvider + 签名比对 + 安装 Intent
+android-app/.../update/AppUpdatePlugin.java     Capacitor 插件：getInfo/checkManifest/download/applyPatch/install/openInstallPermission/cancel/clearCache
+app/src/services/update/index.ts                流程编排：比版本 → 补丁优先 → 校验 → 安装，失败自动回退全量
+app/src/components/settings/SettingsDialog.tsx  通用设置里「检查更新」一行（进度/已是最新/去授权）
+```
+
+**实测（JVM 单测 8 项全绿，`gradlew :app:testDebugUnitTest`）**
+
+```text
+patchReproducesTargetByteForByte   真数据：服务端 4.4MB→160KB 的补丁打在真 APK 上，逐字节还原目标
+rejectsPatchAppliedToWrongBase     用错底包打补丁 → 抛错/哈希不符，产物不落地
+resumesFromPartialFile             有 100KB 残片时只请求剩余字节（服务端确认收到 Range）
+restartsWhenServerIgnoresRange     服务端回 200（不支持续传）→ 整体重下，不拼坏文件
+rejectsCorruptedDownload           哈希不符 → 删残片并报错
+cancelsMidway                      取消 → 不产生目标文件
+```
+
+APK 内容核对：`lib/{arm64-v8a,armeabi-v7a,x86,x86_64}/libzstd-jni-1.5.7-10.so` 都在，dex 内含 `AppUpdatePlugin`。
+
+**四个必须记住的坑**
+
+1. **zstd-jni 版本不能随便升**：`1.5.7-15` 及以后要求 **compileSdk 37**，本项目 AGP/compileSdk 是 36，
+   Gradle 在 `checkDebugAarMetadata` 直接失败（`requires ... 37 or later`）。已钉在 **1.5.7-10**。
+   选版本的方法：拉 AAR 读 `META-INF/com/android/build/gradle/aar-metadata.properties` 的 `minCompileSdk`
+   （脚本：`delivery/deploy/probe-zstd-aar.mjs`），别靠猜。
+2. **`java.nio.file` 要 API 26**，而 minSdk = 24 → 用它会在此前的设备上 `NoClassDefFoundError`。
+   补丁与下载两个类刻意只用 `java.io`。
+3. **Android 单测编译面对的是 android.jar**，没有 `com.sun.net.httpserver` → 测试服务器得自己用 `ServerSocket` 写
+   （`RangeTestServer`，能造 206/200/416 三种响应）。
+4. **`@capacitor/core` 必须打进 Web 包**：原生只注入极简的 `window.Capacitor = {Plugins:{}}`，
+   插件调用机制在 core 里。之前 app 没用过任何插件，所以没有这个依赖，这次补上了。
+   另外插件必须在 `super.onCreate()` **之前** `registerPlugin`，否则 JS 侧找不到。
+
+**体积代价**：APK 5.29MB → **7.77MB**（zstd 原生库 4 个 ABI 合计 ~2.4MB）。
+只给真机发的话可以用 `abiFilters 'arm64-v8a','armeabi-v7a'` 砍掉 x86/x86_64（省 ~1.4MB），暂未改。
+
+**真机自测路径（已发布到 dev 通道）**
+
+```text
+dev 通道当前：0.17.0I-debug（versionCode 170009）
+补丁：0.17.0H-debug → 0.17.0I-debug，4.5 KB（只改了版本号，所以几乎没差异）
+验证：装 0.17.0H → 设置·通用设置 → 检查更新 → 应下 4.5KB 补丁 → 打补丁 → 系统安装器 → 装完是 0.17.0I
+```
+
+公网接口已核对：`/update/manifest?channel=dev` 200、补丁可取且 sha 正确、APK 的 `Range` 请求返回 206。
+
+**尚未验证的**：本机没有连接真机、也没有 AVD，所以"系统安装器真的弹出来 + 装完覆盖成功"这一步只能由用户在手机上走一次。
+
+### 🚨 真机第一次跑就失败：原生 TLS 被重置（v0.17.0J 修复）
+
+**现象**：点「检查更新」显示「更新失败：Connection reset」。
+
+**取证过程（关键：先证明请求有没有到服务器）**
+
+```text
+Caddy 访问日志里 /update/* 共 3 条，全部来自我这台电脑（124.152.254.136, HTTP/1.1）
+手机（117.136.27.155）同一时段有大量 /sync、/memory、/usage 请求，但 /update 一条都没有
+Caddy 近 15 分钟也没有任何 TLS/handshake 报错
+```
+
+→ **请求死在建连/TLS 握手阶段，服务端连字节都没看到**。
+而 WebView 走同一个域名、同一个端口、同一时刻完全正常（日志里全是它的 h2 请求）。
+结论：这台手机上 **原生 `HttpURLConnection` 的 TLS 握手被中间盒重置**（运营商对该端口非浏览器指纹的常见处理），
+和证书、CORS、鉴权都无关。
+
+**修法：网络 I/O 交给 WebView，原生只做磁盘与安装**
+
+```text
+JS fetch（已证明可用的栈）→ 分块 base64 → 原生 appendChunk 落盘 → finishDownload 校验 sha256 → applyPatch → install
+```
+
+新增原生方法：`beginDownload` / `partSize` / `appendChunk` / `finishDownload` / `abortDownload`，
+拼接与校验逻辑抽成纯 Java 的 `ChunkAssembler`（可在 JVM 单测）。
+原生下载仍然先试一次（能通就省一次桥接），失败自动切 WebView 通道 —— 两条路都失败时，
+错误信息会**同时**带上两层的原文，下次不用再猜是哪一层。
+
+**为什么不用"让原生更像浏览器"**：改不了 Conscrypt 的 ClientHello；而 WebView 的栈本来就是通的，
+绕开它只会在更多机型上继续踩。
+
+**顺带确认**：`Range` 从 WebView 发是允许的（不是 fetch 的 forbidden header），
+服务端预检回 `access-control-allow-headers: range`、实际请求回 206 —— 已实测。
+
+**新增单测（ChunkAssemblerTest，5 项）**：分块拼接后逐字节一致、残片续传、
+少一半必须失败并删残片、哈希不符必须失败、没有任何数据必须失败。
+（连同之前的 8 项，`gradlew :app:testDebugUnitTest` 共 13 项）
+
+**待真机确认**：J → K（54KB 补丁）走一遍，看安装器是否正常弹出。
+
+<details>
+<summary>当初的计划（已全部落地，留作对照）</summary>
+
+1. **Gradle 依赖**：`com.github.luben:zstd-jni`（AAR 版给 Android，JAR 版给 JVM 单测）
+2. **Capacitor 插件**：`getInfo` / `checkManifest` / `download` / `applyPatch` / `install` / `openInstallPermission` / `cancel` / `clearCache`
+3. **更新流程**：比对 versionCode → 有补丁下补丁 → 校验 sha256 → 打补丁再校验 → 校验签名 → 唤起系统安装器
+4. **失败回退**：补丁失败/哈希不符/签名不符 → 自动改下全量
+5. **权限**：`REQUEST_INSTALL_PACKAGES` 已在 AndroidManifest
+6. **UI**：设置 → 通用设置 → 「检查更新」（进度直接显示在这一行，没有另做顶部条）
+
+</details>
+
+### 发版时的新步骤（以后每次发版都要做）
+
+```bash
+# 1) 构建 APK 后上传到服务器
+scp delivery/freedeepseek-vX.Y.Z.apk root@59.110.64.118:/tmp/new.apk
+
+# 2) 发布（自动生成到最近 5 个版本的补丁）
+ssh root@59.110.64.118 "cd /opt/ds-gateway && node scripts/publish-update.mjs \
+  --apk /tmp/new.apk --version X.Y.Z --channel release --notes '本次更新内容'"
+
+# 3) 开发通道同理，--channel dev
+```

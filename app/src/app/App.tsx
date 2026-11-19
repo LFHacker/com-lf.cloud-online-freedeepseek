@@ -90,7 +90,22 @@ export const App = () => {
 
   return (
     <>
-      {authStatus !== 'signedIn' ? <LoginScreen /> : null}
+      {/*
+        只在"确认未登录"时才显示登录页。
+        原来是 !== 'signedIn'，而初始状态是 'unknown' —— 启动瞬间就被判成未登录，
+        于是登录页先闪一下，等 initAuth 回来再跳到主界面。
+        这也解释了为什么"已登录时打开 App 会看到登录页闪过"。
+      */}
+      {authStatus === 'signedOut' ? <LoginScreen /> : null}
+      {/*
+        状态未确认时盖一层与启动图同色的遮罩：
+        既避免登录页闪出，也避免主界面在鉴权完成前先露出半个空壳。
+      */}
+      {authStatus === 'unknown' ? (
+        <div className={styles.bootCover} aria-hidden>
+          <div className={styles.bootSpinner} />
+        </div>
+      ) : null}
       <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : siderCollapsed ? null : <Sider />}
         <main className={styles.main}>

@@ -13,6 +13,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { Readable, Transform } from 'node:stream'
 import { timingSafeEqual } from 'node:crypto'
 import { appendFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
 import { join } from 'node:path'
 import type { ChatModel } from '../../shared/protocol.js'
 /**
@@ -153,6 +154,9 @@ const authStore = new AuthStore(AUTH_DB_PATH)
 const DAILY_TOKEN_QUOTA = Number(process.env.DAILY_TOKEN_QUOTA ?? 2_000_000)
 
 const PROFILE = readProfileConfig(process.env)
+
+/** 更新包与补丁目录（publish-update.mjs 写入） */
+const UPDATES_DIR = process.env.UPDATES_DIR ?? '/opt/ds-gateway/updates'
 
 /**
  * 用量与缓存统计。
@@ -1592,6 +1596,82 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       totals,
       note: '统计范围：本 Key 经本网关发出的全部请求；官方后台含任何客户端的调用',
     })
+    return
+  }
+
+  /**
+   * 更新清单（公开接口，不需要登录）。
+   *
+   * 为什么公开：App 启动时可能还没登录就要检查更新；
+   * 清单里只有版本号与文件哈希，没有用户数据。
+   *
+   * 返回里带 patches：{ "旧版本": {file,size,sha256} }，
+   * 客户端据此决定"下补丁"还是"下全量"。
+   */
+  if (req.method === 'GET' && url.pathname === '/update/manifest') {
+    const channel = (url.searchParams.get('channel') ?? 'release').toLowerCase()
+    try {
+      const raw = await readFile(join(UPDATES_DIR, 'manifest.json'), 'utf8')
+      const manifest = JSON.parse(raw) as { channels?: Record<string, unknown> }
+      const entry = manifest.channels?.[channel]
+      if (!entry) {
+        json(res, 404, { ok: false, error: 'no_channel', message: '没有这个更新通道' })
+        return
+      }
+      json(res, 200, { ok: true, channel, ...(entry as Record<string, unknown>) })
+    } catch {
+      json(res, 404, { ok: false, error: 'no_manifest', message: '尚未发布任何更新' })
+    }
+    return
+  }
+
+  /**
+   * 下载更新文件（APK 或补丁），支持 Range 断点续传。
+   *
+   * Range 不只是"省流量"：移动网络下大文件下载中断很常见，
+   * 不能续传就等于每次从头再来。
+   */
+  if (req.method === 'GET' && url.pathname.startsWith('/update/file/')) {
+    const name = decodeURIComponent(url.pathname.slice('/update/file/'.length))
+    // 只允许清单目录下的白名单文件名，挡住路径穿越
+    if (!/^[A-Za-z0-9._-]{4,120}$/u.test(name)) {
+      json(res, 400, { ok: false, error: 'bad_name', message: '文件名不合法' })
+      return
+    }
+    const filePath = join(UPDATES_DIR, name)
+    let info
+    try {
+      info = await stat(filePath)
+    } catch {
+      json(res, 404, { ok: false, error: 'not_found', message: '文件不存在' })
+      return
+    }
+    const range = req.headers.range
+    const contentType = name.endsWith('.apk') ? 'application/vnd.android.package-archive' : 'application/octet-stream'
+    if (typeof range === 'string' && /^bytes=[0-9]*-[0-9]*$/u.test(range)) {
+      const [startText, endText] = range.replace('bytes=', '').split('-')
+      const start = Number(startText || 0)
+      const end = endText ? Math.min(Number(endText), info.size - 1) : info.size - 1
+      if (start > end || start >= info.size) {
+        res.writeHead(416, { 'content-range': `bytes */${info.size}` })
+        res.end()
+        return
+      }
+      res.writeHead(206, {
+        'content-type': contentType,
+        'content-length': String(end - start + 1),
+        'content-range': `bytes ${start}-${end}/${info.size}`,
+        'accept-ranges': 'bytes',
+      })
+      createReadStream(filePath, { start, end }).pipe(res)
+      return
+    }
+    res.writeHead(200, {
+      'content-type': contentType,
+      'content-length': String(info.size),
+      'accept-ranges': 'bytes',
+    })
+    createReadStream(filePath).pipe(res)
     return
   }
 

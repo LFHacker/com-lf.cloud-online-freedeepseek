@@ -351,6 +351,8 @@ try {
     return Boolean(btn)
   })()`)
   await sleep(500)
+  // 「通用设置」里放着「检查更新」，先拍一张
+  await shoot('settings-general')
   const switched = await evaluate(`(() => {
     const tab = [...document.querySelectorAll('button')].find(
       (el) => el.textContent.trim() === '数据管理'

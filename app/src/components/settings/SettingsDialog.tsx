@@ -21,6 +21,13 @@ import {
 } from '../../services/chat/backup.js'
 import { useChatStore } from '../../services/chat/store.js'
 import { startCloudSync, useCloudSync } from '../../services/sync/cloudSync.js'
+import {
+  getAppInfo,
+  isUpdateSupported,
+  openInstallPermission,
+  runUpdate,
+  type UpdateProgress,
+} from '../../services/update/index.js'
 import { regionCodes, getRegionName, provinces } from '../../services/location.js'
 import {
   DEFAULT_API_ORIGIN,
@@ -113,6 +120,7 @@ const SettingsContent = () => {
               <LocaleSetting />
               <TtsVoiceSetting />
               <LocationSetting />
+              <UpdateField />
             </>
           ) : section === 'advanced' ? (
             <AdvancedSettings />
@@ -968,6 +976,115 @@ const CloudSyncField = ({ disabled }: { disabled: boolean }) => {
           <IconRefreshOutline16 />
           {t(running ? 'cloudSyncBusy' : 'cloudSyncAction')}
         </Button>
+      }
+    />
+  )
+}
+
+/**
+ * 「检查更新」。
+ *
+ * 为什么只有一个按钮 + 一行状态：更新是"点了就该走完"的事，
+ * 用户只需要知道：有没有新版、现在下到哪、下来之后要不要授权。
+ *
+ * 通道按版本号自动判断（带 -debug 走 dev），不提供通道选择 —— 让用户选只会选错。
+ */
+const formatUpdateSize = (bytes: number): string => {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 KB'
+  }
+  return bytes >= 1024 * 1024
+    ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
+    : `${Math.round(bytes / 1024)} KB`
+}
+
+const UpdateField = () => {
+  const t = useTranslate()
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState<Status>(null)
+  const [version, setVersion] = useState<string | null>(null)
+  const [canInstall, setCanInstall] = useState(true)
+  const supported = isUpdateSupported()
+
+  useEffect(() => {
+    if (!supported) {
+      return
+    }
+    void getAppInfo()
+      .then((info) => {
+        if (info) {
+          setVersion(info.versionName)
+          setCanInstall(info.canInstall)
+        }
+      })
+      .catch(() => undefined)
+  }, [supported])
+
+  const check = async () => {
+    if (busy) {
+      return
+    }
+    setBusy(true)
+    setStatus({ key: 'updateChecking' })
+    const channel = (version ?? '').includes('-debug') ? 'dev' : 'release'
+    const onProgress = (progress: UpdateProgress) => {
+      setStatus({
+        key: progress.phase === 'patch' ? 'updatePatching' : 'updateDownloading',
+        params: { received: formatUpdateSize(progress.received), total: formatUpdateSize(progress.total) },
+      })
+    }
+    const outcome = await runUpdate(channel, onProgress)
+    if (outcome.kind === 'launched') {
+      setStatus({
+        key: outcome.viaPatch ? 'updateLaunchedViaPatch' : 'updateLaunched',
+        params: { version: outcome.version, saved: formatUpdateSize(outcome.savedBytes) },
+      })
+    } else if (outcome.kind === 'up-to-date') {
+      setStatus({ key: 'updateLatest', params: { version: outcome.version } })
+    } else if (outcome.kind === 'needs-permission') {
+      setStatus({ key: 'updateNeedsPermission', error: true })
+      setCanInstall(false)
+    } else if (outcome.kind === 'unsupported') {
+      setStatus({ key: 'updateUnsupported', error: true })
+    } else {
+      setStatus({ key: 'updateFailed', params: { message: outcome.message }, error: true })
+    }
+    setBusy(false)
+  }
+
+  return (
+    <SettingCell
+      label={t('updateLabel')}
+      description={
+        version
+          ? `${t('updateCurrentVersion', { version })} · ${t('updateDescription')}`
+          : t('updateDescription')
+      }
+      status={status}
+      action={
+        <>
+          {canInstall ? null : (
+            <Button
+              variant="outlined"
+              size="s"
+              className={styles.cellButton}
+              disabled={!supported}
+              onClick={() => void openInstallPermission()}
+            >
+              {t('updateGrantInstall')}
+            </Button>
+          )}
+          <Button
+            variant="outlined"
+            size="m"
+            className={styles.cellButton}
+            disabled={busy || !supported}
+            onClick={() => void check()}
+          >
+            <IconRefreshOutline16 />
+            {t(busy ? 'updateChecking' : 'updateCheck')}
+          </Button>
+        </>
       }
     />
   )

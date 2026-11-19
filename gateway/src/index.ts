@@ -155,6 +155,53 @@ const DAILY_TOKEN_QUOTA = Number(process.env.DAILY_TOKEN_QUOTA ?? 2_000_000)
 
 const PROFILE = readProfileConfig(process.env)
 
+/**
+ * GeoIP 读取器（延迟初始化，进程内复用）。
+ *
+ * 为什么要缓存：xdb 有 11MB，每次请求都读一遍盘既慢又浪费内存。
+ * lookup 是纯函数式查表，可以安全共享。
+ */
+type GeoHit = {
+  country?: { name?: string; code?: string }
+  subdivisions?: Array<{ name?: string }>
+  city?: { name?: string }
+  isp?: string
+}
+let geoReader: { lookup(target: string): unknown; close?(): void } | null = null
+let geoFailed = false
+
+const lookupGeo = async (ip: string): Promise<GeoHit | null> => {
+  if (geoFailed) {
+    return null
+  }
+  try {
+    if (!geoReader) {
+      const specifier = ['ip2region', 'node'].join('/')
+      const mod = (await import(specifier)) as unknown as {
+        IP2Region: new () => { lookup(target: string): unknown; close?(): void }
+      }
+      geoReader = new mod.IP2Region()
+    }
+    return (geoReader.lookup(ip) as GeoHit | null) ?? null
+  } catch (error) {
+    // 只记录一次，避免每轮刷日志；后续直接跳过
+    geoFailed = true
+    console.warn('[gateway] GeoIP 初始化失败，位置信息将不再提供:', error instanceof Error ? error.message : error)
+    return null
+  }
+}
+
+/** 位置文本：'甘肃省兰州市'；查不到返回空串 */
+const resolvePlaceLabel = async (ip: string): Promise<string> => {
+  const hit = await lookupGeo(ip)
+  if (!hit?.country) {
+    return ''
+  }
+  const parts = [hit.subdivisions?.[0]?.name, hit.city?.name]
+    .filter((part): part is string => Boolean(part) && part !== '0')
+  return parts.join('')
+}
+
 /** 更新包与补丁目录（publish-update.mjs 写入） */
 const UPDATES_DIR = process.env.UPDATES_DIR ?? '/opt/ds-gateway/updates'
 
@@ -373,6 +420,15 @@ const clientKey = (req: IncomingMessage): string => {
   }
   return req.socket.remoteAddress ?? 'unknown'
 }
+
+/**
+ * 客户端 IP 的别名。
+ *
+ * 为什么需要别名：代理处理函数内部有一个局部变量也叫 clientKey
+ * （存的是用户的 DeepSeek Key 字符串），它会把上面那个取 IP 的函数遮蔽掉 ——
+ * 在 proxy 里写 clientKey(req) 会被 TS 判成"String 不可调用"，运行时也会崩。
+ */
+const clientIpOf = (req: IncomingMessage): string => clientKey(req)
 
 /** 白名单就是 App 实际会调的全部接口 */
 const ALLOWED_PATHS: readonly RegExp[] = [
@@ -912,9 +968,20 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
            * 放在尾部则两全：既让模型知道现在几点，又不改动任何历史消息。
            */
           const localTime = readHeader(req, 'x-ds-local-time')
+          /**
+           * 位置由网关按来源 IP 推断，不经客户端。
+           *
+           * 为什么不让客户端传：客户端要先拿名字再换代码，链路上任何一步出错
+           * 位置就变成空的（实测就是这样：模型答"不知道你在哪"）。
+           * 网关这条路径已经在服务器上验证过，直接用它最可靠。
+           *
+           * 开关跟随客户端：只有开了"时间与位置"总开关，客户端才会带时间头。
+           */
+          const place = localTime ? await resolvePlaceLabel(clientIpOf(req)) : ''
           const blocks = [
             recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
             localTime ? ['<当前时间>', localTime, '</当前时间>'].join('\n') : '',
+            place ? ['<当前位置>', place, '（按网络出口 IP 推断，仅到城市，可能有偏差）</当前位置>'].join('\n') : '',
             ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'),
             prefix,
           ].filter(Boolean)

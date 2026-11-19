@@ -14,7 +14,16 @@ const json = (value: unknown) => new Blob([JSON.stringify(value)], { type: 'appl
 export const exportArchive = async (
   sessions: Iterable<Session> | AsyncIterable<Session>
 ): Promise<Blob> => {
-  const manifest: Manifest = { export_format_version: EXPORT_FORMAT_VERSION }
+  /**
+   * 隐式标识：在导出包的元信息里写明"内容由 AI 生成"与生成工具。
+   * 文件离开应用后（发给别人、归档），接收方仍能判断来源。
+   */
+  const manifest: Manifest = {
+    export_format_version: EXPORT_FORMAT_VERSION,
+    generated_by: 'freedeepseek',
+    generated_at: new Date().toISOString(),
+    content_notice: 'AI 生成内容：本包中的助手回复由人工智能模型生成，可能不准确。',
+  }
   const entries = [{ name: MANIFEST_PATH, blob: json(manifest) }]
   const imageEntries: { name: string; blob: Blob }[] = []
   const index: SessionIndexEntry[] = []

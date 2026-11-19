@@ -12,7 +12,14 @@ export type Iso8601Utc = string
 export const EXPORT_FORMAT_VERSION = 3
 
 /** manifest.json，ZIP 的第一个条目 */
-export type Manifest = { export_format_version: typeof EXPORT_FORMAT_VERSION }
+export type Manifest = {
+  export_format_version: typeof EXPORT_FORMAT_VERSION
+  /** 隐式标识：生成工具与时间，文件离开应用后仍可判断来源 */
+  generated_by?: string
+  generated_at?: string
+  /** 隐式标识：内容性质声明 */
+  content_notice?: string
+}
 
 /** chat_session_index.json 的一项，只列出成功写出的会话；位于全部会话 JSON 之后、图片之前 */
 export type SessionIndexEntry = {

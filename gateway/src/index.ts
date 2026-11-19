@@ -34,7 +34,7 @@ import { redactSecrets } from './redact.ts'
 import { readSmtpConfig, sendMail, type SmtpConfig } from './mail/smtp.ts'
 import { MEMORY_ADMIN_HTML } from './memory/admin.ts'
 import { AssistantTextCollector, extractUserMessages, injectRecall } from './memory/wire.ts'
-import { ensureProfile, readProfileConfig } from './memory/profile.ts'
+import { ensureProfile, readProfileConfig, type ProfileConfig } from './memory/profile.ts'
 import { estimateCost, isPeakNow, offPeakTable, readPriceTable } from './usage/cost.ts'
 
 /**
@@ -200,6 +200,73 @@ const resolvePlaceLabel = async (ip: string): Promise<string> => {
   const parts = [hit.subdivisions?.[0]?.name, hit.city?.name]
     .filter((part): part is string => Boolean(part) && part !== '0')
   return parts.join('')
+}
+
+/**
+ * 通用运行上下文：当前时间 + 大致位置。
+ *
+ * ⚠️ 这一层**与账号、记忆完全无关**。
+ * 曾经的错误是把时间/位置写进了"长期记忆/档案"那段逻辑里，
+ * 结果账号没有记忆（新用户、清空记忆后）连时间和位置一起消失 ——
+ * 用户看到的就是"模型说它不知道时间也不知道位置"。
+ *
+ * 通用上下文就该每个请求都算，只要用户没关总开关。
+ */
+const buildRuntimeContext = async (req: IncomingMessage): Promise<string> => {
+  const localTime = readHeader(req, 'x-ds-local-time')
+  if (!localTime) {
+    // 总开关关闭：时间和位置都不提供（客户端不带时间头即视为关闭）
+    return ''
+  }
+  const place = await resolvePlaceLabel(clientIpOf(req))
+  return [
+    ['<当前时间>', localTime, '</当前时间>'].join('\n'),
+    place
+      ? ['<当前位置>', place, '（按网络出口 IP 推断，仅到城市，可能有偏差）</当前位置>'].join('\n')
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+/**
+ * 账号记忆：最近原话 + 长期档案（+ 调用方传入的回忆）。
+ *
+ * 这一层**允许为空**，而且为空时不能影响任何其它内容 ——
+ * 新账号第一次说话时它必然是空的。
+ */
+const buildMemoryContext = async (
+  memory: MemoryStore | null,
+  config: ProfileConfig | null,
+  prefix?: string
+): Promise<string> => {
+  // 记忆功能关闭（config 为空）或该用户没有记忆库：直接跳过，不影响其它注入
+  if (!memory || !config) {
+    return prefix ?? ''
+  }
+  try {
+    const profile = await ensureProfile(memory, config)
+    const recent = memory
+      .recentUserMessages(config.recentMessages)
+      .reverse()
+      .map(
+        (item) =>
+          `- [${new Date(item.createdAt).toISOString().slice(0, 16).replace('T', ' ')}] ${item.body.slice(0, 200)}`
+      )
+      .join('\n')
+    return [
+      recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
+      profile.body ? ['<长期记忆>', profile.body, '</长期记忆>'].join('\n') : '',
+      prefix,
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+  } catch (error) {
+    console.warn(
+      `[gateway] 记忆上下文构建失败：${error instanceof Error ? error.message : String(error)}`
+    )
+    return prefix ?? ''
+  }
 }
 
 /** 更新包与补丁目录（publish-update.mjs 写入） */
@@ -943,64 +1010,44 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
      * 等于每轮让整段缓存作废。实测稳定前缀 6009 token 时，
      * 第二次调用命中 5760、只有 249 全价。
      */
-    if (PROFILE && memory) {
-      try {
-        const profile = await ensureProfile(memory, PROFILE)
-        if (profile.body) {
-          /**
-           * ⚠️ 档案**不放 system**，改成和回忆一起进尾部。
-           *
-           * 原因：档案里是会变的事实（年级、专业、在做什么）。
-           * 放 system 想省缓存，就只能靠"别刷新"保住前缀 —— 那必然记错。
-           * 放尾部则前缀（system + 历史）保持稳定，缓存照旧命中；
-           * 尾部这几百 token 按未命中价算，可以忽略。
-           *
-           * 顺序：档案在前（结论），回忆在后（证据）。
-           */
-          /**
-           * 三段内容，按可信度从高到低排：
-           *  ① 最近你说过的原话（未经摘要，一定最新）
-           *  ② 长期档案（摘要，可能滞后）
-           *  ③ 跨会话回忆（证据，可能已过时）
-           * 用户明确要求"记忆的更新应该是即时的"，所以原话必须原样带上。
-           */
-          const recent = memory
-            .recentUserMessages(PROFILE.recentMessages)
-            .reverse()
-            .map((item) => `- [${new Date(item.createdAt).toISOString().slice(0, 16).replace('T', ' ')}] ${item.body.slice(0, 200)}`)
-            .join('\n')
-          /**
-           * 客户端本地时间（精确到分钟）。
-           *
-           * 为什么由网关拼：latest_reminder 字段只接受 YYYY-MM-DD，
-           * 带时分会被上游整条拒绝；塞进用户正文又会污染历史与缓存。
-           * 放在尾部则两全：既让模型知道现在几点，又不改动任何历史消息。
-           */
-          const localTime = readHeader(req, 'x-ds-local-time')
-          /**
-           * 位置由网关按来源 IP 推断，不经客户端。
-           *
-           * 为什么不让客户端传：客户端要先拿名字再换代码，链路上任何一步出错
-           * 位置就变成空的（实测就是这样：模型答"不知道你在哪"）。
-           * 网关这条路径已经在服务器上验证过，直接用它最可靠。
-           *
-           * 开关跟随客户端：只有开了"时间与位置"总开关，客户端才会带时间头。
-           */
-          const place = localTime ? await resolvePlaceLabel(clientIpOf(req)) : ''
-          const blocks = [
-            recent ? ['<最近你说过>', recent, '</最近你说过>'].join('\n') : '',
-            localTime ? ['<当前时间>', localTime, '</当前时间>'].join('\n') : '',
-            place ? ['<当前位置>', place, '（按网络出口 IP 推断，仅到城市，可能有偏差）</当前位置>'].join('\n') : '',
-            ['<长期记忆>', profile.body, '</长期记忆>'].join('\n'),
-            prefix,
-          ].filter(Boolean)
-          body = injectRecall(body, blocks.join('\n\n'))
-        }
-      } catch (error) {
-        console.warn(
-          `[gateway] 长期档案注入失败：${error instanceof Error ? error.message : String(error)}`
-        )
-      }
+    /**
+     * 时间与位置必须**独立于记忆**注入。
+     *
+     * 曾经的写法把这几行嵌在 `if (profile.body)` 里面，
+     * 结果是：新账号 / 清空记忆后档案为空 → 整块被跳过 →
+     * 模型既不知道时间也不知道位置（实测就是这个 bug）。
+     *
+     * 顺序按可信度：最近原话 → 时间 → 位置 → 长期档案 → 回忆。
+     * 任何一段缺失都不影响其它段。
+     */
+    /**
+     * 尾部注入分两层，互不依赖：
+     *  ① buildRuntimeContext —— 通用上下文（时间/位置），每个请求都有
+     *  ② buildMemoryContext  —— 账号记忆（最近原话/长期档案），有则加、无则跳过
+     *
+     * 分层的原因：通用信息和账号数据混在一起写，
+     * 就会出现"账号没记忆 → 连时间和位置都没了"这种荒唐结果。
+     */
+    const [runtimeContext, memoryContext] = await Promise.all([
+      buildRuntimeContext(req),
+      buildMemoryContext(memory, PROFILE, prefix),
+    ])
+    const injected = [runtimeContext, memoryContext].filter(Boolean)
+    if (injected.length > 0) {
+      body = injectRecall(body, injected.join('\n\n'))
+    }
+    /**
+     * 探针开关：客户端带 x-ds-debug-context: 1 时打印注入了哪些块。
+     *
+     * 为什么需要它：服务器不再保存 DeepSeek Key，没法用真实上游验证注入是否发生；
+     * 有了这行日志就能确定"时间/位置确实进了请求体"。
+     * 只在探针请求时打印，不污染正常日志。
+     */
+    const debugContext = readHeader(req, 'x-ds-debug-context') === '1'
+    if (debugContext) {
+      console.log(
+        `[gateway] 上下文注入 runtime=${runtimeContext ? 'yes' : 'no'} memory=${memoryContext ? 'yes' : 'no'}`
+      )
     }
   } else {
     body = Readable.toWeb(req) as unknown as FetchBody

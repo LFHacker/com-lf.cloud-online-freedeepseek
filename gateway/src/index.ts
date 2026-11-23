@@ -360,6 +360,53 @@ const recordUsage = (usage: unknown, context?: { userId: string; sessionId: stri
   }
 }
 
+/**
+ * 从 SSE 文本里提取 usage 并记账。
+ *
+ * 正常聊天走的全是流式（text/event-stream），usage 分两处出现：
+ *   message_start 带输入 token 与缓存命中
+ *   message_delta 带输出 token
+ * 原来的代码只在"非流式 JSON"分支记账，导致**流式对话一条都没记**：
+ * 用量合计永远是 0，每日 token 配额读到 0 也就永远不生效。
+ */
+const recordStreamUsage = (
+  text: string,
+  context: { userId: string; sessionId: string | null }
+): void => {
+  const merged: Record<string, number> = {}
+  let found = false
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('data:')) {
+      continue
+    }
+    const payload = line.slice(5).trim()
+    if (!payload.includes('"usage"')) {
+      continue
+    }
+    try {
+      const parsed = JSON.parse(payload) as {
+        usage?: Record<string, unknown>
+        message?: { usage?: Record<string, unknown> }
+      }
+      const usage = parsed.usage ?? parsed.message?.usage
+      if (!usage || typeof usage !== 'object') {
+        continue
+      }
+      found = true
+      for (const [key, value] of Object.entries(usage)) {
+        if (typeof value === 'number') {
+          merged[key] = value
+        }
+      }
+    } catch {
+      // 单行坏了不影响其它行
+    }
+  }
+  if (found) {
+    recordUsage(merged, context)
+  }
+}
+
 /** 邮件通道；没配就退化成"验证码只能打印到日志"（仅开发用） */
 const SMTP: SmtpConfig | null = readSmtpConfig(process.env)
 const MAIL_ENABLED = SMTP !== null
@@ -1149,25 +1196,42 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
   const stream = Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0])
   stream.on('error', () => res.destroy())
 
-  if (!collector) {
-    stream.pipe(res)
-    return
-  }
+  /** SSE 的 usage 在流末尾，只需保留尾部若干字节，不必攒下整段对话 */
+  const USAGE_TAIL_LIMIT = 256 * 1024
+  const isSse = (upstream.headers.get('content-type') ?? '').includes('text/event-stream')
 
-  if ((upstream.headers.get('content-type') ?? '').includes('text/event-stream')) {
-    // SSE：边转发边捞文本。**绝不能先缓冲再转发**，否则首字延迟就毁掉流式体验
+  if (isSse) {
+    /**
+     * SSE：边转发边捞正文，同时在末尾解析 usage 记账。
+     * **绝不能先缓冲再转发**，否则首字延迟就毁掉流式体验。
+     *
+     * 记账不能依赖 collector：collector 只在"能记忆"的会话里才开，
+     * 而用量是**每个请求**都要记的。
+     */
+    let tail = Buffer.alloc(0)
     const tap = new Transform({
       transform(chunk, _encoding, callback) {
-        collector.push(chunk as Buffer)
+        const buffer = chunk as Buffer
+        collector?.push(buffer)
+        tail = Buffer.concat([tail, buffer])
+        if (tail.length > USAGE_TAIL_LIMIT) {
+          tail = tail.subarray(tail.length - USAGE_TAIL_LIMIT)
+        }
         callback(null, chunk)
       },
       flush(callback) {
+        recordStreamUsage(tail.toString('utf8'), { userId: user.id, sessionId })
         finalizeAssistant()
         callback()
       },
     })
     stream.on('error', (error) => tap.destroy(error))
     stream.pipe(tap).pipe(res)
+    return
+  }
+
+  if (!collector) {
+    stream.pipe(res)
     return
   }
 

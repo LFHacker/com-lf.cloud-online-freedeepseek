@@ -346,6 +346,13 @@ export const pushMessage = async (
       body: JSON.stringify({ sessionId, message, updatedAt, base }),
     })
     if (!response.ok) {
+      /**
+       * 413 说明这条消息本身就超过增量接口的 2 MB 上限（比如整篇长文粘进来）。
+       * 这不是"发不出去"，而是"这条路装不下" —— 回落整段推送，那边上限是 8 MB。
+       */
+      if (response.status === 413) {
+        return { ok: false, retryable: false, needFullPush: true }
+      }
       return {
         ok: false,
         retryable: isRetryableStatus(response.status),

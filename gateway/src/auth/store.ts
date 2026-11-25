@@ -299,6 +299,22 @@ const collectPayloadFileIds = (payload: string): string[] => {
   }
 }
 
+/** 单条消息引用的附件 id（增量追加时只算这一条，不重算整段会话） */
+const collectMessageFileIds = (message: unknown): string[] => {
+  const files = (message as { files?: unknown })?.files
+  if (!Array.isArray(files)) {
+    return []
+  }
+  const ids = new Set<string>()
+  for (const file of files) {
+    const id = (file as { id?: unknown })?.id
+    if (typeof id === 'string' && FILE_ID_RE.test(id)) {
+      ids.add(id)
+    }
+  }
+  return [...ids]
+}
+
 /** 新建用户 id：`u_` + 16 位十六进制，可安全用作目录名 */
 const newUserId = (): string => `u_${randomBytes(8).toString('hex')}`
 
@@ -915,6 +931,112 @@ export class AuthStore {
     const refs = accepted.length > 0 ? this.writeRefs(userId, accepted) : 0
     return { written, skipped: sessions.length - written, refs }
   }
+
+  /**
+   * 单条消息增量追加。
+   *
+   * 为什么需要它：客户端原来每发一句话都要 POST **整段会话**。
+   * 线上实测中位 26 KB、p90 134 KB、最长 4.74 MB —— 而这些字节里 99% 是服务端已经有的历史。
+   * 手机上行慢，长会话光这一步就是几秒，用户只觉得"点发送没反应"。
+   *
+   * 安全边界（三条都要满足才写）：
+   *  · 会话属于这个用户（SQL 带 user_id，不是先查后判）
+   *  · 没被墓碑掉（删过的会话不能被一条追加消息复活）
+   *  · 服务端版本不超前（`updated_at <= base`）：别的设备已经推了更新的版本时，
+   *    盲追加会把它的改动盖掉 —— 这时返回 stale，交给客户端回落整段推送，
+   *    让原有的"取较新者"规则去裁决。
+   *
+   * 幂等：payload 里已有同 id 的消息就直接返回成功（重试/重复投递安全）。
+   */
+  appendMessage(
+    userId: string,
+    sessionId: string,
+    params: { message: unknown; updatedAt: number; base: number }
+  ):
+    | { ok: true; updatedAt: number; idempotent: boolean }
+    | { ok: false; reason: 'missing' | 'stale' | 'bad_payload' } {
+    const row = this.db
+      .prepare('select payload, updated_at from user_sessions where user_id = ? and session_id = ?')
+      .get(userId, sessionId) as { payload: string; updated_at: number } | undefined
+    if (!row) {
+      return { ok: false, reason: 'missing' }
+    }
+    if (
+      this.db
+        .prepare('select 1 as hit from session_tombstones where user_id = ? and session_id = ?')
+        .get(userId, sessionId)
+    ) {
+      // 和 upsertSessions 同样的取舍：删除意图比"旧设备手里的副本"更新
+      return { ok: false, reason: 'missing' }
+    }
+    /**
+     * 服务端比客户端以为的更新（另一台设备先写了）：不猜、不合并，直接让客户端回落。
+     * base 是客户端入队时的 updatedAt，只可能落后，不可能凭空超前。
+     */
+    if (row.updated_at > params.base) {
+      return { ok: false, reason: 'stale' }
+    }
+    const message = params.message as { id?: unknown; files?: unknown } | null
+    if (!message || typeof message !== 'object' || typeof message.id !== 'string') {
+      return { ok: false, reason: 'bad_payload' }
+    }
+    let session: { messages?: unknown; updatedAt?: unknown }
+    try {
+      session = JSON.parse(row.payload) as { messages?: unknown; updatedAt?: unknown }
+    } catch {
+      return { ok: false, reason: 'bad_payload' }
+    }
+    if (!session || !Array.isArray(session.messages)) {
+      return { ok: false, reason: 'bad_payload' }
+    }
+    const messages = session.messages as Array<{ id?: unknown }>
+    if (messages.some((item) => item?.id === message.id)) {
+      return { ok: true, updatedAt: row.updated_at, idempotent: true }
+    }
+    messages.push(message)
+    // 保证服务端时间戳单调前进：客户端时钟回拨也不至于让下一轮 CAS 永远失败
+    const updatedAt = Math.max(params.updatedAt, row.updated_at + 1)
+    session.updatedAt = updatedAt
+    const changes = this.db
+      .prepare(
+        `update user_sessions set payload = ?, updated_at = ?
+         where user_id = ? and session_id = ? and updated_at <= ?`
+      )
+      .run(JSON.stringify(session), updatedAt, userId, sessionId, params.base)
+    if (Number(changes.changes) === 0) {
+      return { ok: false, reason: 'stale' }
+    }
+    /**
+     * 附件引用**只增不删**：这里是追加消息，不存在"新版本少了某个文件"的情况，
+     * 重算整段会话的引用要多解析一遍 payload，没有必要。
+     *
+     * ⚠️ 写引用失败不能让整条追加失败：消息已经在库里了，这里再抛出去，
+     * 客户端重试会走幂等分支直接返回成功，引用却永远补不上（随后 GC 会删掉在用的附件）。
+     * 引用表本来就有 rebuildRefs 兜底，所以这里只记日志。
+     */
+    const fileIds = collectMessageFileIds(message)
+    if (fileIds.length > 0) {
+      try {
+        this.writeRefs(userId, [{ id: sessionId, fileIds: this.mergeRefs(userId, sessionId, fileIds) }])
+      } catch (error) {
+        console.warn(
+          `[gateway] 追加消息后写附件引用失败（可用 rebuildRefs 修复）：${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+    }
+    return { ok: true, updatedAt, idempotent: false }
+  }
+
+  /** 该会话当前在库里的引用 id（追加模式要先取出来，才能"只增不删"地重写） */
+  private mergeRefs(userId: string, sessionId: string, added: string[]): string[] {
+    const existing = this.db
+      .prepare('select file_id from file_refs where user_id = ? and session_id = ?')
+      .all(userId, sessionId) as Array<{ file_id: string }>
+    return [...new Set([...existing.map((row) => row.file_id), ...added])]
+  }
+
 
   /** 重写若干条会话的引用边（先删该会话的旧边、再插新边，幂等） */
   private writeRefs(userId: string, sessions: Array<{ id: string; fileIds: string[] }>): number {

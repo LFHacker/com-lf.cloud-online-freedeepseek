@@ -242,6 +242,119 @@ try {
   check('删光会话后引用表为空', store.fileRefCounts(uid).size === 0)
   check('引用表为空但依然可信（这是该回收的时刻）', store.refsTrusted())
 
+  // ── 8. 单条消息增量追加（发送热路径）─────────────────
+  /**
+   * 这条路径取代"每发一句就整车重传"。它一旦写错，后果比慢更糟：
+   * 要么追加到别人的会话里，要么把已删除的会话复活，要么在别的设备
+   * 已经改过时把对方的内容盖掉。下面每一项都对着一个具体的坏结果。
+   */
+  const incMsg = (id: string, fileIds: string[] = []) => ({
+    id,
+    role: 'user',
+    content: 'hi',
+    createdAt: 5,
+    ...(fileIds.length > 0 ? { files: fileIds.map((fileId) => ({ id: fileId })) } : {}),
+  })
+  store.upsertSessions(uid, [
+    {
+      id: 's_inc',
+      title: '增量',
+      createdAt: 1000,
+      updatedAt: 1000,
+      payload: JSON.stringify({
+        id: 's_inc',
+        title: '增量',
+        createdAt: 1000,
+        updatedAt: 1000,
+        messages: [incMsg('m0')],
+      }),
+    },
+  ])
+  const readInc = () => store.readSession(uid, 's_inc')!
+  const incMessages = () =>
+    (JSON.parse(readInc().payload) as { messages: Array<{ id: string }> }).messages
+
+  const a1 = store.appendMessage(uid, 's_inc', {
+    message: incMsg('m1', ['file_inc_aa']),
+    updatedAt: 1600,
+    base: 1000,
+  })
+  check('增量追加成功', a1.ok === true && a1.idempotent === false, JSON.stringify(a1))
+  check('追加后消息数 +1', incMessages().length === 2, JSON.stringify(incMessages().map((m) => m.id)))
+  check('服务端 updatedAt 前进', readInc().updatedAt === 1600, String(readInc().updatedAt))
+  check(
+    'payload 内的 updatedAt 同步（否则下次拉取会判成旧版本）',
+    (JSON.parse(readInc().payload) as { updatedAt: number }).updatedAt === 1600
+  )
+  check(
+    '追加消息里的附件进了引用表（否则 GC 会删掉在用的文件）',
+    store.fileRefCounts(uid).get('file_inc_aa') === 1,
+    JSON.stringify([...store.fileRefCounts(uid)])
+  )
+
+  const a2 = store.appendMessage(uid, 's_inc', {
+    message: incMsg('m1'),
+    updatedAt: 1700,
+    base: 1600,
+  })
+  check('重复投递幂等（重试安全）', a2.ok === true && a2.idempotent === true, JSON.stringify(a2))
+  check('幂等时不产生第二条', incMessages().length === 2)
+
+  const a3 = store.appendMessage(uid, 's_inc', {
+    message: incMsg('m2'),
+    updatedAt: 1800,
+    base: 100,
+  })
+  check(
+    '云端版本超前时拒绝追加（不盖掉别的设备）',
+    a3.ok === false && a3.reason === 'stale',
+    JSON.stringify(a3)
+  )
+  check('拒绝后内容未变', incMessages().length === 2)
+
+  const a4 = store.appendMessage(uid, 's_inc', {
+    message: incMsg('m3'),
+    updatedAt: 1200,
+    base: 1600,
+  })
+  check(
+    '客户端时钟回拨也不倒退（服务端时间戳单调前进）',
+    a4.ok === true && readInc().updatedAt === 1601,
+    JSON.stringify({ a4, updatedAt: readInc().updatedAt })
+  )
+
+  const a5 = store.appendMessage(uid, 'not_exists', {
+    message: incMsg('m4'),
+    updatedAt: 9000,
+    base: 9000,
+  })
+  check(
+    '会话不存在时返回 missing（客户端据此回落整段推送）',
+    a5.ok === false && a5.reason === 'missing',
+    JSON.stringify(a5)
+  )
+
+  const a6 = store.appendMessage(other.id, 's_inc', {
+    message: incMsg('m5'),
+    updatedAt: 9500,
+    base: 9500,
+  })
+  check('别的账号追加不进来（跨用户隔离）', a6.ok === false && a6.reason === 'missing', JSON.stringify(a6))
+  check('隔离失败会立刻写进别人的会话', incMessages().every((m) => m.id !== 'm5'))
+
+  store.deleteSession(uid, 's_inc')
+  const a7 = store.appendMessage(uid, 's_inc', {
+    message: incMsg('m9'),
+    updatedAt: 20_000,
+    base: 20_000,
+  })
+  check(
+    '删过的会话不会被一条追加消息复活',
+    a7.ok === false && a7.reason === 'missing',
+    JSON.stringify(a7)
+  )
+  check('墓碑后读回为空', store.readSession(uid, 's_inc') === null)
+
   store.close()
 } finally {
   rmSync(dir, { recursive: true, force: true })

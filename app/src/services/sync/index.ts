@@ -23,7 +23,7 @@ import {
   loadSession,
   type CloudSessionMeta,
 } from '../chat/db.js'
-import type { Session } from '../chat/types.js'
+import type { Session, UserMessage } from '../chat/types.js'
 
 const sessionToken = (): string => useSettings.getState().apiKey ?? ''
 
@@ -62,6 +62,11 @@ export type PushOutcome = {
   retryable: boolean
   status?: number
   message?: string
+  /**
+   * 增量推送被服务端拒绝（会话不存在 / 云端更新 / payload 不合法）。
+   * 不是错误，只是"增量这条路走不通"，调用方应改走整段推送。
+   */
+  needFullPush?: boolean
 }
 
 export type RemoteIndex = {
@@ -314,6 +319,48 @@ export const pushSession = async (sessionId: string): Promise<PushOutcome> => {
     retryable: result.failed === 0 ? false : result.retryable,
     status: result.status,
     message: result.message,
+  }
+}
+
+/**
+ * 只推**一条新消息**（增量）。
+ *
+ * 为什么值得单开一条路：`pushSession` 每次上行的是**整段会话**，
+ * 线上实测中位 26 KB、p90 134 KB、最长 4.74 MB —— 而这一轮真正新增的只有一条消息，
+ * 几百字节到几 KB。手机上行慢，长会话里这几乎就是"点发送后那几秒空白"。
+ *
+ * 返回 `needFullPush` **不是错误**：说明云端与本地对不上（会话还没推上去、或别的设备
+ * 已经改过）。这时回落 `pushSession`，由服务端原有的"取较新者"规则裁决 ——
+ * 在这里猜着合并只会丢别人的改动。
+ */
+export const pushMessage = async (
+  sessionId: string,
+  message: UserMessage,
+  updatedAt: number,
+  base: number
+): Promise<PushOutcome> => {
+  try {
+    const response = await fetch(`${apiOrigin()}/sync/message`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ sessionId, message, updatedAt, base }),
+    })
+    if (!response.ok) {
+      return {
+        ok: false,
+        retryable: isRetryableStatus(response.status),
+        status: response.status,
+        message: failureMessage(response.status),
+      }
+    }
+    const payload = (await response.json()) as { ok?: boolean }
+    if (payload.ok === true) {
+      return { ok: true, retryable: false }
+    }
+    return { ok: false, retryable: false, needFullPush: true }
+  } catch {
+    // 请求根本没到服务端：整段推送同样会失败，按可重试处理，别白跑一次回落
+    return { ok: false, retryable: true, message: failureMessage(undefined) }
   }
 }
 

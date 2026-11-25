@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
-import { toSessionSummary, type Session, type SessionSummary } from './types.js'
+import { toSessionSummary, type Session, type SessionSummary, type UserMessage } from './types.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
 const DB_VERSION = 12
@@ -43,6 +43,14 @@ export type OutboxRecord = {
   /** queued：等待重试；sending：正在发；failed：不可重试（如 401） */
   status: 'queued' | 'sending' | 'failed'
   error?: string
+  /**
+   * 增量推送用：这一条消息本体 + 入队时会话的版本。
+   *
+   * 只存这一条（几 KB），不存整段会话。旧版本留下的队列条目没有这两个字段，
+   * 读回来按"缺字段 → 回落整段推送"处理，所以升级不会弄坏已存在的队列。
+   */
+  message?: UserMessage
+  base?: number
 }
 
 /** 文件引用留在摘要中，删除会话时通过索引判断原件是否仍被引用。 */

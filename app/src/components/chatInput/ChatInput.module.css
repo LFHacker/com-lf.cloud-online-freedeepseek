@@ -330,3 +330,22 @@
     cursor: not-allowed;
   }
 }
+
+/*
+ * 支持 field-sizing 的 WebView：让 textarea 自己按内容长高。
+ * 这样每次按键都不必再重排一个隐藏的 mirror —— 高度由浏览器内联完成，
+ * 而且 JS 侧压根不渲染镜像节点（见 ChatInput.tsx 的 SUPPORTS_FIELD_SIZING）。
+ * 老 WebView 继续走原来的 mirror 方案，两条路径互不影响。
+ */
+@supports (field-sizing: content) {
+  .textarea {
+    position: static;
+    height: auto;
+    field-sizing: content;
+    max-height: 336px;
+  }
+
+  .mirror {
+    display: none;
+  }
+}

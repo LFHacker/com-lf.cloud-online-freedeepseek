@@ -123,6 +123,42 @@ const ALLOW_INSTANCE_KEY = (process.env.ALLOW_INSTANCE_KEY ?? '0') === '1'
 const MEMORY_LOCAL_READS_GLOBAL = (process.env.MEMORY_LOCAL_READS_GLOBAL ?? '0') === '1'
 const MEMORY_MAX_HITS = Number(process.env.MEMORY_MAX_HITS ?? 4)
 const MEMORY_MAX_CHARS = Number(process.env.MEMORY_MAX_CHARS ?? 1500)
+/**
+ * 记忆召回的**硬预算**（毫秒）。
+ *
+ * 召回链路上有两跳外部网络（embedding + rerank），实测 300~700ms。
+ * 它卡在"收到请求"和"转发上游"之间，所以**每一毫秒都直接加在首字延迟上** ——
+ * 用户点发送后那一秒空白，有一部分就是在等它。
+ *
+ * 超预算就这一轮不注入：记忆是增强功能，宁可少一点上下文，
+ * 也不要为了它把每句话都拖慢。设 0 表示不限制。
+ */
+const MEMORY_RECALL_BUDGET_MS = Number(process.env.MEMORY_RECALL_BUDGET_MS ?? 400)
+
+/**
+ * 给 promise 加一个"到点就放弃"的外壳，超时返回 null。
+ *
+ * ⚠️ 被放弃的那个任务**还在跑**，必须替它挂一个 catch，
+ * 否则它稍后 reject 时会变成 unhandledRejection 把进程带崩 —— 这在 Node 里是致命的。
+ */
+const withBudget = async <T>(task: Promise<T> | T, ms: number): Promise<T | null> => {
+  const pending = Promise.resolve(task)
+  if (!(ms > 0)) {
+    return pending.catch(() => null)
+  }
+  pending.catch(() => undefined)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms)
+  })
+  try {
+    return await Promise.race([pending, timeout])
+  } catch {
+    return null
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 let registry: MemoryRegistry | null = null
 if (MEMORY_ENABLED) {
@@ -660,6 +696,8 @@ const stats = {
   trimmedMessages: 0,
   memoryWrites: 0,
   memoryRecalls: 0,
+  /** 召回超预算而放弃的次数：它高说明 embedding/rerank 太慢，首字延迟被它拖着 */
+  memoryRecallTimeouts: 0,
 }
 
 const json = (res: ServerResponse, status: number, body: unknown) => {
@@ -1024,8 +1062,19 @@ const proxy = async (req: IncomingMessage, res: ServerResponse, pathname: string
         // 全局会话一定召回；本地会话默认不读（完全隔离），可用环境变量放开
         const canRead = ensured.scope === 'global' || MEMORY_LOCAL_READS_GLOBAL
         if (canRead) {
-          const hits = await memory.search({ text: lastRealText, excludeSessionId: sessionId })
-          if (hits.length > 0) {
+          /**
+           * 带预算召回：这条 await 挡在"转发上游"之前，所以必须封顶。
+           * 超时（返回 null）就当这轮没有相关记忆 —— 少一点上下文，
+           * 总比让用户多等一秒才看到第一个字强。
+           */
+          const hits = await withBudget(
+            memory.search({ text: lastRealText, excludeSessionId: sessionId }),
+            MEMORY_RECALL_BUDGET_MS
+          )
+          if (hits === null) {
+            stats.memoryRecallTimeouts += 1
+            console.log(`[gateway] 记忆召回超过 ${MEMORY_RECALL_BUDGET_MS}ms，本轮不注入`)
+          } else if (hits.length > 0) {
             recallBlock = memory.buildRecallBlock(hits)
             recallHits = hits.length
             stats.memoryRecalls += 1
@@ -1672,6 +1721,60 @@ const handle = async (req: IncomingMessage, res: ServerResponse) => {
       json(res, 200, { ok: true, ...result })
     } catch (error) {
       console.warn('[gateway] 会话同步失败:', error instanceof Error ? error.message : error)
+      json(res, 500, { ok: false, error: 'sync_failed', message: '同步失败，请稍后重试' })
+    }
+    return
+  }
+
+  /**
+   * 单条消息增量同步 —— 发送路径上的热请求。
+   *
+   * 和 /sync/sessions 的区别只在于**少传了什么**：服务端已经有的历史不再重传。
+   * 线上 p90 会话 134 KB、最长 4.74 MB，而一条新消息通常几百字节到几 KB；
+   * 手机上行慢，这部分省下来直接变成"点发送到出字"的时间。
+   *
+   * body: { sessionId, message, updatedAt, base }
+   * ok:false 的 reason（missing / stale / bad_payload）表示"本地与云端不一致"，
+   * 客户端据此回落整段推送，由原有的"取较新者"规则裁决 —— 这里不做任何猜测性合并。
+   */
+  if (req.method === 'POST' && url.pathname === '/sync/message') {
+    const user = userFromRequest(req)
+    if (!user) {
+      json(res, 401, { ok: false, error: 'unauthorized', message: '登录状态已失效，请重新登录' })
+      return
+    }
+    // 单条消息不该有 MB 级体积（附件走 /sync/files）；上限给足，但不给整段会话的空间
+    const read = await readBodyCapped(req, 2 * 1024 * 1024)
+    if (!read.ok) {
+      json(res, 413, { ok: false, error: 'too_large', message: '单条消息体积过大' })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      body = JSON.parse(read.buffer.toString('utf8')) as Record<string, unknown>
+    } catch {
+      json(res, 400, { ok: false, error: 'bad_json', message: '请求体不是合法 JSON' })
+      return
+    }
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+    const updatedAt = Number(body.updatedAt ?? 0)
+    const rawBase = Number(body.base ?? 0)
+    if (!SESSION_ID_RE.test(sessionId) || !body.message || !(updatedAt > 0)) {
+      json(res, 400, { ok: false, error: 'bad_request', message: '缺少会话或消息' })
+      return
+    }
+    try {
+      json(
+        res,
+        200,
+        authStore.appendMessage(user.id, sessionId, {
+          message: body.message,
+          updatedAt,
+          base: Number.isFinite(rawBase) && rawBase > 0 ? rawBase : 0,
+        })
+      )
+    } catch (error) {
+      console.warn('[gateway] 消息增量同步失败:', error instanceof Error ? error.message : error)
       json(res, 500, { ok: false, error: 'sync_failed', message: '同步失败，请稍后重试' })
     }
     return

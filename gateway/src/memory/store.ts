@@ -20,6 +20,9 @@ import {
   type EmbeddingClient,
 } from './embed.ts'
 
+/** 查询向量缓存条数上限：够覆盖"重试/再生成/连问同一句"，又不至于把内存当缓存使 */
+const QUERY_EMBED_CACHE_LIMIT = 32
+
 /**
  * 这段话是不是在**纠正自己的事实**？
  *
@@ -167,6 +170,8 @@ export class MemoryStore {
   /** 每条上下文最多多少字 */
   private readonly contextChars: number
   private lastHits = 0
+  /** 查询向量缓存（键：查询文本）。命中就不必再打一次 embedding 接口 */
+  private readonly queryEmbedCache = new Map<string, Float32Array>()
   /** 后台向量化任务，测试与关停时用 */
   private readonly pending = new Set<Promise<void>>()
 
@@ -176,7 +181,12 @@ export class MemoryStore {
     this.maxHits = options.maxHits ?? 4
     this.maxChars = options.maxChars ?? 1500
     this.embedding = options.embedding ?? createEmbeddingClient(readEmbeddingConfig(process.env))
-    this.queryEmbedTimeoutMs = options.queryEmbedTimeoutMs ?? 1500
+    /**
+     * 从 1500 降到 800：embedding 接口正常在 100~300ms 返回，1500 的等待几乎从不用到，
+     * 但一旦它挂住，就是每个请求都白白多等 1.5 秒（首字延迟最大的单点）。
+     * 真正的总预算在调用方（`MEMORY_RECALL_BUDGET_MS`）兜着。
+     */
+    this.queryEmbedTimeoutMs = options.queryEmbedTimeoutMs ?? 800
     this.maxVectorScan = options.maxVectorScan ?? 50_000
     this.embedDelayMs = options.embedDelayMs ?? Number(process.env.MEMORY_EMBED_DELAY_MS ?? 80)
     this.minVectorScore =
@@ -187,7 +197,7 @@ export class MemoryStore {
     this.rerankEnabled =
       (process.env.MEMORY_RERANK ?? '1') !== '0' && Boolean(process.env.MEMORY_EMBED_API_KEY)
     this.rerankModel = process.env.MEMORY_RERANK_MODEL ?? 'BAAI/bge-reranker-v2-m3'
-    this.rerankTimeoutMs = Number(process.env.MEMORY_RERANK_TIMEOUT_MS ?? 2500)
+    this.rerankTimeoutMs = Number(process.env.MEMORY_RERANK_TIMEOUT_MS ?? 900)
     // 14 是实测的平衡点：@4 92.5% 与 pool=20 持平，但 p95 延迟从 1162ms 降到 727ms
     this.rerankPoolSize = Number(process.env.MEMORY_RERANK_POOL ?? 14)
     /**
@@ -853,15 +863,39 @@ export class MemoryStore {
     if (!this.embedding.enabled) {
       return null
     }
+    /**
+     * 同一条文本在短时间内可能被问多次（用户点重试、重新生成、连问两遍同一句）。
+     * 这些请求的查询向量完全一样，没必要每次都打一次 embedding 接口 ——
+     * 那是首字延迟里最贵的一跳。只留 32 条，避免把内存当缓存使。
+     */
+    const cached = this.queryEmbedCache.get(text)
+    if (cached) {
+      return cached
+    }
     const work = (async () => {
       const vectors = await this.embedding.embed([text])
       const vector = vectors?.[0]
       return vector ? normalizeVector(vector) : null
-    })()
+    })().catch(() => null)
+    let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), this.queryEmbedTimeoutMs).unref?.()
+      timer = setTimeout(() => resolve(null), this.queryEmbedTimeoutMs)
     })
-    return Promise.race([work, timeout])
+    try {
+      const vector = await Promise.race([work, timeout])
+      if (vector) {
+        if (this.queryEmbedCache.size >= QUERY_EMBED_CACHE_LIMIT) {
+          const oldest = this.queryEmbedCache.keys().next().value
+          if (oldest !== undefined) {
+            this.queryEmbedCache.delete(oldest)
+          }
+        }
+        this.queryEmbedCache.set(text, vector)
+      }
+      return vector
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   /** 向量全表扫描取 top-k。条数超过上限会告警（那时该上 sqlite-vec 了） */

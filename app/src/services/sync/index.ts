@@ -347,10 +347,11 @@ export const pushMessage = async (
     })
     if (!response.ok) {
       /**
-       * 413 说明这条消息本身就超过增量接口的 2 MB 上限（比如整篇长文粘进来）。
-       * 这不是"发不出去"，而是"这条路装不下" —— 回落整段推送，那边上限是 8 MB。
+       * 413：这条消息超过增量接口的 2 MB 上限（比如整篇长文粘进来）。
+       * 404/405：对面网关还没有这个接口（客户端比服务端新，或服务端回滚过）。
+       * 两种都不是"发不出去"，而是"这条路走不通" —— 回落整段推送，那边上限 8 MB。
        */
-      if (response.status === 413) {
+      if (response.status === 413 || response.status === 404 || response.status === 405) {
         return { ok: false, retryable: false, needFullPush: true }
       }
       return {

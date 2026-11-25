@@ -68,11 +68,18 @@ const previous = manifest.channels[channel]
 const patches = {}
 
 if (previous && previous.version !== version) {
-  // 最近 N 个历史 APK（按版本号目录里的文件）
+  /**
+   * 最近 N 个历史 APK —— **按 versionCode 排，不能按文件名字典序**。
+   *
+   * 字典序下 "1.0.18" / "1.0.19" 排在 "1.0.2" 前面（"1" < "2"），
+   * 于是 `slice(-5)` 会漏掉真正最近的版本：发 1.0.19 时挑出来的候选是
+   * 1.0.18/1.0.2/1.0.5/1.0.6/1.0.8，用户手机上的 1.0.17 反而没有补丁，
+   * 只能整包下载 6.7 MB（真踩过，2026-11-25）。
+   */
   const apks = readdirSync(UPDATES_DIR)
     .filter((name) => name.startsWith('freedeepseek-v') && name.endsWith('.apk'))
     .filter((name) => name !== apkName)
-    .sort()
+    .sort((a, b) => versionCodeOfFile(a) - versionCodeOfFile(b))
     .slice(-keep)
 
   for (const oldApk of apks) {
@@ -116,7 +123,9 @@ manifest.channels[channel] = {
 writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2), 'utf8')
 console.log(`[publish] 清单已更新：${channel} = ${version}（${Object.keys(patches).length} 个补丁）`)
 
-/** 与 build.gradle 同一套规则：major*1e6 + minor*1e4 + patch*100 + (字母? A=1..26 : 99) */
+/**
+ * 与 build.gradle 同一套规则：major*1e6 + minor*1e4 + patch*100 + (字母? A=1..26 : 99)
+ */
 function deriveVersionCode(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)([A-Z])?(?:-debug)?$/u.exec(version)
   if (!match) {
@@ -125,4 +134,13 @@ function deriveVersionCode(version) {
   const [, major, minor, patch, letter] = match
   const suffix = letter ? letter.charCodeAt(0) - 64 : 99
   return Number(major) * 1_000_000 + Number(minor) * 10_000 + Number(patch) * 100 + suffix
+}
+
+/** 从 APK 文件名取 versionCode；名字不合规的排到最后前面（当作最旧），不让它挤掉正常版本 */
+function versionCodeOfFile(name) {
+  try {
+    return deriveVersionCode(name.replace(/^freedeepseek-v/u, '').replace(/\.apk$/u, ''))
+  } catch {
+    return 0
+  }
 }

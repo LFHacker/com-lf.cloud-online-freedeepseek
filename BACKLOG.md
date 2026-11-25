@@ -1895,3 +1895,74 @@ dev    1.0.16A-debug           ← 后续按需迭代
 - 记忆库静态加密（需换驱动或用加密盘）
 - 每账号独立 token 预算的 UI（现在只有服务端配额）
 - 答案级评测样本量偏小（30–40 例），继续扩会更有说服力
+
+---
+
+## 发送延迟与输入卡顿（v1.0.18B-debug，2026-11-24）
+
+**用户反馈**：*"输入框上下出现与隐藏卡顿，输入卡顿，发送卡顿…还有发送消息速度慢。"*
+
+### 一、发送慢：先量清楚，再改
+
+**实测（线上快照 `server-snapshot-20261119` 的 `user_sessions`，1015 个会话）**
+
+| 指标 | 值 |
+|---|---|
+| 会话 payload 中位 / p90 / p99 / 最大 | 26 KB / 134 KB / **670 KB** / **4.74 MB** |
+| 分档 | <50 KB 71%、50–200 KB 22%、200 KB–1 MB 6%、>1 MB 5 个 |
+| 消息数 中位 / p90 / 最大 | 4 / 34 / 939 |
+
+**原来的链是三段严格串行，任何一段慢都直接推迟首字：**
+
+```text
+点发送
+ → ① POST /sync/sessions（推**整段会话**）→ 等网关确认
+ → ② 网关：读 body → 上下文裁剪 → 逐条入库 → memory.search（embedding + rerank 两跳外网）
+ → ③ 上游首 token
+```
+
+① 的设计初衷是"服务端确认后回答"（保证消息不丢、一个会话只有一条流）。但**队列负责的是"消息不丢"，不是"回答的前提"** —— 长会话里这段白等最刺眼：按 1 Mbps 上行估算，p90 约 1.1 秒、p99 约 5.4 秒，最长那个会话几十秒。
+
+### 二、三个改动
+
+1. **乐观起流**（`app/src/services/chat/store.ts`）
+   - 抽出 `beginReply()`，`sendMessage` 里**不等确认**就起流；离线仍走原路径（模型请求必失败，没必要冒红色错误）。
+   - 去重靠两道：同会话只允许一条流（`getStreamController`）+ 问题下面已有回答就不再重复。所以稍后 `confirmed` 事件进来是空操作。
+   - ⚠️ 这一步**不改变**"消息不丢"：队列照常入队/确认/退避重试。
+
+2. **召回硬预算**（`gateway/src/index.ts`、`memory/store.ts`）
+   - `MEMORY_RECALL_BUDGET_MS`（默认 400）超时 → 本轮不注入召回，日志与 `/health` 的 `memoryRecallTimeouts` 可观测。
+   - `queryEmbedTimeoutMs` 1500 → 800，`MEMORY_RERANK_TIMEOUT_MS` 2500 → 900。
+   - 查询向量加 32 条 LRU：重试/重新生成同一句不再打一次 embedding 接口。
+   - ⚠️ `withBudget` 必须给被放弃的 promise 挂 `catch` —— 超时后它仍在跑，稍后 reject 会变成 `unhandledRejection` 把进程带崩。
+
+3. **单条消息增量推送**（新接口 `POST /sync/message`）
+   - 客户端只上行这一条消息（KB 级），不再整车重传；payload 在服务端解析后追加。
+   - **安全边界三条**：会话属于该用户（SQL 带 `user_id`）、未被墓碑（删过的不许复活）、服务端版本不超前（`updated_at <= base`）。
+   - 幂等：payload 里已有同 id → 直接成功（重试/重复投递安全）。
+   - 对不上（missing / stale / bad_payload）→ 客户端**回落整段推送**，由原有"取较新者"规则裁决，**不在客户端猜合并**。
+   - 服务端时间戳 `max(客户端 updatedAt, 服务端+1)`：客户端时钟回拨也不会让下一轮 CAS 永远失败。
+   - 附件引用**只增不删**，且写引用失败只记日志不抛（抛了会让重试走幂等成功、引用永远补不上，随后 GC 会删在用的文件）。
+
+### 三、卡顿三处（都不是"感觉"，是固定的每帧成本）
+
+| 位置 | 原因 | 改法 |
+|---|---|---|
+| `app/src/app/viewport.ts` `preventPageScroll` | **每个 touchmove** 从落点向上走到 body，逐层 `getComputedStyle` —— 拖一下几十次强制样式重算 | 祖先带 `data-scrollable` 直接放行（消息区已标注）；否则用**缓存的 overflow 样式**，只有真的声明了 auto/scroll 才读尺寸 |
+| 同上 `useMobileViewport` | 视口每次 resize/scroll 都写 `--app-viewport-height`，值没变也写 → 整棵树重排；动画中间值反复写 | 同值不写 + rAF 合并 + 180ms 后补一次精确值；失焦立即复位 |
+| `ChatInput.tsx` | 隐藏 mirror 撑高度：每敲一个字重排整段文本；且工具条与文本框同组件，跟着一起重渲染 | 支持 `field-sizing: content` 时**不渲染 mirror**、高度交给浏览器；工具条抽成 memo 组件，回调全部 `useCallback` |
+
+> ⚠️ 缓存的只能是**样式**部分。`scrollHeight > clientHeight` 会随内容变化，缓存它会得到"空列表时不可滚动"的假阴性，于是整页禁止滚动的判定误伤内部滚动区。
+
+### 四、验证
+
+- `app`：`tsc --noEmit` ✅、`oxlint src` ✅ 0 warning、`rspack build` ✅ 3.77s
+- `gateway`：`tsc --noEmit` ✅；测试 **268 项全通过**（auth 93 / memory 73 / sync 52 / context 27 / import 14 / rate-limit 9）
+- `test-sync.ts` 新增 12 项，专门盯增量追加的坏结果：跨用户、墓碑复活、云端超前拒绝、幂等、时钟回拨、附件引用入表
+- **未验证**：真机手感。真正确认要看 Android Studio profiler 或页面打点；上面关于上传耗时的秒数是**按固定带宽估算**，不是实测
+
+### 五、待观察
+
+- `memoryRecallTimeouts` 涨得快说明 embedding/rerank 太慢（或 key 额度不够），该考虑换更近的接口
+- 增量推送后，流式回答会让本地 `updatedAt` 继续前进，后台同步引擎仍可能整段重推一次。这一步没优化 —— 不在发送热路径上，先不动
+

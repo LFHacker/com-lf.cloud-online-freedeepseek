@@ -11,6 +11,7 @@ import {
 import { setSearch, setThinking, useSettings } from '../../services/settings.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { sendMessage, setPendingMemoryScope, stopReply, useChatStore } from '../../services/chat/store.js'
+import type { MemoryScope } from '../../services/chat/types.js'
 import { useOutbox } from '../../services/sync/outbox.js'
 import {
   addDraftFiles,
@@ -30,7 +31,7 @@ import { DragMask, useFileDrop } from './DragMask.js'
 import { showToast } from '../base/toastState.js'
 import { ACCEPT, useUploads } from '../../services/attachments.js'
 import { DraftAttachments } from './DraftAttachments.js'
-import { useVoiceInput } from './useVoiceInput.js'
+import { useVoiceInput, type VoiceInputStatus } from './useVoiceInput.js'
 import { VoiceButton } from './VoiceButton.js'
 import { Spectrum } from './Spectrum.js'
 import { useTranslate } from '../../i18n/index.js'
@@ -40,6 +41,169 @@ import styles from './ChatInput.module.css'
 export const ChatInput = memo(function ChatInput({ sessionId }: { sessionId: string | null }) {
   // 切换目标时释放录音、转写和 DOM 状态；文字与附件由草稿服务保留。
   return <Input key={sessionId === null ? 'new' : `session:${sessionId}`} sessionId={sessionId} />
+})
+
+/**
+ * WebView 是否支持 `field-sizing: content`（Chrome 123+，现代安卓 WebView 普遍支持）。
+ *
+ * 支持时 textarea 能自己按内容长高，于是那个隐藏的 mirror **完全不必渲染**：
+ * 少一次整段文本的排版，也少一个文本节点更新 —— 这是输入掉帧的主要来源。
+ * 不支持时（老 WebView）保持原方案，行为不变。
+ */
+const SUPPORTS_FIELD_SIZING =
+  typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content')
+
+/**
+ * 工具条（开关 / 语音 / 附件 / 发送）。
+ *
+ * 单独抽出来并 memo：它是输入框里最贵的一块（3 个 Tooltip + 语音按钮 + 附件按钮），
+ * 而它依赖的东西**都不随打字变化**。原来它跟文本框写在同一个组件里，
+ * 于是每敲一个字都要把这一整排重渲染一遍 —— 纯属白做。
+ *
+ * ⚠️ 传进来的回调必须都是稳定引用（useCallback），否则 memo 等于没加。
+ */
+const ChatToolbar = memo(function ChatToolbar({
+  thinking,
+  search,
+  memoryScope,
+  memoryLocked,
+  importingHistory,
+  streaming,
+  canSend,
+  voiceStatus,
+  voiceAvailable,
+  voiceSeconds,
+  onThinking,
+  onSearch,
+  onMemory,
+  onVoice,
+  onOpenFile,
+  onSend,
+  onStop,
+}: {
+  thinking: boolean
+  search: boolean
+  memoryScope: MemoryScope
+  memoryLocked: boolean
+  importingHistory: boolean
+  streaming: boolean
+  canSend: boolean
+  voiceStatus: VoiceInputStatus
+  voiceAvailable: boolean
+  voiceSeconds: number
+  onThinking: () => void
+  onSearch: () => void
+  onMemory: () => void
+  onVoice: () => void
+  onOpenFile: () => void
+  onSend: () => void
+  onStop: () => void
+}) {
+  const t = useTranslate()
+  const togglesRef = useRef<HTMLDivElement>(null)
+
+  // 宽度不够时收起文字标签（只留图标），否则这一排会被挤成两行
+  useLayoutEffect(() => {
+    const toggles = togglesRef.current
+    if (!toggles) {
+      return
+    }
+
+    const updateLabels = () => {
+      toggles.classList.remove(styles.collapsedToggles)
+      toggles.classList.toggle(styles.collapsedToggles, toggles.scrollWidth > toggles.clientWidth)
+    }
+
+    updateLabels()
+    const observer = new ResizeObserver(updateLabels)
+    observer.observe(toggles)
+    return () => observer.disconnect()
+  }, [t])
+
+  return (
+    <div className={styles.functionRow}>
+      {/* 深度思考 / 智能搜索开关，tooltip 在按钮上方 */}
+      <div ref={togglesRef} className={styles.toggles}>
+        <Tooltip content={t('deactivatedThinkTooltip')}>
+          <button
+            type="button"
+            className={clsx(styles.toggle, thinking && styles.selected)}
+            aria-label={t('thinkingSwitch')}
+            aria-pressed={thinking}
+            onClick={onThinking}
+          >
+            <IconThinkOutline14 />
+            <span className={styles.toggleLabel}>{t('thinkingSwitch')}</span>
+          </button>
+        </Tooltip>
+        <Tooltip content={t('deactivatedSearchTooltip')}>
+          <button
+            type="button"
+            className={clsx(styles.toggle, search && styles.selected)}
+            aria-label={t('search')}
+            aria-pressed={search}
+            onClick={onSearch}
+          >
+            <IconGlobeLanguageOutline14 />
+            <span className={styles.toggleLabel}>{t('search')}</span>
+          </button>
+        </Tooltip>
+        <Tooltip content={memoryLocked ? t('memoryLockedTooltip') : t('memoryScopeTooltip')}>
+          <button
+            type="button"
+            className={clsx(styles.toggle, memoryScope === 'global' && styles.selected)}
+            aria-label={t('memoryScope')}
+            aria-pressed={memoryScope === 'global'}
+            disabled={memoryLocked}
+            onClick={onMemory}
+          >
+            {/* 必须给图标：移动端标签会被收起（.collapsedToggles 隐藏 toggleLabel），
+                没有图标时这个按钮会变成一颗完全没有内容的空白胶囊，用户根本发现不了 */}
+            <IconDataOutline16 />
+            <span className={styles.toggleLabel}>
+              {memoryScope === 'global' ? t('memoryGlobal') : t('memoryLocal')}
+            </span>
+          </button>
+        </Tooltip>
+      </div>
+      <div className={styles.right}>
+        <VoiceButton
+          status={voiceStatus}
+          disabled={!voiceAvailable}
+          seconds={voiceSeconds}
+          onClick={onVoice}
+        />
+        <IconButton
+          size="m"
+          tone="primary"
+          icon={<IconPaperclipOutline16 />}
+          tooltip={t('uploadFile')}
+          disabled={importingHistory}
+          onClick={onOpenFile}
+        />
+        {streaming ? (
+          <button
+            type="button"
+            className={styles.sendButton}
+            aria-label={t('chatInputStopButtonTooltip')}
+            onClick={onStop}
+          >
+            <IconStopFill16 />
+          </button>
+        ) : (
+          <button
+            type="button"
+            className={clsx(styles.sendButton, !canSend && styles.disabled)}
+            aria-label={t('send')}
+            aria-disabled={!canSend}
+            onClick={onSend}
+          >
+            <IconSendOutline16 />
+          </button>
+        )}
+      </div>
+    </div>
+  )
 })
 
 const Input = ({ sessionId }: { sessionId: string | null }) => {
@@ -66,24 +230,6 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const memoryLocked = lockedScope !== null
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const togglesRef = useRef<HTMLDivElement>(null)
-
-  useLayoutEffect(() => {
-    const toggles = togglesRef.current
-    if (!toggles) {
-      return
-    }
-
-    const updateLabels = () => {
-      toggles.classList.remove(styles.collapsedToggles)
-      toggles.classList.toggle(styles.collapsedToggles, toggles.scrollWidth > toggles.clientWidth)
-    }
-
-    updateLabels()
-    const observer = new ResizeObserver(updateLabels)
-    observer.observe(toggles)
-    return () => observer.disconnect()
-  }, [t])
 
   const acceptFiles = (files: File[]) => {
     if (files.length === 0 || useChatStore.getState().importingHistory || !ensureApiKey()) {
@@ -154,7 +300,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   )
   const canSend = !importingHistory && !streaming && !pendingSend && voice.status === 'idle' && draftReady
 
-  const send = () => {
+  const send = useCallback(() => {
     if (
       useChatStore.getState().importingHistory ||
       voice.status !== 'idle' ||
@@ -178,7 +324,43 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     } else {
       textareaRef.current?.focus()
     }
-  }
+  }, [sessionId, voice.status, pendingSend, isMobile])
+
+  const openFile = useCallback(() => {
+    if (!useChatStore.getState().importingHistory && ensureApiKey()) {
+      fileInputRef.current?.click()
+    }
+  }, [])
+
+  /**
+   * 录音开关走 ref：这个回调要传给 memo 过的工具条，
+   * 引用必须稳定，否则工具条每帧都会重渲染（等于没 memo）。
+   */
+  const voiceRef = useRef(voice)
+  voiceRef.current = voice
+  const toggleVoice = useCallback(() => {
+    const current = voiceRef.current
+    if (
+      current.status !== 'idle' ||
+      (!useChatStore.getState().importingHistory && ensureApiKey())
+    ) {
+      void current.toggle()
+    }
+  }, [])
+
+  const stop = useCallback(() => {
+    stopReadAloud()
+    if (sessionId) {
+      stopReply(sessionId)
+    }
+  }, [sessionId])
+
+  const toggleThinking = useCallback(() => setThinking(!thinking), [thinking])
+  const toggleSearch = useCallback(() => setSearch(!search), [search])
+  const toggleMemory = useCallback(
+    () => setPendingMemoryScope(memoryScope === 'global' ? 'local' : 'global'),
+    [memoryScope]
+  )
 
   return (
     <div
@@ -223,115 +405,43 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           }}
         />
         {recording && isMobile ? <Spectrum getAnalyser={voice.getAnalyser} /> : null}
-        <div className={styles.mirror} aria-hidden>
-          {`${text}\n`}
-        </div>
+        {/* 撑高度用的镜像：只在 WebView 不支持 field-sizing 时生效（见 CSS） */}
+        {SUPPORTS_FIELD_SIZING ? null : (
+          <div className={styles.mirror} aria-hidden>
+            {`${text}\n`}
+          </div>
+        )}
       </div>
-      <div className={styles.functionRow}>
-        {/* 深度思考 / 智能搜索开关，tooltip 在按钮上方 */}
-        <div ref={togglesRef} className={styles.toggles}>
-          <Tooltip content={t('deactivatedThinkTooltip')}>
-            <button
-              type="button"
-              className={clsx(styles.toggle, thinking && styles.selected)}
-              aria-label={t('thinkingSwitch')}
-              aria-pressed={thinking}
-              onClick={() => setThinking(!thinking)}
-            >
-              <IconThinkOutline14 />
-              <span className={styles.toggleLabel}>{t('thinkingSwitch')}</span>
-            </button>
-          </Tooltip>
-          <Tooltip content={t('deactivatedSearchTooltip')}>
-            <button
-              type="button"
-              className={clsx(styles.toggle, search && styles.selected)}
-              aria-label={t('search')}
-              aria-pressed={search}
-              onClick={() => setSearch(!search)}
-            >
-              <IconGlobeLanguageOutline14 />
-              <span className={styles.toggleLabel}>{t('search')}</span>
-            </button>
-          </Tooltip>
-          <Tooltip content={memoryLocked ? t('memoryLockedTooltip') : t('memoryScopeTooltip')}>
-            <button
-              type="button"
-              className={clsx(styles.toggle, memoryScope === 'global' && styles.selected)}
-              aria-label={t('memoryScope')}
-              aria-pressed={memoryScope === 'global'}
-              disabled={memoryLocked}
-              onClick={() =>
-                setPendingMemoryScope(memoryScope === 'global' ? 'local' : 'global')
-              }
-            >
-              {/* 必须给图标：移动端标签会被收起（.collapsedToggles 隐藏 toggleLabel），
-                  没有图标时这个按钮会变成一颗完全没有内容的空白胶囊，用户根本发现不了 */}
-              <IconDataOutline16 />
-              <span className={styles.toggleLabel}>
-                {memoryScope === 'global' ? t('memoryGlobal') : t('memoryLocal')}
-              </span>
-            </button>
-          </Tooltip>
-        </div>
-        <div className={styles.right}>
-          <VoiceButton
-            status={voice.status}
-            disabled={!voice.available}
-            seconds={voice.seconds}
-            onClick={() => {
-              if (
-                voice.status !== 'idle' ||
-                (!useChatStore.getState().importingHistory && ensureApiKey())
-              ) {
-                void voice.toggle()
-              }
-            }}
-          />
-          <IconButton
-            size="m"
-            tone="primary"
-            icon={<IconPaperclipOutline16 />}
-            tooltip={t('uploadFile')}
-            disabled={importingHistory}
-            onClick={() => ensureApiKey() && fileInputRef.current?.click()}
-          />
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            hidden
-            accept={ACCEPT}
-            onChange={(event) => {
-              acceptFiles(Array.from(event.target.files ?? []))
-              event.target.value = ''
-            }}
-          />
-          {streaming && sessionId ? (
-            <button
-              type="button"
-              className={styles.sendButton}
-              aria-label={t('chatInputStopButtonTooltip')}
-              onClick={() => {
-                stopReadAloud()
-                stopReply(sessionId)
-              }}
-            >
-              <IconStopFill16 />
-            </button>
-          ) : (
-            <button
-              type="button"
-              className={clsx(styles.sendButton, !canSend && styles.disabled)}
-              aria-label={t('send')}
-              aria-disabled={!canSend}
-              onClick={send}
-            >
-              <IconSendOutline16 />
-            </button>
-          )}
-        </div>
-      </div>
+      <ChatToolbar
+        thinking={thinking}
+        search={search}
+        memoryScope={memoryScope}
+        memoryLocked={memoryLocked}
+        importingHistory={importingHistory}
+        streaming={streaming && sessionId !== null}
+        canSend={canSend}
+        voiceStatus={voice.status}
+        voiceAvailable={voice.available}
+        voiceSeconds={voice.seconds}
+        onThinking={toggleThinking}
+        onSearch={toggleSearch}
+        onMemory={toggleMemory}
+        onVoice={toggleVoice}
+        onOpenFile={openFile}
+        onSend={send}
+        onStop={stop}
+      />
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        hidden
+        accept={ACCEPT}
+        onChange={(event) => {
+          acceptFiles(Array.from(event.target.files ?? []))
+          event.target.value = ''
+        }}
+      />
       {dragging ? <DragMask /> : null}
     </div>
   )

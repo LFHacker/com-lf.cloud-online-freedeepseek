@@ -144,8 +144,10 @@ export const MessageList = ({
   const uploadRetryId = getUploadRetryId(messages, streaming)
   return (
     <ScrollToBottomContext.Provider value={scrollToBottom}>
-      <div ref={isMobile ? undefined : scrollRef} className={styles.container}>
-        <div ref={isMobile ? scrollRef : undefined} className={styles.scroll}>
+      {/* data-scrollable：移动端「禁止整页滚动」的判定走这条快路径，
+          不必再逐层读计算样式（见 app/viewport.ts） */}
+      <div data-scrollable="" ref={isMobile ? undefined : scrollRef} className={styles.container}>
+        <div data-scrollable="" ref={isMobile ? scrollRef : undefined} className={styles.scroll}>
           <div ref={contentRef} className={styles.column}>
             {messages.map((message, index) =>
               message.role === 'user' ? (

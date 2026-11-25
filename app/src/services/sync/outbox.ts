@@ -10,9 +10,10 @@
  */
 import { create } from 'zustand'
 import { loadOutbox, putOutbox, removeOutbox, type OutboxRecord } from '../chat/db.js'
+import type { UserMessage } from '../chat/types.js'
 import { useSettings } from '../settings.js'
 import { backoffDelay } from './backoff.js'
-import { pushSession } from './index.js'
+import { pushMessage, pushSession } from './index.js'
 import { markRetry, setSync, useSync } from './status.js'
 
 export type { OutboxRecord }
@@ -88,7 +89,14 @@ const schedule = () => {
 }
 
 /** 放进队列：立刻尝试一次，失败后按退避自动重试 */
-export const enqueueOutbox = async (input: { id: string; sessionId: string }): Promise<void> => {
+export const enqueueOutbox = async (input: {
+  id: string
+  sessionId: string
+  /** 消息本体：有它就能走增量推送（只上传这一条），而不是整车重传 */
+  message?: UserMessage
+  /** 入队时会话的 updatedAt，服务端用它判断自己是不是落后了 */
+  base?: number
+}): Promise<void> => {
   const record: OutboxRecord = {
     id: input.id,
     sessionId: input.sessionId,
@@ -96,6 +104,8 @@ export const enqueueOutbox = async (input: { id: string; sessionId: string }): P
     attempts: 0,
     nextAttemptAt: 0,
     status: 'queued',
+    message: input.message,
+    base: input.base,
   }
   await putOutbox(record).catch(() => undefined)
   commit(record)
@@ -172,7 +182,22 @@ export const flushOutbox = async (options: { force?: boolean } = {}): Promise<vo
 /** 发一条：成功 → 出队并通知；失败 → 记次数、排下一次 */
 const attempt = async (entry: OutboxRecord): Promise<'ok' | 'retry' | 'dead'> => {
   commit({ ...entry, status: 'sending' })
-  const result = await pushSession(entry.sessionId)
+  /**
+   * 优先增量：只上行这一条消息。
+   *  · 云端没有这条会话 / 云端版本更新 / payload 不合预期 → 回落整段推送
+   *    （服务端那边的"取较新者"规则负责裁决，我们不在客户端猜合并）
+   *  · 网络错误 → 直接算可重试，不白跑一次回落
+   *  · 旧版本留下的队列条目没有 message → 只能整段推送
+   */
+  let result
+  if (entry.message && entry.base) {
+    result = await pushMessage(entry.sessionId, entry.message, entry.base, entry.base)
+    if (!result.ok && result.needFullPush) {
+      result = await pushSession(entry.sessionId)
+    }
+  } else {
+    result = await pushSession(entry.sessionId)
+  }
   if (result.ok) {
     await removeOutbox(entry.id).catch(() => undefined)
     forget(entry.id)

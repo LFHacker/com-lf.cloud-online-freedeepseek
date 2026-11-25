@@ -465,6 +465,40 @@ export const applyRemoteIndex = (
  * 能走到这里说明服务端已经收下这条消息，现在起流是安全的；
  * 离线时它根本不会被调用，消息会一直挂在队列上。
  */
+/**
+ * 起一条回复流。两个调用点：
+ *  · 乐观路径（`sendMessage`）：消息一入队就起流，**不等云端确认**
+ *  · 确认路径（outbox confirmed）：兜底，覆盖离线/重启后补发的情况
+ *
+ * 去重靠两道：同会话只允许一条流（`getStreamController`）；
+ * 问题下面已经有回答就不再重复（`path[index + 1]` 判定）。
+ * 所以乐观路径先起流、稍后确认事件再进来，也只会是空操作。
+ */
+const beginReply = async (sessionId: string, questionId: string): Promise<void> => {
+  await ensureSessionLoaded(sessionId).catch(() => undefined)
+  const session = getSession(sessionId)
+  if (!session || getStreamController(sessionId)) {
+    return
+  }
+  const path = getVisibleMessages(session)
+  const index = path.findIndex((message) => message.id === questionId)
+  const question = path[index]
+  if (question?.role !== 'user') {
+    return
+  }
+  // 已经有回答了（用户手动重试过、或这条是重复投递）：不要再来一遍
+  if (path[index + 1]?.role === 'assistant') {
+    return
+  }
+  const reply = createReply()
+  updateSession(sessionId, (current) => ({
+    ...appendBranch(current, question.id, [reply]),
+    updatedAt: Date.now(),
+  }))
+  persist(sessionId)
+  void streamReply(sessionId, reply, { history: path.slice(0, index), question })
+}
+
 const startConfirmedReply = async (entry: OutboxRecord): Promise<void> => {
   const { sessionId } = entry
   /**
@@ -484,28 +518,7 @@ const startConfirmedReply = async (entry: OutboxRecord): Promise<void> => {
       )
     }
   }
-  await ensureSessionLoaded(sessionId).catch(() => undefined)
-  const session = getSession(sessionId)
-  if (!session || getStreamController(sessionId)) {
-    return
-  }
-  const path = getVisibleMessages(session)
-  const index = path.findIndex((message) => message.id === entry.id)
-  const question = path[index]
-  if (question?.role !== 'user') {
-    return
-  }
-  // 已经有回答了（用户手动重试过、或这条是重复投递）：不要再来一遍
-  if (path[index + 1]?.role === 'assistant') {
-    return
-  }
-  const reply = createReply()
-  updateSession(sessionId, (current) => ({
-    ...appendBranch(current, question.id, [reply]),
-    updatedAt: Date.now(),
-  }))
-  persist(sessionId)
-  void streamReply(sessionId, reply, { history: path.slice(0, index), question })
+  await beginReply(sessionId, entry.id)
 }
 
 onOutboxEvent((event) => {
@@ -863,6 +876,12 @@ export const sendMessage = (targetSessionId: string | null) => {
     return false
   }
   const history = getVisibleMessages(current)
+  /**
+   * 增量推送的版本基准：**这一轮消息落库之前**的 updatedAt。
+   * 服务端用它判断"我这边是不是已经更新了"（另一台设备先写过就别盲目追加）。
+   * 读在 updateSession 之前，所以它一定是本轮修改前的值。
+   */
+  const baseUpdatedAt = current.updatedAt
   const question: UserMessage = {
     id: createId(),
     role: 'user',
@@ -890,11 +909,28 @@ export const sendMessage = (targetSessionId: string | null) => {
   persist(sessionId)
   clearSentDraft(targetSessionId)
   /**
-   * 服务端确认后再回答（阶段 2-2）：
-   * 消息先进本地持久队列，等网关确认它已经落到云端，才起流。
+   * 入队：消息先进本地持久队列，网关确认它落到云端后才出队。
    * 离线时它留在队列里（关掉 App 也不丢），恢复后自动补发。
    */
-  void enqueueOutbox({ id: question.id, sessionId })
+  void enqueueOutbox({
+    id: question.id,
+    sessionId,
+    message: question,
+    base: baseUpdatedAt,
+  })
+  /**
+   * ⚠️ 起流**不等确认**（原来这里要等 outbox 的 confirmed 事件）。
+   *
+   * 那次确认是一次上行 POST，推的是**整段会话**：线上实测中位 26 KB、p90 134 KB、
+   * 最长 4.74 MB，长会话光上传就几秒，而这段时间用户看到的是"点发送没反应"。
+   * 队列本身只负责"消息不丢"（入队 / 确认 / 重试），不该成为回答的前提。
+   *
+   * 离线时不提前起流：那种情况下模型请求必失败，留给确认路径，
+   * 保持"消息安静地留在队列里、不冒一条红色错误"的原有语义。
+   */
+  if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+    void beginReply(sessionId, question.id)
+  }
   return true
 }
 
